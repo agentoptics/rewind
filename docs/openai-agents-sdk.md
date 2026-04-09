@@ -151,7 +151,7 @@ result = await Runner.run(triage, "Write an article about Tokyo")
 
 ## MCP Server
 
-Rewind ships an MCP server so AI assistants (Claude Code, Cursor) can query your recordings:
+Rewind ships an MCP server so AI assistants (Claude Code, Cursor etc) can query your recordings:
 
 ```
 > "Why did my agent fail on the research task?"
