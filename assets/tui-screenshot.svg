@@ -16,11 +16,9 @@
   <text x="310" y="49" fill="#45475a">│</text>
   <text x="320" y="49" fill="#f9e2af">5 steps</text>
   <text x="390" y="49" fill="#45475a">│</text>
-  <text x="400" y="49" fill="#a6e3a1">$0.0049</text>
-  <text x="470" y="49" fill="#45475a">│</text>
-  <text x="480" y="49" fill="#89b4fa">1231 tokens</text>
-  <text x="580" y="49" fill="#45475a">│</text>
-  <text x="590" y="49" fill="#f38ba8" font-weight="bold">1 errors</text>
+  <text x="400" y="49" fill="#89b4fa">1231 tokens</text>
+  <text x="500" y="49" fill="#45475a">│</text>
+  <text x="510" y="49" fill="#f38ba8" font-weight="bold">1 errors</text>
 
   <!-- Left panel: Timeline -->
   <rect x="8" y="62" width="310" height="420" rx="3" fill="none" stroke="#89dceb" stroke-width="1"/>
@@ -32,7 +30,7 @@
   <text x="74" y="100" fill="#cdd6f4">Step  1</text>
   <text x="145" y="100" fill="#a6e3a1">✓</text>
   <text x="165" y="100" fill="#6c7086">0.320s</text>
-  <text x="235" y="100" fill="#6c7086">$0.0006</text>
+  <text x="230" y="100" fill="#89b4fa">184tok</text>
 
   <!-- Step 2 -->
   <text x="20" y="122" fill="#45475a"> ├ </text>
@@ -40,7 +38,7 @@
   <text x="74" y="122" fill="#cdd6f4">Step  2</text>
   <text x="145" y="122" fill="#a6e3a1">✓</text>
   <text x="165" y="122" fill="#6c7086">0.045s</text>
-  <text x="235" y="122" fill="#6c7086">$0.0000</text>
+  <text x="230" y="122" fill="#89b4fa">0tok</text>
 
   <!-- Step 3 -->
   <text x="20" y="144" fill="#45475a"> ├ </text>
@@ -48,7 +46,7 @@
   <text x="74" y="144" fill="#cdd6f4">Step  3</text>
   <text x="145" y="144" fill="#a6e3a1">✓</text>
   <text x="165" y="144" fill="#6c7086">0.890s</text>
-  <text x="235" y="144" fill="#6c7086">$0.0011</text>
+  <text x="230" y="144" fill="#89b4fa">347tok</text>
 
   <!-- Step 4 -->
   <text x="20" y="166" fill="#45475a"> ├ </text>
@@ -56,7 +54,7 @@
   <text x="74" y="166" fill="#cdd6f4">Step  4</text>
   <text x="145" y="166" fill="#a6e3a1">✓</text>
   <text x="165" y="166" fill="#6c7086">0.038s</text>
-  <text x="235" y="166" fill="#6c7086">$0.0000</text>
+  <text x="230" y="166" fill="#89b4fa">0tok</text>
 
   <!-- Step 5 (selected, error) -->
   <rect x="12" y="175" width="300" height="20" rx="2" fill="#313244"/>
@@ -66,7 +64,7 @@
   <text x="74" y="190" fill="#89dceb" font-weight="bold">Step  5</text>
   <text x="145" y="190" fill="#f38ba8" font-weight="bold">✗</text>
   <text x="165" y="190" fill="#6c7086">1.450s</text>
-  <text x="235" y="190" fill="#6c7086">$0.0031</text>
+  <text x="230" y="190" fill="#89b4fa">700tok</text>
 
   <!-- Right panel: Step Detail -->
   <rect x="322" y="62" width="590" height="420" rx="3" fill="none" stroke="#45475a" stroke-width="1"/>
@@ -82,8 +80,6 @@
   <text x="334" y="102" fill="#89b4fa"> ↓520tok ↑180tok</text>
   <text x="480" y="102" fill="#45475a">│</text>
   <text x="490" y="102" fill="#f9e2af">1450ms</text>
-  <text x="545" y="102" fill="#45475a">│</text>
-  <text x="555" y="102" fill="#a6e3a1">$0.003100</text>
 
   <!-- Request panel -->
   <rect x="326" y="114" width="582" height="155" rx="2" fill="none" stroke="#45475a" stroke-width="1"/>
