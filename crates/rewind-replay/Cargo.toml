@@ -1,0 +1,16 @@
+[package]
+name = "rewind-replay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rewind-store = { path = "../rewind-store" }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

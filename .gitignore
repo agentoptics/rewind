@@ -1,0 +1,26 @@
+# Build
+/target/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# IDE
+.cursor/
+.idea/
+.vscode/
+
+# Rewind data (user's local recordings)
+.rewind/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+.env.local

@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "crates/rewind-cli",
+    "crates/rewind-proxy",
+    "crates/rewind-store",
+    "crates/rewind-tui",
+    "crates/rewind-replay",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Rewind Contributors"]
+license = "MIT"
+description = "Chrome DevTools for AI agents — checkpoint, replay, intervene, diff."
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP / Proxy
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+rustls = "0.23"
+tokio-rustls = "0.26"
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Hashing
+sha2 = "0.10"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Colored output
+colored = "3"

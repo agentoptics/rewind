@@ -1,0 +1,189 @@
+use anyhow::{Context, Result};
+use rewind_store::{Step, Store, Timeline};
+
+/// Diff result between two timelines
+#[derive(Debug)]
+pub struct TimelineDiff {
+    pub diverge_at_step: Option<u32>,
+    pub left_label: String,
+    pub right_label: String,
+    pub step_diffs: Vec<StepDiff>,
+}
+
+#[derive(Debug)]
+pub struct StepDiff {
+    pub step_number: u32,
+    pub diff_type: DiffType,
+    pub left: Option<StepSummary>,
+    pub right: Option<StepSummary>,
+}
+
+#[derive(Debug)]
+pub struct StepSummary {
+    pub step_type: String,
+    pub status: String,
+    pub model: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+    pub duration_ms: u64,
+    pub response_preview: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DiffType {
+    Same,
+    Modified,
+    LeftOnly,
+    RightOnly,
+}
+
+/// Replay engine: hermetic replay from recorded data, fork-and-execute, timeline diff
+pub struct ReplayEngine<'a> {
+    store: &'a Store,
+}
+
+impl<'a> ReplayEngine<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        ReplayEngine { store }
+    }
+
+    /// Get all steps for a timeline, including inherited steps from parent (for forks)
+    pub fn get_full_timeline_steps(&self, timeline_id: &str, session_id: &str) -> Result<Vec<Step>> {
+        let timelines = self.store.get_timelines(session_id)?;
+        let timeline = timelines.iter().find(|t| t.id == timeline_id)
+            .context("Timeline not found")?;
+
+        if let (Some(parent_id), Some(fork_at)) = (&timeline.parent_timeline_id, timeline.fork_at_step) {
+            // This is a forked timeline — get parent steps up to fork point, then own steps
+            let parent_steps = self.store.get_steps(parent_id)?;
+            let own_steps = self.store.get_steps(timeline_id)?;
+
+            let mut combined: Vec<Step> = parent_steps.into_iter()
+                .filter(|s| s.step_number <= fork_at)
+                .collect();
+            combined.extend(own_steps);
+            combined.sort_by_key(|s| s.step_number);
+            Ok(combined)
+        } else {
+            self.store.get_steps(timeline_id)
+        }
+    }
+
+    /// Create a fork: new timeline branching from a specific step
+    pub fn fork(&self, session_id: &str, source_timeline_id: &str, at_step: u32, label: &str) -> Result<Timeline> {
+        let fork = Timeline::new_fork(session_id, source_timeline_id, at_step, label);
+        self.store.create_timeline(&fork)?;
+        tracing::info!(
+            fork_id = %fork.id,
+            source = %source_timeline_id,
+            at_step = at_step,
+            "Created fork: {}",
+            label,
+        );
+        Ok(fork)
+    }
+
+    /// Diff two timelines step by step
+    pub fn diff_timelines(&self, session_id: &str, left_timeline_id: &str, right_timeline_id: &str) -> Result<TimelineDiff> {
+        let left_steps = self.get_full_timeline_steps(left_timeline_id, session_id)?;
+        let right_steps = self.get_full_timeline_steps(right_timeline_id, session_id)?;
+
+        let timelines = self.store.get_timelines(session_id)?;
+        let left_label = timelines.iter().find(|t| t.id == left_timeline_id)
+            .map(|t| t.label.clone()).unwrap_or_else(|| "left".into());
+        let right_label = timelines.iter().find(|t| t.id == right_timeline_id)
+            .map(|t| t.label.clone()).unwrap_or_else(|| "right".into());
+
+        let max_steps = left_steps.len().max(right_steps.len());
+        let mut step_diffs = Vec::new();
+        let mut diverge_at_step = None;
+
+        for i in 0..max_steps {
+            let left = left_steps.get(i);
+            let right = right_steps.get(i);
+            let step_num = (i + 1) as u32;
+
+            let diff_type = match (left, right) {
+                (Some(l), Some(r)) => {
+                    if l.response_blob == r.response_blob && l.status == r.status {
+                        DiffType::Same
+                    } else {
+                        if diverge_at_step.is_none() {
+                            diverge_at_step = Some(step_num);
+                        }
+                        DiffType::Modified
+                    }
+                }
+                (Some(_), None) => {
+                    if diverge_at_step.is_none() {
+                        diverge_at_step = Some(step_num);
+                    }
+                    DiffType::LeftOnly
+                }
+                (None, Some(_)) => {
+                    if diverge_at_step.is_none() {
+                        diverge_at_step = Some(step_num);
+                    }
+                    DiffType::RightOnly
+                }
+                (None, None) => continue,
+            };
+
+            step_diffs.push(StepDiff {
+                step_number: step_num,
+                diff_type,
+                left: left.map(|s| self.step_summary(s)),
+                right: right.map(|s| self.step_summary(s)),
+            });
+        }
+
+        Ok(TimelineDiff {
+            diverge_at_step,
+            left_label,
+            right_label,
+            step_diffs,
+        })
+    }
+
+    fn step_summary(&self, step: &Step) -> StepSummary {
+        let response_preview = self.store.blobs.get(&step.response_blob)
+            .ok()
+            .and_then(|data| String::from_utf8(data).ok())
+            .and_then(|json_str| {
+                let val: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+                // OpenAI format
+                if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
+                    if let Some(msg) = choices.first()
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        return Some(msg.chars().take(150).collect());
+                    }
+                }
+                // Anthropic format
+                if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
+                    if let Some(text) = content.first()
+                        .and_then(|b| b.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        return Some(text.chars().take(150).collect());
+                    }
+                }
+                Some(json_str.chars().take(150).collect())
+            })
+            .unwrap_or_else(|| "(no response)".to_string());
+
+        StepSummary {
+            step_type: step.step_type.label().to_string(),
+            status: step.status.as_str().to_string(),
+            model: step.model.clone(),
+            tokens_in: step.tokens_in,
+            tokens_out: step.tokens_out,
+            cost_usd: step.cost_usd,
+            duration_ms: step.duration_ms,
+            response_preview,
+        }
+    }
+}

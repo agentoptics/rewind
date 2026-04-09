@@ -1,0 +1,21 @@
+[package]
+name = "rewind-proxy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rewind-store = { path = "../rewind-store" }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

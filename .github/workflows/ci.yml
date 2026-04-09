@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Test demo command
+        run: |
+          ./target/release/rewind demo
+          ./target/release/rewind sessions
+          ./target/release/rewind show latest
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install and verify Python SDK
+        run: |
+          cd python
+          pip install -e .
+          python -c "import rewind_agent; print(f'rewind-agent v{rewind_agent.__version__}')"
+          python -c "from rewind_agent import step, node, tool, trace, annotate, wrap_langgraph, wrap_crew; print('All imports OK')"
