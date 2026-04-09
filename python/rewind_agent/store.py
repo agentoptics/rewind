@@ -168,7 +168,7 @@ class Store:
 
     def __init__(self, root: str = None):
         if root is None:
-            root = os.path.join(os.path.expanduser("~"), ".rewind")
+            root = os.environ.get("REWIND_DATA") or os.path.join(os.path.expanduser("~"), ".rewind")
         os.makedirs(root, exist_ok=True)
 
         db_path = os.path.join(root, "rewind.db")

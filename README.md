@@ -214,6 +214,16 @@ result = Assertions().check("booking-happy-path", "latest")
 assert result.passed, f"Regression: {result.failed_checks} checks failed"
 ```
 
+#### GitHub Actions — 3 lines to add agent regression testing
+
+```yaml
+- uses: agentoptics/rewind/action@v1
+  with:
+    baseline: "booking-happy-path"
+```
+
+The action installs Rewind, runs `rewind assert check` against your baseline, and fails the job if regressions are found. Results are written to the GitHub Step Summary. See [action/README.md](action/README.md) for full docs.
+
 ### Snapshots — workspace checkpoint/restore
 
 Before your agent starts modifying files, take a snapshot. If it goes wrong, restore in one command.
