@@ -456,14 +456,13 @@ fn extract_response_preview(store: &Store, response_blob: &str) -> String {
                     .collect();
                 return Some(format!("tool_calls: {}", names.join(", ")));
             }
-            if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
-                if let Some(text) = content
+            if let Some(content) = val.get("content").and_then(|c| c.as_array())
+                && let Some(text) = content
                     .first()
                     .and_then(|b| b.get("text"))
                     .and_then(|t| t.as_str())
-                {
-                    return Some(text.replace('\n', " ").chars().take(150).collect());
-                }
+            {
+                return Some(text.replace('\n', " ").chars().take(150).collect());
             }
             Some(json_str.chars().take(150).collect())
         })
