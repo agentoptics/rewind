@@ -190,7 +190,19 @@ def _init_direct(session_name: str, auto_patch: bool):
     if auto_patch:
         _recorder.patch_all()
 
+    # Auto-register OpenAI Agents SDK tracing if available
+    _try_register_openai_agents(tid)
+
     _print_direct_banner(session_name)
+
+
+def _try_register_openai_agents(timeline_id: str):
+    """Register Rewind tracing with the OpenAI Agents SDK if it's installed."""
+    try:
+        from .openai_agents import register_tracing_processor
+        register_tracing_processor(_store, _session_id, timeline_id, _recorder)
+    except Exception:
+        pass  # agents SDK not installed or other import issue — skip silently
 
 
 def _init_proxy(proxy_url: str, auto_patch: bool):

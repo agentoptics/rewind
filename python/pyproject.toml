@@ -45,7 +45,8 @@ rewind = "rewind_cli:main"
 [project.optional-dependencies]
 openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.18"]
-all = ["openai>=1.0", "anthropic>=0.18"]
+agents = ["openai-agents>=0.0.7"]
+all = ["openai>=1.0", "anthropic>=0.18", "openai-agents>=0.0.7"]
 
 [project.urls]
 Homepage = "https://github.com/agentoptics/rewind"
