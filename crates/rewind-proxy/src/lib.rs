@@ -196,46 +196,45 @@ async fn handle_request(
     let streaming = is_stream_request(&body_bytes);
 
     // ── Fork-and-Execute: serve parent steps from cache ──
-    if let (Some(replay_steps), Some(fork_at)) = (&state.replay_steps, state.fork_at_step) {
-        if step_number <= fork_at {
-            if let Some(parent_step) = replay_steps.iter().find(|s| s.step_number == step_number) {
-                let resp_data = {
-                    let store = state.store.lock().unwrap();
-                    store.blobs.get(&parent_step.response_blob).unwrap_or_default()
-                };
+    if let (Some(replay_steps), Some(fork_at)) = (&state.replay_steps, state.fork_at_step)
+        && step_number <= fork_at
+        && let Some(parent_step) = replay_steps.iter().find(|s| s.step_number == step_number)
+    {
+        let resp_data = {
+            let store = state.store.lock().unwrap();
+            store.blobs.get(&parent_step.response_blob).unwrap_or_default()
+        };
 
-                // Record a replayed step in the forked timeline
-                let mut step = Step::new_llm_call(&state.timeline_id, &state.session_id, step_number, &parent_step.model);
-                step.status = parent_step.status.clone();
-                step.duration_ms = 0;
-                step.tokens_in = parent_step.tokens_in;
-                step.tokens_out = parent_step.tokens_out;
-                step.request_blob = request_hash.clone();
-                step.response_blob = parent_step.response_blob.clone();
-                step.step_type = parent_step.step_type.clone();
+        // Record a replayed step in the forked timeline
+        let mut step = Step::new_llm_call(&state.timeline_id, &state.session_id, step_number, &parent_step.model);
+        step.status = parent_step.status.clone();
+        step.duration_ms = 0;
+        step.tokens_in = parent_step.tokens_in;
+        step.tokens_out = parent_step.tokens_out;
+        step.request_blob = request_hash.clone();
+        step.response_blob = parent_step.response_blob.clone();
+        step.step_type = parent_step.step_type.clone();
 
-                {
-                    let store = state.store.lock().unwrap();
-                    let _ = store.create_step(&step);
-                    let _ = store.update_session_stats(&state.session_id, step_number, 0);
-                }
-
-                tracing::info!(
-                    step = step_number, model = %parent_step.model,
-                    "⏪ Fork replay — served cached step {}/{} (0ms, 0 tokens)",
-                    step_number, fork_at,
-                );
-
-                let response = Response::builder()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .header("x-rewind-replay", "fork")
-                    .header("x-rewind-cached-step", step_number.to_string())
-                    .body(box_full(Bytes::from(resp_data)))
-                    .unwrap();
-                return Ok(response);
-            }
+        {
+            let store = state.store.lock().unwrap();
+            let _ = store.create_step(&step);
+            let _ = store.update_session_stats(&state.session_id, step_number, 0);
         }
+
+        tracing::info!(
+            step = step_number, model = %parent_step.model,
+            "⏪ Fork replay — served cached step {}/{} (0ms, 0 tokens)",
+            step_number, fork_at,
+        );
+
+        let response = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("x-rewind-replay", "fork")
+            .header("x-rewind-cached-step", step_number.to_string())
+            .body(box_full(Bytes::from(resp_data)))
+            .unwrap();
+        return Ok(response);
     }
 
     // ── Instant Replay: check cache before hitting upstream ──
