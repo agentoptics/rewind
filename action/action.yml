@@ -1,0 +1,110 @@
+name: "Rewind Assert"
+description: "Run agent regression tests with Rewind — check sessions against baselines for step-level regressions."
+author: "agentoptics"
+branding:
+  icon: "rewind"
+  color: "blue"
+
+inputs:
+  baseline:
+    description: "Baseline name to check against (created with `rewind assert baseline`)"
+    required: true
+  session:
+    description: "Session to check (ID, prefix, or 'latest')"
+    required: false
+    default: "latest"
+  token-tolerance:
+    description: "Token tolerance percentage (default: 20)"
+    required: false
+    default: "20"
+  warn-model-change:
+    description: "Treat model changes as warnings instead of failures"
+    required: false
+    default: "false"
+  rewind-data:
+    description: "Path to Rewind data directory (default: ~/.rewind)"
+    required: false
+    default: ""
+  version:
+    description: "Rewind CLI version to install (default: latest)"
+    required: false
+    default: "latest"
+
+outputs:
+  result:
+    description: "'passed' or 'failed'"
+    value: ${{ steps.check.outputs.result }}
+  summary:
+    description: "Human-readable result summary"
+    value: ${{ steps.check.outputs.summary }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rewind CLI
+      shell: bash
+      run: |
+        # Install via pip (includes CLI auto-download)
+        if [ "${{ inputs.version }}" = "latest" ]; then
+          pip install rewind-agent -q
+        else
+          pip install rewind-agent==${{ inputs.version }} -q
+        fi
+
+        # Verify installation
+        rewind --version || python -m rewind_cli --version || {
+          echo "::error::Failed to install Rewind CLI"
+          exit 1
+        }
+
+    - name: Run regression check
+      id: check
+      shell: bash
+      env:
+        REWIND_DATA: ${{ inputs.rewind-data }}
+      run: |
+        # Build command
+        CMD="rewind assert check ${{ inputs.session }} --against ${{ inputs.baseline }} --token-tolerance ${{ inputs.token-tolerance }}"
+
+        if [ "${{ inputs.warn-model-change }}" = "true" ]; then
+          CMD="$CMD --warn-model-change"
+        fi
+
+        # Unset REWIND_DATA if empty (use default ~/.rewind)
+        if [ -z "$REWIND_DATA" ]; then
+          unset REWIND_DATA
+        fi
+
+        echo "::group::Rewind Assertion Check"
+        echo "Running: $CMD"
+        echo ""
+
+        # Capture output and exit code
+        set +e
+        OUTPUT=$($CMD 2>&1)
+        EXIT_CODE=$?
+        set -e
+
+        echo "$OUTPUT"
+        echo "::endgroup::"
+
+        # Extract summary line
+        SUMMARY=$(echo "$OUTPUT" | grep "Result:" | head -1 | sed 's/.*Result: *//')
+
+        if [ $EXIT_CODE -eq 0 ]; then
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "### :white_check_mark: Rewind Regression Check — PASSED" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+          echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "### :x: Rewind Regression Check — FAILED" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        # Write detailed results to step summary
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+        # Fail the step if check failed
+        exit $EXIT_CODE

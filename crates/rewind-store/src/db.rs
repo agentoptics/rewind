@@ -610,6 +610,9 @@ impl Store {
 }
 
 fn dirs_path() -> PathBuf {
+    if let Ok(data_dir) = std::env::var("REWIND_DATA") {
+        return PathBuf::from(data_dir);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".rewind")
 }
