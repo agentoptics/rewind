@@ -150,24 +150,36 @@ def _patch_existing_clients(proxy_url: str):
 
 
 def _print_direct_banner(session_name: str):
+    _print_logo()
+    print(f"  \033[36m\033[1mRecording active\033[0m \033[90m(direct)\033[0m")
     print()
-    print("  \033[36m\033[1m⏪ Rewind\033[0m — Recording active (direct)")
+    print(f"  \033[90m  Session:\033[0m  {session_name}")
+    print(f"  \033[90m  Store:\033[0m    ~/.rewind/")
+    print(f"  \033[90m  Debug:\033[0m    \033[32mrewind show latest\033[0m")
     print()
-    print(f"  \033[90mSession:\033[0m {session_name}")
-    print(f"  \033[90mStore:\033[0m   ~/.rewind/")
-    print()
-    print("  \033[33mAll LLM calls are being recorded.\033[0m")
-    print("  Run \033[32mrewind show latest\033[0m to see the trace.")
+    print(f"  \033[33m  ● Recording all LLM calls\033[0m")
     print()
 
 
 def _print_proxy_banner(proxy_url: str):
+    _print_logo()
+    print(f"  \033[36m\033[1mRecording active\033[0m \033[90m(proxy)\033[0m")
     print()
-    print("  \033[36m\033[1m⏪ Rewind\033[0m — Recording active (proxy)")
+    print(f"  \033[90m  Proxy:\033[0m    {proxy_url}")
+    print(f"  \033[90m  OpenAI:\033[0m   {proxy_url}/v1")
+    print(f"  \033[90m  Debug:\033[0m    \033[32mrewind show latest\033[0m")
     print()
-    print(f"  \033[90mProxy:\033[0m  {proxy_url}")
-    print(f"  \033[90mOpenAI:\033[0m {proxy_url}/v1")
+    print(f"  \033[33m  ● Recording all LLM calls\033[0m")
     print()
-    print("  \033[33mAll LLM calls are being recorded.\033[0m")
-    print("  Run \033[32mrewind show latest\033[0m to see the trace.")
+
+
+def _print_logo():
+    C = "\033[36m"
+    B = "\033[1m"
+    D = "\033[2m"
+    X = "\033[0m"
+    print()
+    print(f"  {C}{B}  ⏪  r e w i n d{X}")
+    print(f"  {D}  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{X}")
+    print(f"  {D}  The time-travel debugger for AI agents{X}")
     print()
