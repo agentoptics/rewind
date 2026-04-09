@@ -72,6 +72,10 @@ No idea what changed.                  Diff shows exactly what diverged.
 
 ## See It in Action
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/risjai/rewind/master/assets/demo.gif" alt="Rewind demo — trace, diff, cache" width="800">
+</p>
+
 ### Agent trace — see where it went wrong
 
 ```
@@ -171,7 +175,7 @@ The `rewind inspect` command opens a full terminal UI:
 - Navigate with arrow keys, Tab to switch panels, scroll through context
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/risjai/rewind/master/assets/demo.gif" alt="Rewind demo" width="800">
+  <img src="https://raw.githubusercontent.com/risjai/rewind/master/assets/tui-screenshot.svg" alt="Rewind TUI — interactive debugger" width="800">
 </p>
 
 ## Install
