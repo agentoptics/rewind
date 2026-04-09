@@ -77,6 +77,12 @@ jobs:
           python -c "import rewind_agent; print(f'rewind-agent v{rewind_agent.__version__}')"
           python -c "from rewind_agent import step, node, tool, trace, annotate, wrap_langgraph, wrap_crew; print('All imports OK')"
 
+      - name: Lint
+        run: |
+          pip install ruff -q
+          cd python
+          ruff check .
+
       - name: Run Python tests
         run: |
           cd python
