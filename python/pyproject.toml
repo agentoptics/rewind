@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rewind-agent"
-version = "0.4.2"
+version = "0.4.3"
 description = "Chrome DevTools for AI agents — record, inspect, fork, replay, diff."
 readme = "README.md"
 license = "MIT"
@@ -40,7 +40,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-rewind = "rewind_agent._cli:main"
+rewind = "rewind_cli:main"
 
 [project.optional-dependencies]
 openai = ["openai>=1.0"]
@@ -55,3 +55,6 @@ Changelog = "https://github.com/agentoptics/rewind/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rewind_agent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"rewind_cli.py" = "rewind_cli.py"
