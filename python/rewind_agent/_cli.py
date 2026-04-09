@@ -90,8 +90,13 @@ def _ensure_binary() -> str:
     tag = f"v{__version__}"
     url = _download_url(tag, platform_key)
 
-    print(f"\033[36m⏪ Rewind\033[0m — Downloading CLI {tag} for {platform_key}...")
-    print(f"   {url}")
+    print()
+    print(f"  \033[36m\033[1m  ⏪  r e w i n d\033[0m")
+    print(f"  \033[2m  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m")
+    print(f"  \033[2m  The time-travel debugger for AI agents\033[0m")
+    print()
+    print(f"  Downloading CLI {tag} for {platform_key}...")
+    print(f"  \033[2m{url}\033[0m")
     print()
 
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -137,7 +142,8 @@ def _ensure_binary() -> str:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-    print(f"\033[32m✓\033[0m Installed rewind {tag} to {bin_path}")
+    print(f"  \033[32m✓\033[0m Installed rewind {tag} to {bin_path}")
+    print(f"  \033[2mRun \033[0m\033[32mrewind demo\033[0m\033[2m to try it out\033[0m")
     print()
 
     return bin_path
