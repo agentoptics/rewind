@@ -49,7 +49,7 @@ jobs:
       - name: CLI_VERSION matches Cargo.toml
         run: |
           cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          cli_version=$(grep 'CLI_VERSION' python/rewind_cli.py | sed 's/.*"\(.*\)"/\1/')
+          cli_version=$(grep '^CLI_VERSION' python/rewind_cli.py | sed 's/.*"\(.*\)"/\1/')
           echo "Cargo.toml version: $cargo_version"
           echo "CLI_VERSION:        $cli_version"
           if [ "$cargo_version" != "$cli_version" ]; then
