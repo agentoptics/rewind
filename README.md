@@ -545,6 +545,14 @@ result = crew.kickoff()
 | `rewind record --web` | Start recording with live web dashboard |
 | `rewind demo` | Seed demo data to explore without API keys |
 
+### Web UI — browser-based dashboard
+
+<p align="center">
+  <img src="assets/web-ui-screenshot.png" alt="Rewind Web UI — session timeline, step detail with context window" width="800" />
+</p>
+
+Run `rewind web` and open `http://localhost:8080` to explore recorded sessions, inspect context windows, diff timelines, and watch live recordings via WebSocket. Everything is embedded in the single binary — no Docker, no Node.js runtime needed.
+
 ## Compatibility
 
 | Provider | Non-streaming | Streaming (SSE) |
