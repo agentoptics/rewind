@@ -595,16 +595,16 @@ fn parse_sse_event(
                     }
                     // Tool input JSON delta — accumulate into the last tool call's input,
                     // NOT into the text buffer (which would corrupt content text).
-                    if let Some(partial) = delta.get("partial_json").and_then(|p| p.as_str()) {
-                        if let Some(last_tc) = tool_calls.last_mut() {
-                            let existing = last_tc.get("_partial_input")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            last_tc["_partial_input"] = serde_json::Value::String(
-                                format!("{}{}", existing, partial),
-                            );
-                        }
+                    if let Some(partial) = delta.get("partial_json").and_then(|p| p.as_str())
+                        && let Some(last_tc) = tool_calls.last_mut()
+                    {
+                        let existing = last_tc.get("_partial_input")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        last_tc["_partial_input"] = serde_json::Value::String(
+                            format!("{}{}", existing, partial),
+                        );
                     }
                 }
             }
