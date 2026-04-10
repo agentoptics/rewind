@@ -541,7 +541,17 @@ result = crew.kickoff()
 | `rewind assert list` | List all baselines |
 | `rewind assert show <name>` | Show baseline step signatures |
 | `rewind assert delete <name>` | Delete a baseline |
+| `rewind web [--port 8080]` | Start the web dashboard (flight recorder + live) |
+| `rewind record --web` | Start recording with live web dashboard |
 | `rewind demo` | Seed demo data to explore without API keys |
+
+### Web UI — browser-based dashboard
+
+<p align="center">
+  <img src="assets/web-ui-screenshot.png" alt="Rewind Web UI — session timeline, step detail with context window" width="800" />
+</p>
+
+Run `rewind web` and open `http://localhost:8080` to explore recorded sessions, inspect context windows, diff timelines, and watch live recordings via WebSocket. Everything is embedded in the single binary — no Docker, no Node.js runtime needed.
 
 ## Compatibility
 
@@ -643,12 +653,13 @@ Rewind is in active development. Here's what's shipped and what's coming:
 |:------|:---------|:-------|
 | **v0.1** | Record, inspect, fork, diff, TUI, streaming, Instant Replay, Snapshots, Python SDK with hooks, LangGraph + CrewAI adapters | ✅ Shipped |
 | **v0.2** | Direct recording (no proxy), fork-and-execute replay, regression testing (`rewind assert`), MCP server, replay context manager | ✅ Shipped |
-| **v0.3** | Web UI, multi-agent tracing, OTel export | Building |
+| **v0.3** | Web UI (flight recorder + live dashboard), `rewind web`, `rewind record --web` | ✅ Shipped |
+| **v0.4** | Multi-agent tracing, OTel export | Building |
 | **v1.0** | Live breakpoints, Rewind Cloud (team collab), semantic diff, on-prem | Planned |
 
 ### What we're solving next
 
-- [ ] **Web UI** — Browser-based timeline explorer with interactive context window viewer
+- [x] **Web UI** — Browser-based dashboard with session explorer, step timeline, context window viewer, timeline diff, and live recording observability via WebSocket
 - [ ] **Multi-agent tracing** — Follow execution across parent/child agent handoffs
 - [ ] **Live breakpoints** — Pause a running agent at any step, inspect state, modify, resume
 - [ ] **OTel export** — Push traces to Grafana, Datadog, or any OpenTelemetry collector

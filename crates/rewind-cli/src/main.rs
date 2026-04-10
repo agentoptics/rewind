@@ -6,6 +6,7 @@ use rewind_proxy::ProxyServer;
 use rewind_replay::ReplayEngine;
 use rewind_store::Store;
 use rewind_tui::TuiApp;
+use rewind_web::WebServer;
 use std::net::SocketAddr;
 
 #[derive(Parser)]
@@ -39,6 +40,14 @@ enum Commands {
         /// Enable Instant Replay — cache responses and serve from cache on identical requests
         #[arg(long)]
         replay: bool,
+
+        /// Also start the web dashboard for live observability
+        #[arg(long)]
+        web: bool,
+
+        /// Port for the web dashboard (used with --web)
+        #[arg(long, default_value = "8080")]
+        web_port: u16,
     },
 
     /// List recorded sessions
@@ -138,6 +147,13 @@ enum Commands {
         #[command(subcommand)]
         action: AssertAction,
     },
+
+    /// Start the web dashboard (flight recorder + air traffic control)
+    Web {
+        /// Port for the web server
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,7 +220,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Record { name, port, upstream, replay } => cmd_record(name, port, upstream, replay).await,
+        Commands::Record { name, port, upstream, replay, web, web_port } => cmd_record(name, port, upstream, replay, web, web_port).await,
         Commands::Sessions => cmd_sessions(),
         Commands::Inspect { session } => cmd_inspect(session),
         Commands::Show { session } => cmd_show(session),
@@ -223,10 +239,11 @@ async fn main() -> Result<()> {
             AssertAction::Show { name } => cmd_assert_show(name),
             AssertAction::Delete { name } => cmd_assert_delete(name),
         },
+        Commands::Web { port } => cmd_web(port).await,
     }
 }
 
-async fn cmd_record(name: String, port: u16, upstream: String, replay: bool) -> Result<()> {
+async fn cmd_record(name: String, port: u16, upstream: String, replay: bool, web: bool, web_port: u16) -> Result<()> {
     let store = Store::open_default()?;
     let proxy = ProxyServer::new(store, &name, &upstream, replay)?;
 
@@ -238,6 +255,9 @@ async fn cmd_record(name: String, port: u16, upstream: String, replay: bool) -> 
     if replay {
         println!("  {} {}", "Replay:".dimmed(), "ON — identical requests served from cache (0 tokens)".green().bold());
     }
+    if web {
+        println!("  {} {}", "Dashboard:".dimmed(), format!("http://127.0.0.1:{}", web_port).cyan().bold());
+    }
     println!();
     println!("  {} Set your agent's base URL to intercept calls:", "→".cyan());
     println!("    {}", format!("export OPENAI_BASE_URL=http://127.0.0.1:{}/v1", port).green());
@@ -246,7 +266,27 @@ async fn cmd_record(name: String, port: u16, upstream: String, replay: bool) -> 
     println!();
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
-    proxy.run(addr).await
+
+    if web {
+        let web_store = Store::open_default()?;
+        let (_event_tx, _) = tokio::sync::broadcast::channel::<rewind_web::StoreEvent>(256);
+        let web_server = WebServer::new_standalone(web_store);
+        let web_addr: SocketAddr = format!("127.0.0.1:{}", web_port).parse()?;
+
+        tokio::select! {
+            res = proxy.run(addr) => res,
+            res = web_server.run(web_addr) => res,
+        }
+    } else {
+        proxy.run(addr).await
+    }
+}
+
+async fn cmd_web(port: u16) -> Result<()> {
+    let store = Store::open_default()?;
+    let web_server = WebServer::new_standalone(store);
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+    web_server.run(addr).await
 }
 
 async fn cmd_replay(session_ref: String, from_step: u32, upstream: String, port: u16, label: String) -> Result<()> {

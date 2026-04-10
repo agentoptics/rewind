@@ -18,8 +18,14 @@
 __pycache__/
 *.pyc
 *.egg-info/
-dist/
 build/
+
+# Web UI
+web/node_modules/
+web/dist/
+
+# Python dist
+dist/
 
 # Internal research (not public)
 /research/

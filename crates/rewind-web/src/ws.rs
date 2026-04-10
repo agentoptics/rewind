@@ -1,0 +1,156 @@
+use axum::{
+    extract::{
+        ws::{Message, WebSocket},
+        State, WebSocketUpgrade,
+    },
+    response::Response,
+    routing::get,
+    Router,
+};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+
+use crate::{AppState, StoreEvent};
+
+pub fn routes(state: AppState) -> Router {
+    Router::new()
+        .route("/api/ws", get(ws_handler))
+        .with_state(state)
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClientMessage {
+    #[serde(rename = "subscribe")]
+    Subscribe { session_id: String },
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum ServerMessage {
+    #[serde(rename = "step")]
+    Step { data: StepEventData },
+    #[serde(rename = "session_update")]
+    SessionUpdate { data: SessionUpdateData },
+    #[serde(rename = "subscribed")]
+    Subscribed { session_id: String },
+}
+
+#[derive(Serialize)]
+struct StepEventData {
+    id: String,
+    step_number: u32,
+    step_type: String,
+    step_type_label: String,
+    step_type_icon: String,
+    status: String,
+    model: String,
+    duration_ms: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    error: Option<String>,
+    response_preview: String,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct SessionUpdateData {
+    session_id: String,
+    status: String,
+    total_steps: u32,
+    total_tokens: u64,
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    let mut subscribed_session: Option<String> = None;
+    let mut event_rx = state.event_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                            match client_msg {
+                                ClientMessage::Subscribe { session_id } => {
+                                    let ack = ServerMessage::Subscribed {
+                                        session_id: session_id.clone(),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
+                                        let _ = sender.send(Message::Text(json.into())).await;
+                                    }
+                                    subscribed_session = Some(session_id);
+                                }
+                                ClientMessage::Unsubscribe => {
+                                    subscribed_session = None;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            event = event_rx.recv() => {
+                if let Ok(event) = event {
+                    let msg = match &event {
+                        StoreEvent::StepCreated { session_id, step } => {
+                            if subscribed_session.as_deref() == Some(session_id) {
+                                let preview = {
+                                    let store = state.store.lock().unwrap();
+                                    crate::api::extract_preview_from_store(&store, &step.response_blob)
+                                };
+                                Some(ServerMessage::Step {
+                                    data: StepEventData {
+                                        id: step.id.clone(),
+                                        step_number: step.step_number,
+                                        step_type: step.step_type.as_str().to_string(),
+                                        step_type_label: step.step_type.label().to_string(),
+                                        step_type_icon: step.step_type.icon().to_string(),
+                                        status: step.status.as_str().to_string(),
+                                        model: step.model.clone(),
+                                        duration_ms: step.duration_ms,
+                                        tokens_in: step.tokens_in,
+                                        tokens_out: step.tokens_out,
+                                        error: step.error.clone(),
+                                        response_preview: preview,
+                                        created_at: step.created_at.to_rfc3339(),
+                                    },
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        StoreEvent::SessionUpdated { session_id, status, total_steps, total_tokens } => {
+                            Some(ServerMessage::SessionUpdate {
+                                data: SessionUpdateData {
+                                    session_id: session_id.clone(),
+                                    status: status.clone(),
+                                    total_steps: *total_steps,
+                                    total_tokens: *total_tokens,
+                                },
+                            })
+                        }
+                    };
+
+                    if let Some(msg) = msg
+                        && let Ok(json) = serde_json::to_string(&msg)
+                            && sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                }
+            }
+        }
+    }
+}

@@ -29,6 +29,23 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Web UI dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Run Web UI tests
+        working-directory: web
+        run: npm test
+
+      - name: Build Web UI
+        working-directory: web
+        run: npm run build
+
       - name: Build
         run: cargo build --release
 
