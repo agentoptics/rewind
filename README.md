@@ -48,15 +48,15 @@ Every existing observability tool shows you **what happened**. None of them let 
 
 | Capability | What it means |
 |:---|:---|
-| **Record** | Transparent proxy captures every LLM call. Streaming pass-through — zero added latency. |
-| **Inspect** | See the *exact* context window at each step. Every message, system prompt, and tool response. |
-| **Fork** | Branch the timeline at any step. Edit context, resume from there — re-run only what changed. |
-| **Diff** | Compare original and forked timelines. See exactly where and why they diverge. |
-| **Replay from Failure** | Agent fails at step 5? Fix your code, run `rewind replay --from 4`. Steps 1-4 cached (0 tokens, 0ms). Only step 5 re-runs live. |
-| **Instant Replay** | Identical requests cached at 0 tokens, 0ms. Run the same agent 10 times — only the first hits the LLM. |
-| **Regression Testing** | Turn any session into a baseline. Check new behavior against it. Run in CI. |
-| **Evaluation** | Datasets, scoring, experiments, comparison. CI-ready with `--fail-below`. |
-| **Snapshots** | Checkpoint/restore your workspace. No git dependency. |
+| **Record** | A transparent proxy captures every LLM call. Your agent doesn't know it's being recorded. Streaming works in real-time — zero added latency. |
+| **Inspect** | See the *exact* context window at each step. Every message, system prompt, and tool response the model saw — displayed as human-readable, color-coded views. |
+| **Fork** | Branch the execution timeline at any step. Edit the context (fix a stale tool response, tweak the prompt). Resume from there — re-run only the new steps. |
+| **Diff** | Compare the original and forked timelines. See exactly where they diverge and why. |
+| **Replay from Failure** | Agent fails at step 5? Fix your code, run `rewind replay --from 4`. Steps 1-4 served instantly from cache (0 tokens, 0ms). Only step 5 re-runs live. Diff the result. |
+| **Instant Replay** | Identical requests are served from cache at **0 tokens, 0ms latency**. Run the same agent 10 times — only the first run hits the LLM. |
+| **Regression Testing** | Turn any session into a baseline. After code changes, check the new behavior: step types, models, tool calls, token counts. Run in CI. |
+| **Evaluation** | Create datasets of test cases, run your agent against them, score with built-in evaluators (exact match, contains, regex, JSON schema, tool use), compare experiments side-by-side. CI-ready with `--fail-below` thresholds. |
+| **Snapshots** | Capture your entire workspace at any point. Restore in one command if your agent breaks something. No git dependency. |
 
 ### Before / After
 
