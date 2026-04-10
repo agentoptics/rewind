@@ -361,7 +361,7 @@ class TestDataset:
         tmpfile.close()
 
         try:
-            ds = Dataset.from_jsonl("jsonl-ds", tmpfile.name, store=tmp_store)
+            Dataset.from_jsonl("jsonl-ds", tmpfile.name, store=tmp_store)
             assert mock_cli.called
             call_args = mock_cli.call_args[0]
             assert "import" in call_args
