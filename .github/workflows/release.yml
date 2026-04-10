@@ -34,6 +34,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build Web UI
+        working-directory: web
+        run: npm ci && npm run build
+
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -51,8 +60,8 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/rewind" dist/
           cd dist
-          tar -czf "rewind-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" rewind
-          shasum -a 256 "rewind-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" > "rewind-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz.sha256"
+          tar -czf "rewind-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" rewind
+          shasum -a 256 "rewind-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" > "rewind-${{ github.ref_name }}-${{ matrix.name }}.tar.gz.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
