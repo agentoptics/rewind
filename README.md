@@ -117,23 +117,34 @@ result = rewind_agent.evaluate(
 
 ## Install
 
+**pip** (recommended — installs Python SDK + CLI):
+
 ```bash
-# pip (recommended — installs Python SDK + CLI)
 pip install rewind-agent
+```
 
-# Binary only (macOS / Linux)
+**Binary only** (macOS / Linux):
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/agentoptics/rewind/master/install.sh | sh
+```
 
-# From source
+**From source** (requires Rust):
+
+```bash
 cargo install --git https://github.com/agentoptics/rewind rewind-cli
 ```
 
-Optional extras for framework integrations:
+**Optional extras** for framework integrations:
 
 ```bash
-pip install rewind-agent[agents]      # OpenAI Agents SDK
-pip install rewind-agent[pydantic]    # Pydantic AI
-pip install rewind-agent[all]         # everything
+pip install rewind-agent[agents]
+```
+```bash
+pip install rewind-agent[pydantic]
+```
+```bash
+pip install rewind-agent[all]
 ```
 
 ## Quickstart
