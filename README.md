@@ -58,29 +58,61 @@ Every existing observability tool shows you **what happened**. None of them let 
 | **Evaluation** | Create datasets of test cases, run your agent against them, score with built-in evaluators (exact match, contains, regex, JSON schema, tool use), compare experiments side-by-side. CI-ready with `--fail-below` thresholds. |
 | **Snapshots** | Capture your entire workspace at any point. Restore in one command if your agent breaks something. No git dependency. |
 
-### Before / After
-
-```
-Without Rewind                         With Rewind
-─────────────────                      ─────────────────
-Agent fails on step 5.                 Agent fails on step 5.
-Re-run all 5 steps.                    Fix your code.
-Burn tokens on all 5 calls.            rewind replay latest --from 4
-Wait 30 seconds.                       Steps 1-4: cached (0ms, 0 tokens)
-Hope it works this time.               Step 5: live (1 LLM call, 5 sec)
-No idea what changed.                  rewind diff → see exactly what diverged.
-```
-
 ## See It in Action
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/agentoptics/rewind/master/assets/demo.gif" alt="Rewind demo — trace, diff, cache" width="800">
 </p>
 
-Or try the self-contained demo (no API keys needed):
+```bash
+rewind demo && rewind inspect latest   # try it now — no API keys needed
+```
+
+### See what the model saw — find the bug in 5 seconds
+
+```
+⏪ Rewind — Session Trace
+
+  Session: research-agent    Steps: 5    Tokens: 1,231
+
+  ┌ ✓ 🧠  Step 1  gpt-4o    320ms   156↓  28↑  → web_search("Tokyo population 2024")
+  ├ ✓ 📋  Step 2  tool        45ms
+  ├ ✓ 🧠  Step 3  gpt-4o    890ms   312↓  35↑  → web_search("Tokyo decade trend")
+  ├ ✓ 📋  Step 4  tool        38ms               ⚠ Stale cached data (2019 dataset)
+  └ ✗ 🧠  Step 5  gpt-4o   1450ms   520↓ 180↑  ERROR: Hallucination — used 2019 data as fact
+```
+
+Step 4 returned stale data. Step 5 hallucinated because of it. Without Rewind, you'd re-run 50 times and never find this.
+
+### Fix and replay — only re-run what changed
 
 ```bash
-rewind demo && rewind inspect latest
+rewind replay latest --from 4          # fix your code, then:
+# Steps 1-3: cached instantly (0ms, 0 tokens)
+# Steps 4-5: re-run live with corrected context
+rewind diff latest                     # see exactly what diverged
+```
+
+```
+⏪ Rewind — Timeline Diff (main vs fixed, diverge at step 4)
+
+  ═ Step  1  identical
+  ═ Step  2  identical
+  ═ Step  3  identical
+  ≠ Step  4  [stale data]  →  [fresh data]
+  ≠ Step  5  [error] 700tok   →  [success] 715tok
+```
+
+### Evaluate before shipping — catch regressions in CI
+
+```python
+result = rewind_agent.evaluate(
+    dataset="booking-tests",
+    target_fn=my_agent,
+    evaluators=[exact_match, tool_use_match],
+    fail_below=0.9,   # CI fails if score drops below 90%
+)
+# Score: 95.0%, Pass rate: 100% — ship it
 ```
 
 ## Install
