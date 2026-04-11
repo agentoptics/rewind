@@ -9,7 +9,7 @@
   <br/>
   <strong>The time-travel debugger for AI agents</strong>
   <br/>
-  <em>Built-in tracing, evals, and CI regression testing — no LangSmith required.</em>
+  <em>Built-in tracing, evals, and CI regression testing - no LangSmith required.</em>
   <br/>
   <br/>
   <a href="#the-problem">Why</a> &nbsp;&bull;&nbsp;
