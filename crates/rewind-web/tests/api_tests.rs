@@ -394,3 +394,59 @@ async fn test_context_window_content_blocks() {
     assert!(messages[0]["content"].as_str().unwrap().contains("Part one."));
     assert!(messages[0]["content"].as_str().unwrap().contains("Part two."));
 }
+
+// ── OTel Export ─────────────────────────────────────────────
+
+async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+    (status, value)
+}
+
+#[tokio::test]
+async fn test_export_otel_returns_501_when_unconfigured() {
+    let (app, store, _tmp) = setup();
+    let (session, _) = seed_session(&store);
+
+    let (status, _) = post_json(
+        app,
+        &format!("/api/sessions/{}/export/otel", session.id),
+        json!({}),
+    ).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn test_export_otel_returns_404_for_missing_session() {
+    // Setup with otel_config present
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let (event_tx, _) = tokio::sync::broadcast::channel::<StoreEvent>(16);
+    let state = AppState {
+        store: store.clone(),
+        event_tx,
+        hooks: Arc::new(HookIngestionState::new()),
+        otel_config: Some(rewind_web::OtelConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            protocol: rewind_otel::export::Protocol::Http,
+            headers: vec![],
+        }),
+    };
+    let app = Router::new().nest("/api", rewind_web::api_routes(state));
+
+    let (status, _) = post_json(
+        app,
+        "/api/sessions/nonexistent/export/otel",
+        json!({}),
+    ).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

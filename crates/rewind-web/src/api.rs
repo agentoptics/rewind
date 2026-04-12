@@ -625,10 +625,8 @@ async fn export_otel(
             .lock()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock: {e}")))?;
 
-        let session = store
-            .get_session(&id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Session not found: {id}")))?;
+        let session = resolve_session(&store, &id)
+            .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
 
         let opts = rewind_otel::extract::ExtractOptions {
             timeline_id: body.timeline_id.clone(),
