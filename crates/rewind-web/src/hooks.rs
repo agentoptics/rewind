@@ -279,8 +279,10 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
 fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
     // Fast path: session already exists in memory
     if state.hooks.sessions.contains_key(claude_session_id) {
-        // Backfill transcript_path and hook_source if missing
-        if let Some(sess_state) = state.hooks.sessions.get(claude_session_id)
+        // Backfill transcript_path and hook_source if missing.
+        // Only acquire the store lock when there's something that could be backfilled.
+        if (transcript_path.is_some() || hook_source.is_some())
+            && let Some(sess_state) = state.hooks.sessions.get(claude_session_id)
             && let Ok(store) = state.store.lock()
             && let Ok(Some(session)) = store.get_session(&sess_state.session_id)
         {
@@ -383,16 +385,12 @@ fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload, sourc
             let needs_update = session.metadata.get("partial").is_some()
                 || (payload.transcript_path.is_some() && session.metadata.get("transcript_path").is_none());
             if needs_update {
-                let mut meta = serde_json::json!({"claude_session_id": payload.session_id});
-                // Preserve existing transcript_path or set from payload
-                if let Some(tp) = payload.transcript_path.as_deref()
-                    .or_else(|| session.metadata.get("transcript_path").and_then(|v| v.as_str()))
-                {
+                let mut meta = session.metadata.clone();
+                // Remove partial flag
+                meta.as_object_mut().map(|m| m.remove("partial"));
+                // Set transcript_path from payload if not already present
+                if let Some(tp) = payload.transcript_path.as_deref() {
                     meta["transcript_path"] = serde_json::json!(tp);
-                }
-                // Preserve hook_source
-                if let Some(src) = session.metadata.get("hook_source") {
-                    meta["hook_source"] = src.clone();
                 }
                 store.update_session_metadata(&sess_state.session_id, &meta)?;
             }

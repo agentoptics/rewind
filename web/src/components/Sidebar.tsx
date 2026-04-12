@@ -83,7 +83,7 @@ export function Sidebar() {
 function SessionItem({ session, selected, onClick }: { session: Session; selected: boolean; onClick: () => void }) {
   const isLive = session.status === 'Recording'
   const isHook = session.source === 'hooks'
-  const isCursor = isHook && (session.metadata?.hook_source as string) === 'cursor'
+  const isCursor = isHook && session.metadata?.hook_source === 'cursor'
 
   return (
     <button

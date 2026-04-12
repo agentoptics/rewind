@@ -452,8 +452,8 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
     };
 
     for (rewind_session_id, claude_session_id) in &sessions_to_check {
-        // Read transcript_path + byte offset from session metadata (brief lock)
-        let (transcript_path, stored_offset) = {
+        // Read transcript_path, byte offset, hook_source, and discovery state from session metadata (brief lock)
+        let (transcript_path, stored_offset, hook_source, discovery_attempted) = {
             let store = match state.store.lock() {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -472,39 +472,37 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                 .get("transcript_byte_offset")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            (tp, offset)
+            let src = session
+                .metadata
+                .get("hook_source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let discovery_attempted = session
+                .metadata
+                .get("transcript_discovery_attempted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (tp, offset, src, discovery_attempted)
         };
 
         let transcript_path = match transcript_path {
             Some(p) => p,
             None => {
-                // For Cursor sessions, try to discover the transcript file on disk
-                let hook_source = {
-                    let store = match state.store.lock() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    match store.get_session(rewind_session_id) {
-                        Ok(Some(s)) => s.metadata.get("hook_source")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        _ => None,
-                    }
-                };
-
-                if hook_source.as_deref() != Some("cursor") {
+                // For Cursor sessions, try to discover the transcript file on disk.
+                // Skip if not a Cursor session or if discovery was already attempted.
+                if hook_source.as_deref() != Some("cursor") || discovery_attempted {
                     continue;
                 }
 
                 match discover_cursor_transcript(claude_session_id) {
                     Some(discovered) => {
-                        // Persist the discovered path so we don't glob again
-                        if let Ok(store) = state.store.lock() {
-                            if let Ok(Some(session)) = store.get_session(rewind_session_id) {
-                                let mut meta = session.metadata.clone();
-                                meta["transcript_path"] = serde_json::json!(&discovered);
-                                let _ = store.update_session_metadata(rewind_session_id, &meta);
-                            }
+                        // Persist the discovered path so we don't scan again
+                        if let Ok(store) = state.store.lock()
+                            && let Ok(Some(session)) = store.get_session(rewind_session_id)
+                        {
+                            let mut meta = session.metadata.clone();
+                            meta["transcript_path"] = serde_json::json!(&discovered);
+                            let _ = store.update_session_metadata(rewind_session_id, &meta);
                         }
                         tracing::info!(
                             "Discovered Cursor transcript for session {}: {}",
@@ -513,7 +511,17 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                         );
                         discovered
                     }
-                    None => continue,
+                    None => {
+                        // Cache the failure so we don't re-scan every sync cycle
+                        if let Ok(store) = state.store.lock()
+                            && let Ok(Some(session)) = store.get_session(rewind_session_id)
+                        {
+                            let mut meta = session.metadata.clone();
+                            meta["transcript_discovery_attempted"] = serde_json::json!(true);
+                            let _ = store.update_session_metadata(rewind_session_id, &meta);
+                        }
+                        continue;
+                    }
                 }
             }
         };
