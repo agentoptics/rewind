@@ -8,6 +8,8 @@ health checks. No added latency on the happy path.
 State machine: CLOSED → OPEN → HALF_OPEN → CLOSED
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import threading
@@ -28,8 +30,11 @@ def _is_connection_error(error: Exception) -> bool:
     """
     error_type = type(error).__name__
 
-    # Direct match on SDK error types
-    if error_type in ("APIConnectionError", "APITimeoutError"):
+    # Direct match on SDK connection error type.
+    # APITimeoutError is excluded: timeouts may originate from the upstream
+    # provider (slow LLM response), not the proxy. Including it would cause
+    # false trips when the proxy is healthy but upstream is slow.
+    if error_type == "APIConnectionError":
         return True
 
     # stdlib connection errors
@@ -41,8 +46,7 @@ def _is_connection_error(error: Exception) -> bool:
     if cause:
         cause_type = type(cause).__name__
         if cause_type in ("ConnectError", "ConnectionRefusedError",
-                          "ConnectionError", "ConnectionResetError",
-                          "ReadTimeout"):
+                          "ConnectionError", "ConnectionResetError"):
             return True
 
     return False
@@ -202,6 +206,7 @@ class ProxyCircuitBreaker:
         direct_client = openai.OpenAI(
             base_url=self.original_openai_url,
             api_key=existing_client.api_key,
+            organization=getattr(existing_client, "organization", None),
         )
         request_data = _serialize_request(kwargs)
         model = kwargs.get("model", "unknown")
@@ -232,6 +237,7 @@ class ProxyCircuitBreaker:
         direct_client = openai.AsyncOpenAI(
             base_url=self.original_openai_url,
             api_key=existing_client.api_key,
+            organization=getattr(existing_client, "organization", None),
         )
         request_data = _serialize_request(kwargs)
         model = kwargs.get("model", "unknown")
@@ -329,7 +335,11 @@ class ProxyCircuitBreaker:
             if cb.should_try_proxy():
                 try:
                     result = original(completions_self, *args, **kwargs)
-                    cb.record_success()
+                    # Only record success for non-streaming calls. For streaming,
+                    # original() returns a stream object — no data has flowed yet.
+                    # The proxy could die mid-stream after we've reset failure_count.
+                    if not kwargs.get("stream", False):
+                        cb.record_success()
                     return result
                 except Exception as e:
                     if _is_connection_error(e):
@@ -355,7 +365,8 @@ class ProxyCircuitBreaker:
             if cb.should_try_proxy():
                 try:
                     result = await original(completions_self, *args, **kwargs)
-                    cb.record_success()
+                    if not kwargs.get("stream", False):
+                        cb.record_success()
                     return result
                 except Exception as e:
                     if _is_connection_error(e):
@@ -381,7 +392,8 @@ class ProxyCircuitBreaker:
             if cb.should_try_proxy():
                 try:
                     result = original(messages_self, *args, **kwargs)
-                    cb.record_success()
+                    if not kwargs.get("stream", False):
+                        cb.record_success()
                     return result
                 except Exception as e:
                     if _is_connection_error(e):
@@ -407,7 +419,8 @@ class ProxyCircuitBreaker:
             if cb.should_try_proxy():
                 try:
                     result = await original(messages_self, *args, **kwargs)
-                    cb.record_success()
+                    if not kwargs.get("stream", False):
+                        cb.record_success()
                     return result
                 except Exception as e:
                     if _is_connection_error(e):
@@ -435,7 +448,8 @@ class ProxyCircuitBreaker:
             if cb.should_try_proxy():
                 try:
                     result = original(messages_self, *args, **kwargs)
-                    cb.record_success()
+                    # Don't record_success() — stream() returns a manager,
+                    # no data has flowed. Proxy could die mid-stream.
                     return result
                 except Exception as e:
                     if _is_connection_error(e):
@@ -485,7 +499,7 @@ class ProxyCircuitBreaker:
             if cb.should_try_proxy():
                 try:
                     result = original(messages_self, *args, **kwargs)
-                    cb.record_success()
+                    # Don't record_success() — stream manager, no data yet.
                     return result
                 except Exception as e:
                     if _is_connection_error(e):

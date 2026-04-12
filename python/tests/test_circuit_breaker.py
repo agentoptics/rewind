@@ -25,10 +25,11 @@ class TestIsConnectionError(unittest.TestCase):
         err = self._make_error("APIConnectionError")
         self.assertTrue(_is_connection_error(err))
 
-    def test_api_timeout_error_detected(self):
+    def test_api_timeout_error_not_detected(self):
+        """APITimeoutError excluded — timeouts may come from slow upstream, not dead proxy."""
         from rewind_agent.circuit_breaker import _is_connection_error
         err = self._make_error("APITimeoutError")
-        self.assertTrue(_is_connection_error(err))
+        self.assertFalse(_is_connection_error(err))
 
     def test_regular_api_error_not_detected(self):
         from rewind_agent.circuit_breaker import _is_connection_error
@@ -245,6 +246,94 @@ def _find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+class TestRetryPath(unittest.TestCase):
+    """Test the core value proposition: proxy fails → fallthrough → call succeeds."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._saved_rewind_data = os.environ.get("REWIND_DATA")
+        os.environ["REWIND_DATA"] = self.tmpdir
+
+    def tearDown(self):
+        if self._saved_rewind_data is None:
+            os.environ.pop("REWIND_DATA", None)
+        else:
+            os.environ["REWIND_DATA"] = self._saved_rewind_data
+
+    def test_direct_recorder_records_step_after_trip(self):
+        """After tripping to OPEN, the direct recorder correctly stores steps."""
+        from rewind_agent.circuit_breaker import ProxyCircuitBreaker
+
+        cb = ProxyCircuitBreaker(
+            proxy_url="http://127.0.0.1:9999",
+            original_openai_url="https://api.openai.com/v1",
+            original_anthropic_url="https://api.anthropic.com",
+            session_name="retry-test",
+            failure_threshold=2,
+        )
+        # Trip to OPEN
+        cb.record_failure(_make_conn_error())
+        cb.record_failure(_make_conn_error())
+        self.assertEqual(cb.state, "open")
+        self.assertIsNotNone(cb._direct_recorder)
+
+        # Simulate what _call_direct does after a successful retry:
+        # call _record_call on the direct recorder
+        cb._direct_recorder._record_call(
+            model="gpt-4o",
+            request_data={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            response_data={
+                "choices": [{"message": {"content": "hello"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+            duration_ms=150,
+            provider="openai",
+        )
+
+        # Verify the step was recorded in the local store
+        store = cb._direct_store
+        root_tl = store.get_root_timeline(cb._direct_session_id)
+        steps = store.get_steps(root_tl["id"])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["model"], "gpt-4o")
+        self.assertEqual(steps[0]["status"], "success")
+        self.assertEqual(steps[0]["tokens_in"], 10)
+        self.assertEqual(steps[0]["tokens_out"], 5)
+
+        cb.teardown()
+
+    def test_state_transitions_through_full_cycle(self):
+        """CLOSED → OPEN → HALF_OPEN → CLOSED full cycle."""
+        from rewind_agent.circuit_breaker import ProxyCircuitBreaker
+
+        cb = ProxyCircuitBreaker(
+            proxy_url="http://127.0.0.1:9999",
+            original_openai_url="https://api.openai.com/v1",
+            original_anthropic_url="https://api.anthropic.com",
+            session_name="cycle-test",
+            failure_threshold=2,
+            recovery_timeout=0.1,
+        )
+
+        # CLOSED → OPEN
+        self.assertEqual(cb.state, "closed")
+        cb.record_failure(_make_conn_error())
+        cb.record_failure(_make_conn_error())
+        self.assertEqual(cb.state, "open")
+        self.assertIsNotNone(cb._direct_store)
+
+        # OPEN → HALF_OPEN (after recovery timeout)
+        time.sleep(0.15)
+        self.assertTrue(cb.should_try_proxy())
+        self.assertEqual(cb.state, "half_open")
+
+        # HALF_OPEN → CLOSED (probe succeeds)
+        cb.record_success()
+        self.assertEqual(cb.state, "closed")
+        self.assertIsNone(cb._direct_store)
+        self.assertEqual(cb.failure_count, 0)
 
 
 class TestCircuitBreakerIntegration(unittest.TestCase):
