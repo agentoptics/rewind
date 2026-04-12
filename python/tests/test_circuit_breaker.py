@@ -1,10 +1,12 @@
 """Tests for the mid-session proxy circuit breaker."""
 
+import json
 import os
 import tempfile
 import threading
 import time
 import unittest
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Step 1: Error detection tests ──────────────────────────────
 
@@ -217,9 +219,6 @@ class TestCircuitBreakerStateMachine(unittest.TestCase):
 
 
 # ── Step 7: Integration with patch.py ──────────────────────────
-
-import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 class MockHealthHandler(BaseHTTPRequestHandler):
