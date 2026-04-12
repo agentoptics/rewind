@@ -83,6 +83,7 @@ export function Sidebar() {
 function SessionItem({ session, selected, onClick }: { session: Session; selected: boolean; onClick: () => void }) {
   const isLive = session.status === 'Recording'
   const isHook = session.source === 'hooks'
+  const isCursor = isHook && (session.metadata?.hook_source as string) === 'cursor'
 
   return (
     <button
@@ -97,7 +98,12 @@ function SessionItem({ session, selected, onClick }: { session: Session; selecte
         <div className="flex items-center gap-1.5">
           <span className="text-sm font-medium truncate">{session.name}</span>
           {isLive && <span className="text-[10px] font-semibold text-cyan-400 uppercase tracking-wide">live</span>}
-          {isHook && (
+          {isCursor ? (
+            <span className="flex items-center gap-0.5 text-[10px] font-semibold text-blue-400 uppercase tracking-wide">
+              <Plug size={10} />
+              cursor
+            </span>
+          ) : isHook && (
             <span className="flex items-center gap-0.5 text-[10px] font-semibold text-violet-400 uppercase tracking-wide">
               <Plug size={10} />
               hooks

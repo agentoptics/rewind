@@ -260,34 +260,43 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
     // uses camelCase (preToolUse). Also handle legacy names (beforeSubmitPrompt).
     let event_type_lower = envelope.event_type.to_lowercase();
 
+    let source = &envelope.source;
+
     match event_type_lower.as_str() {
-        "sessionstart" => handle_session_start(state, &payload),
-        "pretooluse" => handle_pre_tool_use(state, &payload),
-        "posttooluse" => handle_post_tool_use(state, &payload, StepStatus::Success),
-        "posttoolusefailure" => handle_post_tool_use(state, &payload, StepStatus::Error),
-        "userpromptsubmit" | "beforesubmitprompt" | "beforepromptsubmit" => handle_user_prompt(state, &payload, &envelope.payload),
+        "sessionstart" => handle_session_start(state, &payload, source),
+        "pretooluse" => handle_pre_tool_use(state, &payload, source),
+        "posttooluse" => handle_post_tool_use(state, &payload, StepStatus::Success, source),
+        "posttoolusefailure" => handle_post_tool_use(state, &payload, StepStatus::Error, source),
+        "userpromptsubmit" | "beforesubmitprompt" | "beforepromptsubmit" => handle_user_prompt(state, &payload, &envelope.payload, source),
         "sessionend" | "stop" => handle_session_end(state, &payload),
-        _ => handle_generic_event(state, &payload, &envelope.event_type, &envelope.payload),
+        _ => handle_generic_event(state, &payload, &envelope.event_type, &envelope.payload, source),
     }
 }
 
 /// Ensure a session exists in both the store and in-memory state.
 /// If the session doesn't exist yet (e.g. a non-SessionStart event arrived first),
 /// create it with partial=true metadata.
-fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, partial: bool) -> anyhow::Result<()> {
+fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
     // Fast path: session already exists in memory
     if state.hooks.sessions.contains_key(claude_session_id) {
-        // Backfill transcript_path if missing (sessions created before this feature)
-        if let Some(tp) = transcript_path
-            && let Some(sess_state) = state.hooks.sessions.get(claude_session_id)
+        // Backfill transcript_path and hook_source if missing
+        if let Some(sess_state) = state.hooks.sessions.get(claude_session_id)
             && let Ok(store) = state.store.lock()
             && let Ok(Some(session)) = store.get_session(&sess_state.session_id)
-            && session.metadata.get("transcript_path").is_none()
         {
-            let mut meta = session.metadata.clone();
-            meta["transcript_path"] = serde_json::json!(tp);
-            let _ = store.update_session_metadata(&sess_state.session_id, &meta);
-            tracing::info!("Backfilled transcript_path for session {}", &claude_session_id[..8.min(claude_session_id.len())]);
+            let need_tp = transcript_path.is_some() && session.metadata.get("transcript_path").is_none();
+            let need_src = hook_source.is_some() && session.metadata.get("hook_source").is_none();
+            if need_tp || need_src {
+                let mut meta = session.metadata.clone();
+                if let Some(tp) = transcript_path {
+                    meta["transcript_path"] = serde_json::json!(tp);
+                }
+                if let Some(src) = hook_source {
+                    meta["hook_source"] = serde_json::json!(src);
+                }
+                let _ = store.update_session_metadata(&sess_state.session_id, &meta);
+                tracing::info!("Backfilled metadata for session {}", &claude_session_id[..8.min(claude_session_id.len())]);
+            }
         }
         return Ok(());
     }
@@ -329,6 +338,9 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
     if let Some(tp) = transcript_path {
         meta["transcript_path"] = serde_json::json!(tp);
     }
+    if let Some(src) = hook_source {
+        meta["hook_source"] = serde_json::json!(src);
+    }
     session.metadata = meta;
 
     let timeline = Timeline::new_root(&session.id);
@@ -360,8 +372,8 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
     Ok(())
 }
 
-fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload) -> anyhow::Result<Option<String>> {
-    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), false)?;
+fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload, source: &str) -> anyhow::Result<Option<String>> {
+    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), false)?;
 
     // If session already existed as partial, update metadata to remove partial flag
     // and ensure transcript_path is set
@@ -378,6 +390,10 @@ fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload) -> an
                 {
                     meta["transcript_path"] = serde_json::json!(tp);
                 }
+                // Preserve hook_source
+                if let Some(src) = session.metadata.get("hook_source") {
+                    meta["hook_source"] = src.clone();
+                }
                 store.update_session_metadata(&sess_state.session_id, &meta)?;
             }
         }
@@ -386,8 +402,8 @@ fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload) -> an
     Ok(Some("session_created".to_string()))
 }
 
-fn handle_pre_tool_use(state: &AppState, payload: &ClaudeCodeHookPayload) -> anyhow::Result<Option<String>> {
-    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), true)?;
+fn handle_pre_tool_use(state: &AppState, payload: &ClaudeCodeHookPayload, source: &str) -> anyhow::Result<Option<String>> {
+    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
         .ok_or_else(|| anyhow::anyhow!("Session state missing after ensure"))?;
@@ -438,8 +454,9 @@ fn handle_post_tool_use(
     state: &AppState,
     payload: &ClaudeCodeHookPayload,
     status: StepStatus,
+    source: &str,
 ) -> anyhow::Result<Option<String>> {
-    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), true)?;
+    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
         .ok_or_else(|| anyhow::anyhow!("Session state missing after ensure"))?;
@@ -529,8 +546,8 @@ fn handle_post_tool_use(
     Ok(None)
 }
 
-fn handle_user_prompt(state: &AppState, payload: &ClaudeCodeHookPayload, raw_payload: &serde_json::Value) -> anyhow::Result<Option<String>> {
-    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), true)?;
+fn handle_user_prompt(state: &AppState, payload: &ClaudeCodeHookPayload, raw_payload: &serde_json::Value, source: &str) -> anyhow::Result<Option<String>> {
+    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
         .ok_or_else(|| anyhow::anyhow!("Session state missing after ensure"))?;
@@ -610,8 +627,9 @@ fn handle_generic_event(
     payload: &ClaudeCodeHookPayload,
     event_type: &str,
     raw_payload: &serde_json::Value,
+    source: &str,
 ) -> anyhow::Result<Option<String>> {
-    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), true)?;
+    ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
         .ok_or_else(|| anyhow::anyhow!("Session state missing after ensure"))?;

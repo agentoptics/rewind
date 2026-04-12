@@ -213,6 +213,36 @@ fn read_new_lines(path: &Path, offset: u64) -> anyhow::Result<(Vec<String>, u64)
     Ok((lines, new_offset))
 }
 
+// ── Cursor transcript discovery ────────────────────────────
+
+/// Attempt to find a Cursor IDE transcript file for the given session ID.
+/// Searches `~/.cursor/projects/*/agent-transcripts/{session_id}/{session_id}.jsonl`.
+/// Returns the path if found, None otherwise. Runs once per session.
+fn discover_cursor_transcript(session_id: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let base = std::path::Path::new(&home).join(".cursor/projects");
+    discover_cursor_transcript_in(session_id, &base)
+}
+
+/// Inner implementation that accepts a base path for testability.
+fn discover_cursor_transcript_in(session_id: &str, base: &std::path::Path) -> Option<String> {
+    if !base.is_dir() {
+        return None;
+    }
+
+    let read_dir = std::fs::read_dir(base).ok()?;
+    for entry in read_dir.flatten() {
+        let candidate = entry.path()
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(format!("{}.jsonl", session_id));
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 // ── Content block helpers ───────────────────────────────────
 
 /// Extract concatenated text from an assistant message's content blocks.
@@ -447,7 +477,45 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
 
         let transcript_path = match transcript_path {
             Some(p) => p,
-            None => continue,
+            None => {
+                // For Cursor sessions, try to discover the transcript file on disk
+                let hook_source = {
+                    let store = match state.store.lock() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    match store.get_session(rewind_session_id) {
+                        Ok(Some(s)) => s.metadata.get("hook_source")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        _ => None,
+                    }
+                };
+
+                if hook_source.as_deref() != Some("cursor") {
+                    continue;
+                }
+
+                match discover_cursor_transcript(claude_session_id) {
+                    Some(discovered) => {
+                        // Persist the discovered path so we don't glob again
+                        if let Ok(store) = state.store.lock() {
+                            if let Ok(Some(session)) = store.get_session(rewind_session_id) {
+                                let mut meta = session.metadata.clone();
+                                meta["transcript_path"] = serde_json::json!(&discovered);
+                                let _ = store.update_session_metadata(rewind_session_id, &meta);
+                            }
+                        }
+                        tracing::info!(
+                            "Discovered Cursor transcript for session {}: {}",
+                            &claude_session_id[..8.min(claude_session_id.len())],
+                            &discovered
+                        );
+                        discovered
+                    }
+                    None => continue,
+                }
+            }
         };
 
         let path = Path::new(&transcript_path);
@@ -1125,4 +1193,65 @@ mod tests {
     }
 
     use chrono::Datelike;
+
+    // ── Cursor transcript discovery tests ───────────────────
+
+    #[test]
+    fn test_discover_cursor_transcript_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = "abc-def-123";
+
+        // Create the expected directory structure:
+        // {base}/1234567890/agent-transcripts/abc-def-123/abc-def-123.jsonl
+        let transcript_dir = tmp.path()
+            .join("1234567890")
+            .join("agent-transcripts")
+            .join(session_id);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_file = transcript_dir.join(format!("{}.jsonl", session_id));
+        std::fs::write(&transcript_file, "{}\n").unwrap();
+
+        let result = super::discover_cursor_transcript_in(session_id, tmp.path());
+        assert!(result.is_some(), "Should discover transcript file");
+        assert_eq!(result.unwrap(), transcript_file.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_discover_cursor_transcript_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a project dir but no matching transcript
+        std::fs::create_dir_all(tmp.path().join("1234567890/agent-transcripts/other-session")).unwrap();
+
+        let result = super::discover_cursor_transcript_in("nonexistent-session", tmp.path());
+        assert!(result.is_none(), "Should return None when transcript not found");
+    }
+
+    #[test]
+    fn test_discover_cursor_transcript_no_base_dir() {
+        let result = super::discover_cursor_transcript_in(
+            "any-session",
+            std::path::Path::new("/nonexistent/path"),
+        );
+        assert!(result.is_none(), "Should return None when base dir doesn't exist");
+    }
+
+    #[test]
+    fn test_discover_cursor_transcript_multiple_projects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = "target-session";
+
+        // Create multiple project directories, only one has the transcript
+        std::fs::create_dir_all(tmp.path().join("111/agent-transcripts/other")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("222/agent-transcripts")).unwrap();
+
+        let transcript_dir = tmp.path()
+            .join("333")
+            .join("agent-transcripts")
+            .join(session_id);
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(transcript_dir.join(format!("{}.jsonl", session_id)), "{}\n").unwrap();
+
+        let result = super::discover_cursor_transcript_in(session_id, tmp.path());
+        assert!(result.is_some(), "Should find transcript across multiple project dirs");
+    }
 }

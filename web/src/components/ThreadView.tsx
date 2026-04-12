@@ -44,7 +44,7 @@ export function ThreadView({ threadId, onBack }: ThreadViewProps) {
             <div className="flex items-center gap-4 text-xs text-neutral-500 mt-1">
               <span>{data.sessions.length} turns</span>
               <span className="flex items-center gap-1"><Layers size={11} /> {totalSteps} steps</span>
-              <span className="flex items-center gap-1"><Zap size={11} /> {formatTokens(totalTokens)} tokens</span>
+              {totalTokens > 0 && <span className="flex items-center gap-1"><Zap size={11} /> {formatTokens(totalTokens)} tokens</span>}
             </div>
           </div>
         </div>
@@ -97,7 +97,7 @@ function TurnCard({ session, turnNumber, onClick }: { session: Session; turnNumb
       </div>
       <div className="flex items-center gap-4 text-xs text-neutral-500 pl-16">
         <span>{session.total_steps} steps</span>
-        <span>{formatTokens(session.total_tokens)} tokens</span>
+        {session.total_tokens > 0 && <span>{formatTokens(session.total_tokens)} tokens</span>}
       </div>
     </button>
   )
