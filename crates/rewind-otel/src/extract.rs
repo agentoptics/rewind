@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rewind_store::models::{Session, Span, Step, Timeline};
+use rewind_store::models::{Session, Step, Timeline};
 use rewind_store::Store;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,11 +11,8 @@ pub struct SessionExportData {
     pub session: Session,
     pub timelines: Vec<Timeline>,
     pub steps_by_timeline: HashMap<String, Vec<Step>>,
-    pub spans: Vec<Span>,
-    /// Parsed request blobs keyed by SHA-256 hash.
-    pub request_blobs: HashMap<String, Value>,
-    /// Parsed response blobs keyed by SHA-256 hash.
-    pub response_blobs: HashMap<String, Value>,
+    /// Parsed blobs (request + response) keyed by SHA-256 hash.
+    pub blobs: HashMap<String, Value>,
 }
 
 /// Options controlling which timelines to extract.
@@ -71,22 +68,15 @@ pub fn extract_session_data(
         steps_by_timeline.insert(tl.id.clone(), steps);
     }
 
-    // 4. Get spans
-    let spans = store.get_spans_by_session(session_id)?;
-
-    // 5. Resolve blobs (deduplicated)
+    // 4. Resolve blobs (deduplicated)
     blob_hashes.sort();
     blob_hashes.dedup();
 
-    let mut request_blobs = HashMap::new();
-    let mut response_blobs = HashMap::new();
+    let mut blobs = HashMap::new();
 
     for hash in &blob_hashes {
         if let Ok(value) = store.blobs.get_json::<Value>(hash) {
-            // Store in both maps — we don't know which is request vs response
-            // until we look it up by the step's field. Both maps share the same pool.
-            request_blobs.insert(hash.clone(), value.clone());
-            response_blobs.insert(hash.clone(), value);
+            blobs.insert(hash.clone(), value);
         } else {
             tracing::warn!(hash = %hash, "Failed to read blob, skipping");
         }
@@ -96,9 +86,7 @@ pub fn extract_session_data(
         session,
         timelines,
         steps_by_timeline,
-        spans,
-        request_blobs,
-        response_blobs,
+        blobs,
     })
 }
 
@@ -132,13 +120,8 @@ impl SessionExportData {
         self.steps_by_timeline.values().map(|s| s.len()).sum()
     }
 
-    /// Look up a request blob by its hash.
-    pub fn get_request_blob(&self, hash: &str) -> Option<&Value> {
-        self.request_blobs.get(hash)
-    }
-
-    /// Look up a response blob by its hash.
-    pub fn get_response_blob(&self, hash: &str) -> Option<&Value> {
-        self.response_blobs.get(hash)
+    /// Look up a blob by its SHA-256 hash.
+    pub fn get_blob(&self, hash: &str) -> Option<&Value> {
+        self.blobs.get(hash)
     }
 }

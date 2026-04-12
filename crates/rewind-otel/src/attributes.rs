@@ -33,7 +33,10 @@ pub fn span_name(step: &Step) -> String {
             format!("tool.result {}", name)
         }
         StepType::UserPrompt => "user.prompt".to_string(),
-        StepType::HookEvent => "hook.event".to_string(),
+        StepType::HookEvent => {
+            let event_type = step.tool_name.as_deref().unwrap_or("unknown");
+            format!("hook.event {}", event_type)
+        }
     }
 }
 
@@ -128,7 +131,7 @@ pub fn llm_call_attributes(
         if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
             attrs.push(KeyValue::new("gen_ai.response.id", id.to_string()));
         }
-        // finish_reasons — extract from choices array
+        // finish_reasons — OpenAI format (choices array) vs Anthropic (top-level stop_reason)
         if let Some(choices) = resp.get("choices").and_then(|v| v.as_array()) {
             let reasons: Vec<String> = choices
                 .iter()
@@ -138,18 +141,14 @@ pub fn llm_call_attributes(
             if !reasons.is_empty() {
                 attrs.push(KeyValue::new("gen_ai.response.finish_reasons", format!("[{}]", reasons.join(","))));
             }
-        }
-        // Anthropic format: stop_reason at top level
-        if let Some(stop) = resp.get("stop_reason").and_then(|v| v.as_str()) {
+        } else if let Some(stop) = resp.get("stop_reason").and_then(|v| v.as_str()) {
             attrs.push(KeyValue::new("gen_ai.response.finish_reasons", format!("[{}]", stop)));
         }
-        // Content (opt-in)
+        // Content (opt-in) — OpenAI vs Anthropic format
         if include_content {
             if let Some(choices) = resp.get("choices") {
                 attrs.push(KeyValue::new("gen_ai.output.messages", choices.to_string()));
-            }
-            // Anthropic format
-            if let Some(content) = resp.get("content") {
+            } else if let Some(content) = resp.get("content") {
                 attrs.push(KeyValue::new("gen_ai.output.messages", content.to_string()));
             }
         }
@@ -199,11 +198,28 @@ pub fn tool_result_attributes(step: &Step) -> Vec<KeyValue> {
     attrs
 }
 
-/// Build OTel attributes for UserPrompt / HookEvent steps.
-pub fn misc_step_attributes(step: &Step) -> Vec<KeyValue> {
+/// Build OTel attributes for a UserPrompt step.
+pub fn user_prompt_attributes(step: &Step) -> Vec<KeyValue> {
     let mut attrs = Vec::with_capacity(4);
 
-    attrs.push(KeyValue::new("rewind.step.type", step.step_type.as_str().to_string()));
+    attrs.push(KeyValue::new("rewind.step.type", "user_prompt"));
+    attrs.push(KeyValue::new("rewind.duration_ms", step.duration_ms as i64));
+
+    if let Some(ref err) = step.error {
+        attrs.push(KeyValue::new("error.type", err.clone()));
+    }
+
+    attrs
+}
+
+/// Build OTel attributes for a HookEvent step.
+pub fn hook_event_attributes(step: &Step) -> Vec<KeyValue> {
+    let mut attrs = Vec::with_capacity(6);
+
+    attrs.push(KeyValue::new("rewind.hook.type", step.step_type.as_str().to_string()));
+    if let Some(ref name) = step.tool_name {
+        attrs.push(KeyValue::new("rewind.hook.event_type", name.clone()));
+    }
     attrs.push(KeyValue::new("rewind.duration_ms", step.duration_ms as i64));
 
     if let Some(ref err) = step.error {
@@ -224,7 +240,8 @@ pub fn step_attributes(
         StepType::LlmCall => llm_call_attributes(step, request_blob, response_blob, include_content),
         StepType::ToolCall => tool_call_attributes(step, request_blob),
         StepType::ToolResult => tool_result_attributes(step),
-        StepType::UserPrompt | StepType::HookEvent => misc_step_attributes(step),
+        StepType::UserPrompt => user_prompt_attributes(step),
+        StepType::HookEvent => hook_event_attributes(step),
     }
 }
 
@@ -293,8 +310,14 @@ mod tests {
 
     #[test]
     fn test_span_name_hook_event() {
+        let step = make_step(StepType::HookEvent, "", Some("on_tool_start"));
+        assert_eq!(span_name(&step), "hook.event on_tool_start");
+    }
+
+    #[test]
+    fn test_span_name_hook_event_unknown() {
         let step = make_step(StepType::HookEvent, "", None);
-        assert_eq!(span_name(&step), "hook.event");
+        assert_eq!(span_name(&step), "hook.event unknown");
     }
 
     // ── span_kind tests ──
@@ -462,6 +485,7 @@ mod tests {
         let llm = make_step(StepType::LlmCall, "gpt-4o", None);
         let tool = make_step(StepType::ToolCall, "", Some("read_file"));
         let prompt = make_step(StepType::UserPrompt, "", None);
+        let hook = make_step(StepType::HookEvent, "", Some("on_tool_start"));
 
         let llm_attrs = step_attributes(&llm, None, None, false);
         assert!(find_attr(&llm_attrs, "gen_ai.operation.name").is_some());
@@ -471,5 +495,9 @@ mod tests {
 
         let prompt_attrs = step_attributes(&prompt, None, None, false);
         assert!(find_attr(&prompt_attrs, "rewind.step.type").is_some());
+
+        let hook_attrs = step_attributes(&hook, None, None, false);
+        assert!(find_attr(&hook_attrs, "rewind.hook.type").is_some());
+        assert!(find_attr(&hook_attrs, "rewind.hook.event_type").is_some());
     }
 }

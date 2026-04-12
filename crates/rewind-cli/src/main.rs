@@ -223,8 +223,8 @@ enum ExportAction {
         #[arg(long, env = "OTEL_EXPORTER_OTLP_PROTOCOL", default_value = "http")]
         protocol: String,
 
-        /// HTTP headers as KEY=VALUE (repeatable)
-        #[arg(long = "header", env = "OTEL_EXPORTER_OTLP_HEADERS")]
+        /// HTTP headers as KEY=VALUE (repeatable, or comma-separated via env var)
+        #[arg(long = "header", env = "OTEL_EXPORTER_OTLP_HEADERS", value_delimiter = ',')]
         headers: Vec<String>,
 
         /// Export a specific timeline (default: main timeline)
@@ -2894,14 +2894,14 @@ async fn cmd_export_otel(
 
     let span_count = if dry_run {
         println!("{} Dry run — writing spans to stdout:\n", "📋".bold());
-        rewind_otel::export::export_to_stdout(&data, &config).await?
+        rewind_otel::export::export_to_stdout(&data, &config)?
     } else {
         println!(
             "{} Exporting to {} ...",
             "📡".bold(),
             endpoint.cyan()
         );
-        rewind_otel::export::export_to_otlp(&data, &config).await?
+        rewind_otel::export::export_to_otlp(&data, &config)?
     };
 
     println!(

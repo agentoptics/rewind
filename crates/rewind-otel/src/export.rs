@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use opentelemetry::trace::{SpanKind, TraceContextExt, TraceFlags, TraceState, Tracer, TracerProvider};
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanLimits};
 use opentelemetry_sdk::Resource;
 use sha2::{Digest, Sha256};
@@ -69,7 +69,7 @@ fn to_system_time(dt: &chrono::DateTime<chrono::Utc>) -> SystemTime {
 /// Export session data to an OTLP endpoint.
 ///
 /// Returns the number of spans exported.
-pub async fn export_to_otlp(data: &SessionExportData, config: &ExportConfig) -> Result<usize> {
+pub fn export_to_otlp(data: &SessionExportData, config: &ExportConfig) -> Result<usize> {
     let provider = build_provider(config)?;
     let span_count = emit_spans(&provider, data, config)?;
 
@@ -83,7 +83,7 @@ pub async fn export_to_otlp(data: &SessionExportData, config: &ExportConfig) -> 
 /// Export session data to stdout (for --dry-run).
 ///
 /// Returns the number of spans exported.
-pub async fn export_to_stdout(data: &SessionExportData, config: &ExportConfig) -> Result<usize> {
+pub fn export_to_stdout(data: &SessionExportData, config: &ExportConfig) -> Result<usize> {
     let provider = build_stdout_provider()?;
     let span_count = emit_spans(&provider, data, config)?;
 
@@ -97,11 +97,20 @@ pub async fn export_to_stdout(data: &SessionExportData, config: &ExportConfig) -
 fn build_provider(config: &ExportConfig) -> Result<SdkTracerProvider> {
     let exporter = match config.protocol {
         Protocol::Grpc => {
-            opentelemetry_otlp::SpanExporter::builder()
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            for (key, value) in &config.headers {
+                let key = key.parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
+                    .context("Invalid gRPC metadata key")?;
+                let value = value.parse().context("Invalid gRPC metadata value")?;
+                metadata.insert(key, value);
+            }
+            let mut builder = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
-                .with_endpoint(&config.endpoint)
-                .build()
-                .context("Failed to build gRPC exporter")?
+                .with_endpoint(&config.endpoint);
+            if !metadata.is_empty() {
+                builder = builder.with_metadata(metadata);
+            }
+            builder.build().context("Failed to build gRPC exporter")?
         }
         Protocol::Http => {
             let mut headers = std::collections::HashMap::new();
@@ -155,16 +164,26 @@ fn emit_spans(
     data: &SessionExportData,
     config: &ExportConfig,
 ) -> Result<usize> {
+    use opentelemetry::trace::Span;
+
     let tracer = provider.tracer("rewind-otel");
     let trace_id = trace_id_from_session(&data.session.id);
     let mut span_count = 0;
 
+    // Seed a root context with our deterministic trace ID so all child spans
+    // inherit it instead of the SDK generating a random one.
+    let root_span_ctx = opentelemetry::trace::SpanContext::new(
+        trace_id,
+        span_id_from_id("root-seed"), // placeholder, won't appear in output
+        TraceFlags::SAMPLED,
+        false,
+        TraceState::default(),
+    );
+    let root_ctx = opentelemetry::Context::new().with_remote_span_context(root_span_ctx);
+
     // Session root span
-    let session_span_id = span_id_from_id(&data.session.id);
     let session_start = to_system_time(&data.session.created_at);
     let session_end = to_system_time(&data.session.updated_at);
-
-    use opentelemetry::trace::Span;
 
     let mut session_span = tracer
         .span_builder(format!("session {}", data.session.name))
@@ -177,14 +196,26 @@ fn emit_spans(
             KeyValue::new("rewind.session.total_steps", data.session.total_steps as i64),
             KeyValue::new("rewind.session.total_tokens", data.session.total_tokens as i64),
         ])
-        .start_with_context(&tracer, &opentelemetry::Context::new());
+        .start_with_context(&tracer, &root_ctx);
 
+    // Read back the actual SDK-assigned span ID for use as parent
+    let actual_session_span_id = session_span.span_context().span_id();
     session_span.end_with_timestamp(session_end);
     span_count += 1;
 
+    // Build parent context from the actual session span ID
+    let session_parent_ctx = opentelemetry::trace::SpanContext::new(
+        trace_id,
+        actual_session_span_id,
+        TraceFlags::SAMPLED,
+        false,
+        TraceState::default(),
+    );
+    let session_otel_ctx =
+        opentelemetry::Context::new().with_remote_span_context(session_parent_ctx);
+
     // Timeline spans + step spans
     for timeline in &data.timelines {
-        let tl_span_id = span_id_from_id(&timeline.id);
         let tl_start = to_system_time(&timeline.created_at);
 
         let mut tl_attrs = vec![
@@ -198,38 +229,30 @@ fn emit_spans(
             tl_attrs.push(KeyValue::new("rewind.timeline.fork_at_step", fork_at as i64));
         }
 
-        // Create parent context pointing to session span
-        let parent_ctx = opentelemetry::trace::SpanContext::new(
-            trace_id,
-            session_span_id,
-            TraceFlags::SAMPLED,
-            false,
-            TraceState::default(),
-        );
-        let parent_otel_ctx = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
-
         let mut tl_span = tracer
             .span_builder(format!("timeline {}", timeline.label))
             .with_kind(SpanKind::Internal)
             .with_start_time(tl_start)
             .with_attributes(tl_attrs)
-            .start_with_context(&tracer, &parent_otel_ctx);
+            .start_with_context(&tracer, &session_otel_ctx);
 
+        // Read back actual timeline span ID for step parenting
+        let actual_tl_span_id = tl_span.span_context().span_id();
         span_count += 1;
+
+        // Build parent context from actual timeline span ID
+        let tl_parent_ctx = opentelemetry::trace::SpanContext::new(
+            trace_id,
+            actual_tl_span_id,
+            TraceFlags::SAMPLED,
+            false,
+            TraceState::default(),
+        );
+        let tl_otel_ctx =
+            opentelemetry::Context::new().with_remote_span_context(tl_parent_ctx);
 
         // Step spans under this timeline
         if let Some(steps) = data.steps_by_timeline.get(&timeline.id) {
-            // Create parent context pointing to timeline span
-            let tl_parent_ctx = opentelemetry::trace::SpanContext::new(
-                trace_id,
-                tl_span_id,
-                TraceFlags::SAMPLED,
-                false,
-                TraceState::default(),
-            );
-            let tl_otel_ctx =
-                opentelemetry::Context::new().with_remote_span_context(tl_parent_ctx);
-
             for step in steps {
                 let name = attributes::span_name(step);
                 let kind = match attributes::span_kind(step) {
@@ -237,8 +260,8 @@ fn emit_spans(
                     OtelSpanKind::Internal => SpanKind::Internal,
                 };
 
-                let req_blob = data.get_request_blob(&step.request_blob);
-                let resp_blob = data.get_response_blob(&step.response_blob);
+                let req_blob = data.get_blob(&step.request_blob);
+                let resp_blob = data.get_blob(&step.response_blob);
                 let mut attrs =
                     attributes::step_attributes(step, req_blob, resp_blob, config.include_content);
 
@@ -265,14 +288,19 @@ fn emit_spans(
             }
         }
 
-        tl_span.end_with_timestamp(
-            tl_start + std::time::Duration::from_millis(
-                data.steps_by_timeline
-                    .get(&timeline.id)
-                    .map(|steps| steps.iter().map(|s| s.duration_ms).sum::<u64>())
-                    .unwrap_or(0),
-            ),
-        );
+        // Timeline end = max(step end times), not sum of durations
+        let tl_end = data
+            .steps_by_timeline
+            .get(&timeline.id)
+            .and_then(|steps| {
+                steps.iter().map(|s| {
+                    to_system_time(&s.created_at)
+                        + std::time::Duration::from_millis(s.duration_ms)
+                }).max()
+            })
+            .unwrap_or(tl_start);
+
+        tl_span.end_with_timestamp(tl_end);
     }
 
     Ok(span_count)
