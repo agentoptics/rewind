@@ -15,6 +15,7 @@ fn setup() -> (AppState, Arc<Mutex<Store>>, TempDir, Arc<HookIngestionState>) {
         store: store.clone(),
         event_tx,
         hooks: hooks.clone(),
+        otel_config: None,
     };
     (state, store, tmp, hooks)
 }

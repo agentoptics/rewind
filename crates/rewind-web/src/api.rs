@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use rewind_replay::ReplayEngine;
@@ -18,6 +18,7 @@ pub fn routes(state: AppState) -> Router {
         .route("/sessions/{id}/steps", get(get_session_steps))
         .route("/sessions/{id}/timelines", get(get_session_timelines))
         .route("/sessions/{id}/diff", get(diff_timelines))
+        .route("/sessions/{id}/export/otel", post(export_otel))
         .route("/steps/{id}", get(get_step_detail))
         .route("/baselines", get(list_baselines))
         .route("/baselines/{name}", get(get_baseline))
@@ -585,4 +586,75 @@ fn extract_preview(store: &rewind_store::Store, blob_hash: &str) -> String {
             Some(json_str.chars().take(200).collect())
         })
         .unwrap_or_default()
+}
+
+// ── OTel Export ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct OtelExportRequest {
+    #[serde(default)]
+    include_content: bool,
+    timeline_id: Option<String>,
+    #[serde(default)]
+    all_timelines: bool,
+}
+
+#[derive(Serialize)]
+struct OtelExportResponse {
+    spans_exported: usize,
+    trace_id: String,
+}
+
+async fn export_otel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<OtelExportRequest>,
+) -> Result<Json<OtelExportResponse>, (StatusCode, String)> {
+    // Check if OTel is configured server-side
+    let otel_config = state.otel_config.as_ref().ok_or_else(|| {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "OTel export not configured. Set REWIND_OTEL_ENDPOINT environment variable.".to_string(),
+        )
+    })?;
+
+    // Extract session data synchronously (Store is not Send)
+    let data = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock: {e}")))?;
+
+        let session = store
+            .get_session(&id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Session not found: {id}")))?;
+
+        let opts = rewind_otel::extract::ExtractOptions {
+            timeline_id: body.timeline_id.clone(),
+            all_timelines: body.all_timelines,
+        };
+
+        rewind_otel::extract::extract_session_data(&store, &session.id, &opts)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Extract error: {e}")))?
+    };
+
+    // Build export config from server-side settings
+    let config = rewind_otel::export::ExportConfig {
+        endpoint: otel_config.endpoint.clone(),
+        protocol: otel_config.protocol,
+        headers: otel_config.headers.clone(),
+        include_content: body.include_content,
+    };
+
+    let trace_id = rewind_otel::export::trace_id_from_session(&data.session.id);
+
+    // Export (sync — no Store needed)
+    let spans_exported = rewind_otel::export::export_to_otlp(&data, &config)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Export error: {e}")))?;
+
+    Ok(Json(OtelExportResponse {
+        spans_exported,
+        trace_id: trace_id.to_string(),
+    }))
 }

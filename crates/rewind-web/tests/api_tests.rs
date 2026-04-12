@@ -20,6 +20,7 @@ fn setup() -> (Router, Arc<Mutex<Store>>, TempDir) {
         store: store.clone(),
         event_tx,
         hooks: Arc::new(HookIngestionState::new()),
+        otel_config: None,
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
     (app, store, tmp)
