@@ -103,9 +103,12 @@ class TestIsoToNs:
 class TestExportSessionImportGuard:
     def test_import_error_without_otel(self):
         """Verify helpful error when OTel is not installed."""
-        import importlib.util
-        if importlib.util.find_spec("opentelemetry.sdk"):
-            pytest.skip("OTel is installed, can't test ImportError path")
+        try:
+            import importlib.util
+            if importlib.util.find_spec("opentelemetry.sdk"):
+                pytest.skip("OTel is installed, can't test ImportError path")
+        except ModuleNotFoundError:
+            pass  # opentelemetry not installed at all — proceed with test
         else:
             with pytest.raises(ImportError, match="pip install rewind-agent"):
                 from rewind_agent.otel_export import export_session
@@ -124,8 +127,11 @@ class TestExportSessionIntegration:
     """Integration test using a real Store to verify data extraction."""
 
     def _has_otel(self):
-        import importlib.util
-        return importlib.util.find_spec("opentelemetry.sdk") is not None
+        try:
+            import importlib.util
+            return importlib.util.find_spec("opentelemetry.sdk") is not None
+        except ModuleNotFoundError:
+            return False
 
     def test_query_functions_return_all_columns(self):
         """Create a temp store with a session, verify queries return timestamps and tool_name."""
