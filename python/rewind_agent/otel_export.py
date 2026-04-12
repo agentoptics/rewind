@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
+import warnings
 from typing import Any
 
 
@@ -61,22 +61,112 @@ def _infer_provider(model: str) -> str:
 
 
 def _iso_to_ns(iso_str: str) -> int:
-    """Convert ISO 8601 timestamp string to nanoseconds since epoch."""
+    """Convert ISO 8601 timestamp string to nanoseconds since epoch.
+
+    Raises ValueError if the timestamp cannot be parsed.
+    """
     from datetime import datetime, timezone
-    # Handle both with and without fractional seconds
+
+    if not iso_str:
+        raise ValueError("Empty timestamp string")
+
+    # Try fromisoformat first (handles +00:00, Z, and bare timestamps)
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1_000_000_000)
+    except (ValueError, TypeError):
+        pass
+
+    # Fallback: manual strptime for edge cases
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
         try:
             dt = datetime.strptime(iso_str.rstrip("Z"), fmt).replace(tzinfo=timezone.utc)
             return int(dt.timestamp() * 1_000_000_000)
         except ValueError:
             continue
-    # Fallback: current time
-    return time.time_ns()
+
+    raise ValueError(f"Could not parse timestamp: {iso_str!r}")
+
+
+def _query_session(conn, session_id: str) -> dict | None:
+    """Query session with all fields needed for export (including timestamps)."""
+    if session_id == "latest":
+        row = conn.execute(
+            "SELECT id, name, status, total_steps, total_tokens, created_at, updated_at "
+            "FROM sessions ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, name, status, total_steps, total_tokens, created_at, updated_at "
+            "FROM sessions WHERE id = ? OR id LIKE ?",
+            (session_id, f"{session_id}%"),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "name": row[1], "status": row[2],
+        "total_steps": row[3], "total_tokens": row[4],
+        "created_at": row[5], "updated_at": row[6],
+    }
+
+
+def _query_timelines(conn, session_id: str, timeline_id: str | None, all_tl: bool) -> list[dict]:
+    """Query timelines with created_at for span timestamps."""
+    if all_tl:
+        rows = conn.execute(
+            "SELECT id, session_id, parent_timeline_id, fork_at_step, label, created_at "
+            "FROM timelines WHERE session_id = ? ORDER BY created_at",
+            (session_id,),
+        ).fetchall()
+    elif timeline_id:
+        rows = conn.execute(
+            "SELECT id, session_id, parent_timeline_id, fork_at_step, label, created_at "
+            "FROM timelines WHERE id = ?",
+            (timeline_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, session_id, parent_timeline_id, fork_at_step, label, created_at "
+            "FROM timelines WHERE session_id = ? AND parent_timeline_id IS NULL "
+            "ORDER BY created_at LIMIT 1",
+            (session_id,),
+        ).fetchall()
+    return [
+        {"id": r[0], "session_id": r[1], "parent_timeline_id": r[2],
+         "fork_at_step": r[3], "label": r[4], "created_at": r[5]}
+        for r in rows
+    ]
+
+
+def _query_steps(conn, timeline_id: str) -> list[dict]:
+    """Query steps with all fields needed for export (including created_at).
+
+    Note: The Python store schema does not have tool_name or span_id columns
+    in the steps table (the Rust schema does). Tool name is extracted from
+    the request/response blob when needed.
+    """
+    rows = conn.execute(
+        "SELECT id, timeline_id, session_id, step_number, step_type, status, "
+        "created_at, duration_ms, tokens_in, tokens_out, model, "
+        "request_blob, response_blob, error "
+        "FROM steps WHERE timeline_id = ? ORDER BY step_number",
+        (timeline_id,),
+    ).fetchall()
+    return [
+        {"id": r[0], "timeline_id": r[1], "session_id": r[2],
+         "step_number": r[3], "step_type": r[4], "status": r[5],
+         "created_at": r[6], "duration_ms": r[7], "tokens_in": r[8],
+         "tokens_out": r[9], "model": r[10], "request_blob": r[11],
+         "response_blob": r[12], "error": r[13]}
+        for r in rows
+    ]
 
 
 def export_session(
     session_id: str,
-    endpoint: str = "http://localhost:4318/v1/traces",
+    endpoint: str = "http://localhost:4318",
     headers: dict[str, str] | None = None,
     include_content: bool = False,
     service_name: str = "rewind-agent",
@@ -88,7 +178,7 @@ def export_session(
 
     Args:
         session_id: Session ID, prefix, or "latest".
-        endpoint: OTLP HTTP endpoint URL.
+        endpoint: OTLP HTTP endpoint URL (the SDK appends /v1/traces automatically).
         headers: Optional HTTP headers (e.g. auth tokens).
         include_content: Include full request/response message content.
         service_name: OTel service name.
@@ -115,46 +205,22 @@ def export_session(
     from .store import Store
     from . import __version__
 
-    # 1. Open store and read session data
+    # 1. Open store and read session data using direct SQL (includes all columns)
     store = Store()
-    sess = store.get_session(session_id)
+    sess = _query_session(store._conn, session_id)
     if not sess:
         raise ValueError(f"Session not found: {session_id}")
 
-    # Get timelines
-    if all_timelines:
-        rows = store._conn.execute(
-            "SELECT id, session_id, parent_timeline_id, fork_at_step, label "
-            "FROM timelines WHERE session_id = ? ORDER BY created_at",
-            (sess["id"],),
-        ).fetchall()
-        timelines = [
-            {"id": r[0], "session_id": r[1], "parent_timeline_id": r[2],
-             "fork_at_step": r[3], "label": r[4]}
-            for r in rows
-        ]
-    elif timeline_id:
-        row = store._conn.execute(
-            "SELECT id, session_id, parent_timeline_id, fork_at_step, label "
-            "FROM timelines WHERE id = ?",
-            (timeline_id,),
-        ).fetchone()
-        if not row:
-            raise ValueError(f"Timeline not found: {timeline_id}")
-        timelines = [{"id": row[0], "session_id": row[1], "parent_timeline_id": row[2],
-                       "fork_at_step": row[3], "label": row[4]}]
-    else:
-        tl = store.get_root_timeline(sess["id"])
-        if not tl:
-            raise ValueError(f"Session has no timelines: {sess['id']}")
-        timelines = [tl]
+    timelines = _query_timelines(store._conn, sess["id"], timeline_id, all_timelines)
+    if not timelines:
+        raise ValueError(f"No timelines found for session: {sess['id']}")
 
     # Get steps per timeline + resolve blobs
     steps_by_timeline: dict[str, list[dict]] = {}
     blobs: dict[str, Any] = {}
 
     for tl in timelines:
-        steps = store.get_steps(tl["id"])
+        steps = _query_steps(store._conn, tl["id"])
         steps_by_timeline[tl["id"]] = steps
         for step in steps:
             for blob_key in ("request_blob", "response_blob"):
@@ -193,11 +259,15 @@ def export_session(
         trace_flags=TraceFlags(TraceFlags.SAMPLED),
     )))
 
-    # Session root span
+    # Session root span — with recorded timestamps
+    session_start_ns = _iso_to_ns(sess["created_at"])
+    session_end_ns = _iso_to_ns(sess["updated_at"])
+
     session_span = tracer.start_span(
         name=f"session {sess.get('name', sess['id'][:8])}",
         kind=SpanKind.INTERNAL,
         context=root_ctx,
+        start_time=session_start_ns,
         attributes={
             "rewind.session.id": sess["id"],
             "rewind.session.name": sess.get("name", ""),
@@ -206,7 +276,7 @@ def export_session(
         },
     )
     actual_session_span_id = session_span.get_span_context().span_id
-    session_span.end()
+    session_span.end(end_time=session_end_ns)
     span_count += 1
 
     # Parent context for timelines
@@ -219,7 +289,9 @@ def export_session(
 
     # 4. Timeline + step spans
     for tl in timelines:
-        tl_attrs = {
+        tl_start_ns = _iso_to_ns(tl["created_at"])
+
+        tl_attrs: dict[str, Any] = {
             "rewind.timeline.id": tl["id"],
             "rewind.timeline.label": tl.get("label", "main"),
         }
@@ -232,6 +304,7 @@ def export_session(
             name=f"timeline {tl.get('label', 'main')}",
             kind=SpanKind.INTERNAL,
             context=session_ctx,
+            start_time=tl_start_ns,
             attributes=tl_attrs,
         )
         actual_tl_span_id = tl_span.get_span_context().span_id
@@ -246,10 +319,12 @@ def export_session(
         )))
 
         steps = steps_by_timeline.get(tl["id"], [])
+        max_end_ns = tl_start_ns
+
         for step in steps:
             stype = step.get("step_type", "llm_call")
             model = step.get("model", "")
-            tool_name = step.get("tool_name") or step.get("span_id") or "unknown"
+            tool_name = step.get("tool_name") or "unknown"
 
             # Span name — matches Rust attribute mapping
             if stype == "llm_call":
@@ -335,9 +410,10 @@ def export_session(
                     and step.get("step_number", 0) <= tl["fork_at_step"]):
                 attrs["rewind.replay.cached"] = True
 
-            # Create span with explicit timestamps
-            start_ns = _iso_to_ns(step.get("created_at", ""))
+            # Create span with recorded timestamps
+            start_ns = _iso_to_ns(step["created_at"])
             end_ns = start_ns + step.get("duration_ms", 0) * 1_000_000
+            max_end_ns = max(max_end_ns, end_ns)
 
             step_span = tracer.start_span(
                 name=span_name,
@@ -349,7 +425,8 @@ def export_session(
             step_span.end(end_time=end_ns)
             span_count += 1
 
-        tl_span.end()
+        # Timeline end = max(step end times)
+        tl_span.end(end_time=max_end_ns)
 
     # 5. Flush and shutdown
     provider.force_flush()
