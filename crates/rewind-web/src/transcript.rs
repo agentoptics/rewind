@@ -260,6 +260,93 @@ fn has_tool_use(content: &[ContentBlock]) -> bool {
     content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }))
 }
 
+// ── Blob format helpers ─────────────────────────────────────
+// The Web UI and API layer expect blobs in standard API formats:
+// - Request: `{"messages": [{"role": "user", "content": "..."}], "model": "..."}`
+// - Response: Anthropic format `{"content": [{"type": "text", "text": "..."}], ...}`
+
+/// Build an API-format request blob from the preceding user transcript entry.
+/// Extracts the user's text from various transcript formats.
+fn build_request_blob(user_entry: &serde_json::Value, model: &str) -> serde_json::Value {
+    let user_text = extract_user_text(user_entry);
+    serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": user_text}]
+    })
+}
+
+/// Extract the user's prompt text from a transcript JSONL entry.
+/// Handles multiple formats:
+/// - `{"message": {"content": "string"}}` (simple text)
+/// - `{"message": {"content": [{"type": "text", "text": "..."}]}}` (content blocks)
+/// - `{"content": "string"}` (flat format)
+/// - `{"prompt": "string"}` (hook payload format)
+fn extract_user_text(entry: &serde_json::Value) -> String {
+    // Try message.content as string
+    if let Some(text) = entry.pointer("/message/content").and_then(|c| c.as_str()) {
+        return text.to_string();
+    }
+    // Try message.content as array of content blocks
+    if let Some(blocks) = entry.pointer("/message/content").and_then(|c| c.as_array()) {
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if !texts.is_empty() {
+            return texts.join("\n");
+        }
+    }
+    // Try top-level content
+    if let Some(text) = entry.get("content").and_then(|c| c.as_str()) {
+        return text.to_string();
+    }
+    // Try prompt field
+    if let Some(text) = entry.get("prompt").and_then(|c| c.as_str()) {
+        return text.to_string();
+    }
+    // Fallback: serialize the entry
+    entry.to_string()
+}
+
+/// Build an Anthropic-format response blob from assistant content blocks.
+fn build_response_blob(
+    text: &str,
+    thinking_preview: Option<&str>,
+    has_tool_use: bool,
+    model: &str,
+    usage: Option<&TokenUsage>,
+) -> serde_json::Value {
+    let mut content = Vec::<serde_json::Value>::new();
+
+    if let Some(tp) = thinking_preview {
+        content.push(serde_json::json!({"type": "thinking", "thinking": tp}));
+    }
+
+    content.push(serde_json::json!({"type": "text", "text": text}));
+
+    let mut resp = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+    });
+
+    if has_tool_use {
+        resp["has_tool_use"] = serde_json::json!(true);
+    }
+
+    if let Some(u) = usage {
+        resp["usage"] = serde_json::json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cache_read_input_tokens": u.cache_read_input_tokens,
+            "cache_creation_input_tokens": u.cache_creation_input_tokens,
+        });
+    }
+
+    resp
+}
+
 // ── Full-file parsing (for token aggregation) ───────────────
 
 /// Parse a Claude Code JSONL transcript file and aggregate token usage.
@@ -430,20 +517,25 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                     }
                 }
 
-                // Build response blob
+                let model_str = message.model.as_deref().unwrap_or("");
                 let thinking_preview = extract_thinking_preview(content);
-                let response_obj = serde_json::json!({
-                    "text": text,
-                    "thinking_summary": thinking_preview,
-                    "has_tool_use": has_tool_use(content),
-                });
+                let content_has_tool_use = has_tool_use(content);
+
+                // Build Anthropic-format response blob
+                let response_obj = build_response_blob(
+                    &text,
+                    thinking_preview.as_deref(),
+                    content_has_tool_use,
+                    model_str,
+                    message.usage.as_ref(),
+                );
 
                 let step_num = sess_state.step_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let mut step = Step::new_llm_call(
                     &sess_state.timeline_id,
                     rewind_session_id,
                     step_num,
-                    message.model.as_deref().unwrap_or(""),
+                    model_str,
                 );
                 step.id = Uuid::new_v4().to_string();
                 step.step_type = StepType::LlmCall;
@@ -460,20 +552,21 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                     step.span_id = Some(sess_state.root_span_id.clone());
                 }
 
-                // Store blobs
+                // Store blobs in API-compatible formats
                 {
                     let store = match state.store.lock() {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
 
-                    // Request blob: the preceding user message
+                    // Request blob: API format with messages array
                     if let Some(ref user_content) = last_user_content {
-                        let req_bytes = serde_json::to_vec(user_content)?;
+                        let req_obj = build_request_blob(user_content, model_str);
+                        let req_bytes = serde_json::to_vec(&req_obj)?;
                         step.request_blob = store.blobs.put(&req_bytes)?;
                     }
 
-                    // Response blob: the assistant text content
+                    // Response blob: Anthropic message format
                     let resp_bytes = serde_json::to_vec(&response_obj)?;
                     step.response_blob = store.blobs.put(&resp_bytes)?;
 
@@ -894,6 +987,78 @@ mod tests {
         let content = msg.content.as_ref().unwrap();
         // No text → should not create LlmCall step
         assert!(extract_text_content(content).is_none());
+    }
+
+    // ── Blob format helper tests ──────────────────────────────
+
+    #[test]
+    fn test_extract_user_text_string_content() {
+        let entry = serde_json::json!({"type":"user","message":{"content":"What is Rust?"}});
+        assert_eq!(extract_user_text(&entry), "What is Rust?");
+    }
+
+    #[test]
+    fn test_extract_user_text_content_blocks() {
+        let entry = serde_json::json!({
+            "type":"user",
+            "message":{"content":[{"type":"text","text":"Hello"},{"type":"text","text":"World"}]}
+        });
+        assert_eq!(extract_user_text(&entry), "Hello\nWorld");
+    }
+
+    #[test]
+    fn test_extract_user_text_flat_format() {
+        let entry = serde_json::json!({"content": "Flat prompt"});
+        assert_eq!(extract_user_text(&entry), "Flat prompt");
+    }
+
+    #[test]
+    fn test_build_request_blob_format() {
+        let user_entry = serde_json::json!({"type":"user","message":{"content":"Hello"}});
+        let blob = build_request_blob(&user_entry, "claude-opus-4-6");
+        assert_eq!(blob["model"], "claude-opus-4-6");
+        let messages = blob["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_build_response_blob_format() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let blob = build_response_blob("Answer here", Some("I thought..."), true, "claude-opus-4-6", Some(&usage));
+
+        assert_eq!(blob["type"], "message");
+        assert_eq!(blob["role"], "assistant");
+        assert_eq!(blob["model"], "claude-opus-4-6");
+        assert_eq!(blob["has_tool_use"], true);
+
+        let content = blob["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2); // thinking + text
+
+        let thinking = content.iter().find(|b| b["type"] == "thinking").unwrap();
+        assert_eq!(thinking["thinking"], "I thought...");
+
+        let text = content.iter().find(|b| b["type"] == "text").unwrap();
+        assert_eq!(text["text"], "Answer here");
+
+        assert_eq!(blob["usage"]["input_tokens"], 100);
+        assert_eq!(blob["usage"]["output_tokens"], 50);
+    }
+
+    #[test]
+    fn test_build_response_blob_no_thinking() {
+        let blob = build_response_blob("Just text", None, false, "claude-3", None);
+        let content = blob["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1); // text only
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Just text");
+        assert!(blob.get("has_tool_use").is_none());
     }
 
     use chrono::Datelike;

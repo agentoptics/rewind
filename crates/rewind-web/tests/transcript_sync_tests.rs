@@ -109,14 +109,22 @@ async fn test_sync_creates_llm_call_steps() {
     assert_eq!(steps[0].tokens_out, 50);
     assert!(steps[0].tool_name.as_ref().unwrap().starts_with("transcript:resp-1"));
 
-    // Response blob should contain the text
+    // Response blob should be in Anthropic format
     let resp_bytes = s.blobs.get(&steps[0].response_blob).unwrap();
     let resp: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
-    assert_eq!(resp["text"], "Rust is a systems programming language.");
-    assert_eq!(resp["has_tool_use"], false);
+    assert_eq!(resp["role"], "assistant");
+    assert_eq!(resp["type"], "message");
+    let content = resp["content"].as_array().unwrap();
+    let text_block = content.iter().find(|b| b["type"] == "text").unwrap();
+    assert_eq!(text_block["text"], "Rust is a systems programming language.");
 
-    // Request blob should contain the user message
+    // Request blob should be in API format with messages array
     assert!(!steps[0].request_blob.is_empty());
+    let req_bytes = s.blobs.get(&steps[0].request_blob).unwrap();
+    let req: serde_json::Value = serde_json::from_slice(&req_bytes).unwrap();
+    let messages = req["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "What is Rust?");
 
     // Token aggregation should have updated
     assert!(sess.total_tokens > 0);
@@ -185,7 +193,9 @@ async fn test_sync_creates_step_for_mixed_content() {
 
     let resp_bytes = s.blobs.get(&steps[0].response_blob).unwrap();
     let resp: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
-    assert_eq!(resp["text"], "Let me read that file for you.");
+    let content = resp["content"].as_array().unwrap();
+    let text_block = content.iter().find(|b| b["type"] == "text").unwrap();
+    assert_eq!(text_block["text"], "Let me read that file for you.");
     assert_eq!(resp["has_tool_use"], true);
 }
 
@@ -349,6 +359,9 @@ async fn test_sync_thinking_preview() {
 
     let resp_bytes = s.blobs.get(&steps[0].response_blob).unwrap();
     let resp: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
-    assert_eq!(resp["text"], "Here is my conclusion.");
-    assert_eq!(resp["thinking_summary"], "Internal reasoning about the problem...");
+    let content = resp["content"].as_array().unwrap();
+    let text_block = content.iter().find(|b| b["type"] == "text").unwrap();
+    assert_eq!(text_block["text"], "Here is my conclusion.");
+    let thinking_block = content.iter().find(|b| b["type"] == "thinking").unwrap();
+    assert_eq!(thinking_block["thinking"], "Internal reasoning about the problem...");
 }
