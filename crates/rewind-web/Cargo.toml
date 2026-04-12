@@ -8,6 +8,7 @@ rewind-store = { path = "../rewind-store" }
 rewind-replay = { path = "../rewind-replay" }
 rewind-assert = { path = "../rewind-assert" }
 rewind-eval = { path = "../rewind-eval" }
+rewind-otel = { path = "../rewind-otel" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

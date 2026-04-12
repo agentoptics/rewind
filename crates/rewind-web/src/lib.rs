@@ -31,11 +31,54 @@ pub enum StoreEvent {
     },
 }
 
+/// Server-configured OTel export settings (from env vars).
+/// None = OTel export not configured (endpoint returns 501).
+#[derive(Clone, Debug)]
+pub struct OtelConfig {
+    pub endpoint: String,
+    pub protocol: rewind_otel::export::Protocol,
+    pub headers: Vec<(String, String)>,
+}
+
+impl OtelConfig {
+    /// Read OTel config from environment variables.
+    /// Returns None if REWIND_OTEL_ENDPOINT is not set.
+    pub fn from_env() -> Option<Self> {
+        let endpoint = std::env::var("REWIND_OTEL_ENDPOINT").ok()?;
+
+        let protocol = match std::env::var("REWIND_OTEL_PROTOCOL")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "grpc" => rewind_otel::export::Protocol::Grpc,
+            _ => rewind_otel::export::Protocol::Http,
+        };
+
+        let headers = std::env::var("REWIND_OTEL_HEADERS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|h| {
+                let (k, v) = h.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect();
+
+        Some(Self {
+            endpoint,
+            protocol,
+            headers,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub event_tx: broadcast::Sender<StoreEvent>,
     pub hooks: Arc<HookIngestionState>,
+    pub otel_config: Option<OtelConfig>,
 }
 
 pub struct WebServer {
@@ -45,11 +88,13 @@ pub struct WebServer {
 
 impl WebServer {
     pub fn new(store: Arc<Mutex<Store>>, event_tx: broadcast::Sender<StoreEvent>) -> Self {
+        let otel_config = OtelConfig::from_env();
         WebServer {
             state: AppState {
                 store,
                 event_tx,
                 hooks: Arc::new(HookIngestionState::new()),
+                otel_config,
             },
             dev_mode: false,
         }
@@ -57,11 +102,13 @@ impl WebServer {
 
     pub fn new_standalone(store: Store) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let otel_config = OtelConfig::from_env();
         WebServer {
             state: AppState {
                 store: Arc::new(Mutex::new(store)),
                 event_tx,
                 hooks: Arc::new(HookIngestionState::new()),
+                otel_config,
             },
             dev_mode: false,
         }
