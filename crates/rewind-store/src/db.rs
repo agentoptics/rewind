@@ -271,6 +271,7 @@ impl Store {
         // v0.6 migrations: hooks integration — session source and step tool_name
         let _ = self.conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'proxy'", []);
         let _ = self.conn.execute("ALTER TABLE steps ADD COLUMN tool_name TEXT", []);
+        let _ = self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_steps_session_tool ON steps(session_id, tool_name)");
 
         Ok(())
     }

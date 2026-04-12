@@ -248,10 +248,11 @@ fn extract_thinking_preview(content: &[ContentBlock]) -> Option<String> {
     }
 
     let full = thinking.join("\n");
-    if full.len() <= 500 {
+    if full.chars().count() <= 500 {
         Some(full)
     } else {
-        Some(format!("{}...", &full[..500]))
+        let truncated: String = full.chars().take(500).collect();
+        Some(format!("{truncated}..."))
     }
 }
 
@@ -464,13 +465,23 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
             }
         };
 
-        if !new_lines.is_empty() {
-            let sess_state = match state.hooks.sessions.get(claude_session_id) {
-                Some(s) => s,
-                None => continue,
-            };
+        // Clone session state fields upfront and drop the DashMap guard
+        // to avoid holding it across the entire line-processing loop (#5).
+        let (timeline_id, root_span_id, step_counter) = match state.hooks.sessions.get(claude_session_id) {
+            Some(s) => (
+                s.timeline_id.clone(),
+                s.root_span_id.clone(),
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                    s.step_counter.load(Ordering::Relaxed),
+                )),
+            ),
+            None => continue,
+        };
+        // Ref guard is now dropped
 
+        if !new_lines.is_empty() {
             let mut last_user_content: Option<serde_json::Value> = None;
+            let mut summary = TranscriptSummary::new();
 
             for line in &new_lines {
                 let trimmed = line.trim();
@@ -494,12 +505,19 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                     None => continue,
                 };
 
+                // Accumulate tokens in the incremental loop (#6)
+                if let Some(ref usage) = message.usage {
+                    summary.accumulate(usage);
+                }
+                if summary.model.is_none() {
+                    summary.model = message.model.clone();
+                }
+
                 let content = match &message.content {
                     Some(c) if !c.is_empty() => c,
                     _ => continue,
                 };
 
-                // Only create LlmCall steps for entries with text content
                 let text = match extract_text_content(content) {
                     Some(t) => t,
                     None => continue,
@@ -512,8 +530,14 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
-                    if store.step_exists_by_tool_name(rewind_session_id, &dedup_key)? {
-                        continue;
+                    // Use match+continue instead of ? to avoid aborting sync for all sessions (#2)
+                    match store.step_exists_by_tool_name(rewind_session_id, &dedup_key) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::debug!("Dedup check failed for {}: {e}", rewind_session_id);
+                            continue;
+                        }
                     }
                 }
 
@@ -521,7 +545,6 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                 let thinking_preview = extract_thinking_preview(content);
                 let content_has_tool_use = has_tool_use(content);
 
-                // Build Anthropic-format response blob
                 let response_obj = build_response_blob(
                     &text,
                     thinking_preview.as_deref(),
@@ -530,11 +553,11 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                     message.usage.as_ref(),
                 );
 
-                let step_num = sess_state.step_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                // Build step WITHOUT incrementing counter yet (#3)
                 let mut step = Step::new_llm_call(
-                    &sess_state.timeline_id,
+                    &timeline_id,
                     rewind_session_id,
-                    step_num,
+                    0, // placeholder — set after successful create
                     model_str,
                 );
                 step.id = Uuid::new_v4().to_string();
@@ -548,33 +571,46 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                     step.tokens_out = usage.output_tokens;
                 }
 
-                if !sess_state.root_span_id.is_empty() {
-                    step.span_id = Some(sess_state.root_span_id.clone());
+                if !root_span_id.is_empty() {
+                    step.span_id = Some(root_span_id.clone());
                 }
 
-                // Store blobs in API-compatible formats
-                {
-                    let store = match state.store.lock() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
+                // Store blobs + create step — all errors use continue, not ? (#2)
+                let persist_ok = (|| -> anyhow::Result<u32> {
+                    let store = state.store.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                    // Request blob: API format with messages array
                     if let Some(ref user_content) = last_user_content {
                         let req_obj = build_request_blob(user_content, model_str);
                         let req_bytes = serde_json::to_vec(&req_obj)?;
                         step.request_blob = store.blobs.put(&req_bytes)?;
                     }
 
-                    // Response blob: Anthropic message format
                     let resp_bytes = serde_json::to_vec(&response_obj)?;
                     step.response_blob = store.blobs.put(&resp_bytes)?;
 
+                    // Increment counter only after blobs succeed, right before create_step (#3)
+                    let step_num = step_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    step.step_number = step_num;
+
                     store.create_step(&step)?;
                     store.update_session_stats(rewind_session_id, step_num, 0)?;
+                    Ok(step_num)
+                })();
+
+                match persist_ok {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("Failed to persist transcript step: {e}");
+                        continue;
+                    }
                 }
 
-                // Emit WebSocket event for live updates
+                // Sync the authoritative counter back to the DashMap (#3)
+                if let Some(sess_state) = state.hooks.sessions.get(claude_session_id) {
+                    let local_val = step_counter.load(Ordering::Relaxed);
+                    sess_state.step_counter.fetch_max(local_val, Ordering::Relaxed);
+                }
+
                 let _ = state.event_tx.send(StoreEvent::StepCreated {
                     session_id: rewind_session_id.clone(),
                     step: Box::new(step),
@@ -583,71 +619,85 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                 created += 1;
             }
 
-            // Update the byte offset in metadata
-            if new_offset != stored_offset {
+            // Update byte offset + token totals in one metadata write
+            {
                 let store = match state.store.lock() {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
                 if let Ok(Some(session)) = store.get_session(rewind_session_id) {
                     let mut meta = session.metadata.clone();
-                    meta["transcript_byte_offset"] = serde_json::json!(new_offset);
+
+                    if new_offset != stored_offset {
+                        meta["transcript_byte_offset"] = serde_json::json!(new_offset);
+                    }
+
+                    // Token aggregation from incremental pass (#6)
+                    let new_tokens = summary.new_tokens();
+                    let cache_tokens = summary.cache_tokens();
+                    if new_tokens > 0 || cache_tokens > 0 {
+                        let _ = store.update_session_tokens(rewind_session_id, new_tokens);
+                        meta["cache_tokens"] = serde_json::json!(cache_tokens);
+                        if let Some(ref model) = summary.model {
+                            meta["model"] = serde_json::json!(model);
+                        }
+
+                        let _ = state.event_tx.send(StoreEvent::SessionUpdated {
+                            session_id: rewind_session_id.clone(),
+                            status: session.status.as_str().to_string(),
+                            total_steps: session.total_steps,
+                            total_tokens: new_tokens,
+                        });
+                    }
+
                     let _ = store.update_session_metadata(rewind_session_id, &meta);
                 }
             }
-        }
+        } else {
+            // No new lines — but still need token aggregation for sessions
+            // that started before the server (offset was 0, full file already read).
+            // Only re-read when offset is 0 (first sync); afterward the incremental
+            // loop handles it.
+            if stored_offset == 0 {
+                let summary = match parse_transcript(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("Transcript parse error for {}: {e}", transcript_path);
+                        continue;
+                    }
+                };
 
-        // ── Token aggregation (full file re-read, same as before) ──
-
-        let summary = match parse_transcript(path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!("Transcript parse error for {}: {e}", transcript_path);
-                continue;
-            }
-        };
-
-        let new_tokens = summary.new_tokens();
-        let cache_tokens = summary.cache_tokens();
-        if new_tokens == 0 && cache_tokens == 0 {
-            continue;
-        }
-
-        {
-            let store = match state.store.lock() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let session = match store.get_session(rewind_session_id) {
-                Ok(Some(s)) => s,
-                _ => continue,
-            };
-
-            let stored_cache = session
-                .metadata
-                .get("cache_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-
-            if session.total_tokens != new_tokens || stored_cache != cache_tokens {
-                if let Err(e) = store.update_session_tokens(rewind_session_id, new_tokens) {
-                    tracing::debug!("Failed to update session tokens: {e}");
+                let new_tokens = summary.new_tokens();
+                let cache_tokens = summary.cache_tokens();
+                if new_tokens == 0 && cache_tokens == 0 {
                     continue;
                 }
 
-                let mut meta = session.metadata.clone();
-                meta["cache_tokens"] = serde_json::json!(cache_tokens);
-                if let Some(ref model) = summary.model {
-                    meta["model"] = serde_json::json!(model);
-                }
-                let _ = store.update_session_metadata(rewind_session_id, &meta);
+                let store = match state.store.lock() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if let Ok(Some(session)) = store.get_session(rewind_session_id) {
+                    let stored_cache = session.metadata.get("cache_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
-                let _ = state.event_tx.send(StoreEvent::SessionUpdated {
-                    session_id: rewind_session_id.clone(),
-                    status: session.status.as_str().to_string(),
-                    total_steps: session.total_steps,
-                    total_tokens: new_tokens,
-                });
+                    if session.total_tokens != new_tokens || stored_cache != cache_tokens {
+                        let _ = store.update_session_tokens(rewind_session_id, new_tokens);
+                        let mut meta = session.metadata.clone();
+                        meta["cache_tokens"] = serde_json::json!(cache_tokens);
+                        if let Some(ref model) = summary.model {
+                            meta["model"] = serde_json::json!(model);
+                        }
+                        let _ = store.update_session_metadata(rewind_session_id, &meta);
+                        let _ = state.event_tx.send(StoreEvent::SessionUpdated {
+                            session_id: rewind_session_id.clone(),
+                            status: session.status.as_str().to_string(),
+                            total_steps: session.total_steps,
+                            total_tokens: new_tokens,
+                        });
+                    }
+                }
             }
         }
     }
@@ -900,13 +950,26 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_thinking_preview_long() {
+    fn test_extract_thinking_preview_long_ascii() {
         let long_thinking = "x".repeat(1000);
         let blocks = vec![ContentBlock::Thinking {
             thinking: long_thinking,
         }];
         let preview = extract_thinking_preview(&blocks).unwrap();
         assert_eq!(preview.len(), 503); // 500 + "..."
+        assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn test_extract_thinking_preview_multibyte_safe() {
+        // Each CJK char is 3 bytes in UTF-8. 500 chars = 1500 bytes.
+        // The old byte-slice approach would panic at a non-char boundary.
+        let cjk_thinking = "思".repeat(1000);
+        let blocks = vec![ContentBlock::Thinking {
+            thinking: cjk_thinking,
+        }];
+        let preview = extract_thinking_preview(&blocks).unwrap();
+        assert_eq!(preview.chars().count(), 503); // 500 chars + "..."
         assert!(preview.ends_with("..."));
     }
 
