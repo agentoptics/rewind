@@ -271,6 +271,7 @@ impl Store {
         // v0.6 migrations: hooks integration — session source and step tool_name
         let _ = self.conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'proxy'", []);
         let _ = self.conn.execute("ALTER TABLE steps ADD COLUMN tool_name TEXT", []);
+        let _ = self.conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_steps_session_tool ON steps(session_id, tool_name)");
 
         Ok(())
     }
@@ -1301,6 +1302,17 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![span_id], Self::row_to_step)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Check if a step with a given tool_name exists for a session.
+    /// Used by transcript sync for UUID-based dedup.
+    pub fn step_exists_by_tool_name(&self, session_id: &str, tool_name: &str) -> Result<bool> {
+        let count: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM steps WHERE session_id = ?1 AND tool_name = ?2",
+            params![session_id, tool_name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Update a step's status, response blob, duration, and error (used by hook ingestion for PostToolUse).
