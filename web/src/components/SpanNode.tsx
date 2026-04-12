@@ -129,7 +129,7 @@ function StepRow({ step, selected, onSelect }: { step: StepResponse; selected: b
 
       <span className="text-[11px] font-mono text-neutral-500">#{step.step_number}</span>
 
-      <span className="text-xs text-neutral-300 truncate">{step.model}</span>
+      {step.model && <span className="text-xs text-neutral-300 truncate">{step.model}</span>}
 
       <span className="ml-auto flex items-center gap-2 text-[10px] text-neutral-500 shrink-0">
         {step.duration_ms > 0 && (

@@ -69,7 +69,7 @@ function ThreadCard({ thread, onClick }: { thread: ThreadSummary; onClick: () =>
       <div className="flex items-center gap-4 text-xs text-neutral-500">
         <span>{thread.session_count} session{thread.session_count !== 1 ? 's' : ''}</span>
         <span>{thread.total_steps} steps</span>
-        <span>{formatTokens(thread.total_tokens)} tokens</span>
+        {thread.total_tokens > 0 && <span>{formatTokens(thread.total_tokens)} tokens</span>}
       </div>
     </button>
   )

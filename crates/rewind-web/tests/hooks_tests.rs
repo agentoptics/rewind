@@ -290,3 +290,110 @@ async fn test_hook_transcript_path_stored() {
         "transcript_path should be stored in session metadata"
     );
 }
+
+// ── Test 8: hook_source stored from envelope.source ─────
+
+#[tokio::test]
+async fn test_hook_source_stored_in_metadata() {
+    let (app, store, _tmp, hooks) = setup();
+
+    // Send event with source: "cursor"
+    let envelope = json!({
+        "source": "cursor",
+        "event_type": "PreToolUse",
+        "timestamp": "2026-04-11T10:32:00.000Z",
+        "payload": {
+            "session_id": "test-session-cursor-src",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/src/main.rs"},
+            "tool_use_id": "toolu_cursor_src_1",
+            "cwd": "/Users/test/my-project"
+        }
+    });
+
+    let (status, _) = post_json(app, "/api/hooks/event", envelope).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sess_state = hooks.sessions.get("test-session-cursor-src").unwrap();
+    let s = store.lock().unwrap();
+    let session = s.get_session(&sess_state.session_id).unwrap().unwrap();
+    assert_eq!(
+        session.metadata["hook_source"].as_str(),
+        Some("cursor"),
+        "hook_source should be stored from envelope.source"
+    );
+}
+
+// ── Test 9: hook_source "claude-code" for CLI sessions ──
+
+#[tokio::test]
+async fn test_hook_source_cli_stored() {
+    let (app, store, _tmp, hooks) = setup();
+
+    let envelope = make_envelope("PreToolUse", "test-session-cli-src", json!({
+        "tool_name": "Read",
+        "tool_input": {"file_path": "/src/main.rs"},
+        "tool_use_id": "toolu_cli_src_1"
+    }));
+
+    let (status, _) = post_json(app, "/api/hooks/event", envelope).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sess_state = hooks.sessions.get("test-session-cli-src").unwrap();
+    let s = store.lock().unwrap();
+    let session = s.get_session(&sess_state.session_id).unwrap().unwrap();
+    assert_eq!(
+        session.metadata["hook_source"].as_str(),
+        Some("claude-code"),
+        "hook_source should be 'claude-code' for CLI sessions"
+    );
+}
+
+// ── Test 10: hook_source preserved across partial → full session ──
+
+#[tokio::test]
+async fn test_hook_source_preserved_on_session_start() {
+    let (app, store, _tmp, hooks) = setup();
+
+    // First event (partial session creation) with source: "cursor"
+    let pre_envelope = json!({
+        "source": "cursor",
+        "event_type": "preToolUse",
+        "timestamp": "2026-04-11T10:33:00.000Z",
+        "payload": {
+            "session_id": "test-session-preserve",
+            "hook_event_name": "preToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/src/main.rs"},
+            "tool_use_id": "toolu_preserve_1",
+            "cwd": "/Users/test/my-project"
+        }
+    });
+    let (status, _) = post_json(app.clone(), "/api/hooks/event", pre_envelope).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // SessionStart arrives later (upgrades partial → full)
+    let start_envelope = json!({
+        "source": "cursor",
+        "event_type": "sessionStart",
+        "timestamp": "2026-04-11T10:33:01.000Z",
+        "payload": {
+            "session_id": "test-session-preserve",
+            "hook_event_name": "sessionStart",
+            "cwd": "/Users/test/my-project"
+        }
+    });
+    let (status, _) = post_json(app, "/api/hooks/event", start_envelope).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // hook_source should still be "cursor" after session upgrade
+    let sess_state = hooks.sessions.get("test-session-preserve").unwrap();
+    let s = store.lock().unwrap();
+    let session = s.get_session(&sess_state.session_id).unwrap().unwrap();
+    assert_eq!(
+        session.metadata["hook_source"].as_str(),
+        Some("cursor"),
+        "hook_source should be preserved when partial session is upgraded to full"
+    );
+}

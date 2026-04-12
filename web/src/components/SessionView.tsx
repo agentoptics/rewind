@@ -64,6 +64,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const totalDuration = steps.reduce((sum, s) => sum + s.duration_ms, 0)
   const hasForked = (detail?.timelines.length ?? 0) > 1
   const isHook = session.source === 'hooks'
+  const isCursor = isHook && session.metadata?.hook_source === 'cursor'
 
   return (
     <div className="flex flex-col h-full">
@@ -79,9 +80,14 @@ export function SessionView({ sessionId }: { sessionId: string }) {
 
       {/* Hooks session banner */}
       {isHook && !isLive && (
-        <div className="bg-violet-950/30 border-b border-violet-900/50 px-4 py-2 flex items-center gap-2">
-          <Plug size={14} className="text-violet-400" />
-          <span className="text-xs font-medium text-violet-300">Claude Code Session — observed via hooks</span>
+        <div className={cn(
+          'border-b px-4 py-2 flex items-center gap-2',
+          isCursor ? 'bg-blue-950/30 border-blue-900/50' : 'bg-violet-950/30 border-violet-900/50'
+        )}>
+          <Plug size={14} className={isCursor ? 'text-blue-400' : 'text-violet-400'} />
+          <span className={cn('text-xs font-medium', isCursor ? 'text-blue-300' : 'text-violet-300')}>
+            {isCursor ? 'Cursor IDE Session — token data may be limited' : 'Claude Code Session — observed via hooks'}
+          </span>
         </div>
       )}
 
