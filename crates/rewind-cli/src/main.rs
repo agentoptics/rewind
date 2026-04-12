@@ -211,38 +211,41 @@ enum Commands {
 #[derive(Subcommand)]
 enum ExportAction {
     /// Export a session as OpenTelemetry traces via OTLP
-    Otel {
-        /// Session ID or "latest"
-        session: String,
+    Otel(OtelExportArgs),
+}
 
-        /// OTLP endpoint URL
-        #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT", default_value = "http://localhost:4318")]
-        endpoint: String,
+#[derive(clap::Args)]
+struct OtelExportArgs {
+    /// Session ID or "latest"
+    session: String,
 
-        /// Export protocol: "http" or "grpc"
-        #[arg(long, env = "OTEL_EXPORTER_OTLP_PROTOCOL", default_value = "http")]
-        protocol: String,
+    /// OTLP endpoint URL
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT", default_value = "http://localhost:4318")]
+    endpoint: String,
 
-        /// HTTP headers as KEY=VALUE (repeatable, or comma-separated via env var)
-        #[arg(long = "header", env = "OTEL_EXPORTER_OTLP_HEADERS", value_delimiter = ',')]
-        headers: Vec<String>,
+    /// Export protocol: "http" or "grpc"
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_PROTOCOL", default_value = "http")]
+    protocol: String,
 
-        /// Export a specific timeline (default: main timeline)
-        #[arg(long)]
-        timeline: Option<String>,
+    /// HTTP headers as KEY=VALUE (repeatable, or comma-separated via env var)
+    #[arg(long = "header", env = "OTEL_EXPORTER_OTLP_HEADERS", value_delimiter = ',')]
+    headers: Vec<String>,
 
-        /// Export all timelines
-        #[arg(long)]
-        all_timelines: bool,
+    /// Export a specific timeline (default: main timeline)
+    #[arg(long)]
+    timeline: Option<String>,
 
-        /// Include full request/response message content (privacy-sensitive)
-        #[arg(long)]
-        include_content: bool,
+    /// Export all timelines
+    #[arg(long)]
+    all_timelines: bool,
 
-        /// Print spans to stdout instead of sending to an endpoint
-        #[arg(long)]
-        dry_run: bool,
-    },
+    /// Include full request/response message content (privacy-sensitive)
+    #[arg(long)]
+    include_content: bool,
+
+    /// Print spans to stdout instead of sending to an endpoint
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Subcommand)]
@@ -552,8 +555,7 @@ async fn main() -> Result<()> {
             HooksAction::Status { port } => cmd_hooks_status(port).await,
         },
         Commands::Export { action } => match action {
-            ExportAction::Otel { session, endpoint, protocol, headers, timeline, all_timelines, include_content, dry_run } =>
-                cmd_export_otel(session, endpoint, protocol, headers, timeline, all_timelines, include_content, dry_run).await,
+            ExportAction::Otel(args) => cmd_export_otel(args).await,
         },
     }
 }
@@ -2831,28 +2833,19 @@ fn format_time_ago(dt: chrono::DateTime<chrono::Utc>) -> String {
 
 // ── Export Commands ─────────────────────────────────────────
 
-async fn cmd_export_otel(
-    session_ref: String,
-    endpoint: String,
-    protocol: String,
-    headers: Vec<String>,
-    timeline: Option<String>,
-    all_timelines: bool,
-    include_content: bool,
-    dry_run: bool,
-) -> Result<()> {
+async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
     let store = Store::open_default()?;
-    let session = resolve_session(&store, &session_ref)?;
+    let session = resolve_session(&store, &args.session)?;
 
     // Parse protocol
-    let proto = match protocol.to_lowercase().as_str() {
+    let proto = match args.protocol.to_lowercase().as_str() {
         "grpc" => rewind_otel::export::Protocol::Grpc,
         "http" | "http/protobuf" => rewind_otel::export::Protocol::Http,
         other => bail!("Unknown protocol '{}'. Use 'http' or 'grpc'.", other),
     };
 
     // Parse headers (KEY=VALUE format)
-    let parsed_headers: Vec<(String, String)> = headers
+    let parsed_headers: Vec<(String, String)> = args.headers
         .iter()
         .map(|h| {
             let (k, v) = h.split_once('=').with_context(|| format!("Invalid header format '{}'. Use KEY=VALUE.", h))?;
@@ -2862,8 +2855,8 @@ async fn cmd_export_otel(
 
     // Extract options
     let extract_opts = rewind_otel::extract::ExtractOptions {
-        timeline_id: timeline,
-        all_timelines,
+        timeline_id: args.timeline,
+        all_timelines: args.all_timelines,
     };
 
     // Step 1: Extract data synchronously from Store (Store is not Send)
@@ -2886,20 +2879,20 @@ async fn cmd_export_otel(
 
     // Step 2: Export asynchronously (no Store needed)
     let config = rewind_otel::export::ExportConfig {
-        endpoint: endpoint.clone(),
+        endpoint: args.endpoint.clone(),
         protocol: proto,
         headers: parsed_headers,
-        include_content,
+        include_content: args.include_content,
     };
 
-    let span_count = if dry_run {
+    let span_count = if args.dry_run {
         println!("{} Dry run — writing spans to stdout:\n", "📋".bold());
         rewind_otel::export::export_to_stdout(&data, &config)?
     } else {
         println!(
             "{} Exporting to {} ...",
             "📡".bold(),
-            endpoint.cyan()
+            args.endpoint.cyan()
         );
         rewind_otel::export::export_to_otlp(&data, &config)?
     };
@@ -2911,7 +2904,7 @@ async fn cmd_export_otel(
         rewind_otel::export::trace_id_from_session(&session.id).to_string()[..16].yellow()
     );
 
-    if include_content {
+    if args.include_content {
         println!(
             "   {} Full message content included (--include-content)",
             "⚠".yellow()
