@@ -110,12 +110,12 @@ impl WebServer {
             std::time::Duration::from_millis(300),
         ));
 
-        // Start background transcript token sync for hook sessions
+        // Start background transcript sync: creates LlmCall steps + aggregates tokens
         let transcript_state = drain_state;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if let Err(e) = transcript::sync_transcript_tokens(&transcript_state) {
+                if let Err(e) = transcript::sync_transcript_steps(&transcript_state) {
                     tracing::error!("Transcript sync error: {e}");
                 }
             }
