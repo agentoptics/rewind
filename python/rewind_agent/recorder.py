@@ -79,6 +79,20 @@ def _has_tool_calls_anthropic(response_dict: dict) -> bool:
     return any(block.get("type") == "tool_use" for block in content if isinstance(block, dict))
 
 
+# ── Span context bridge ──────────────────────────────────────
+
+_current_span_id_ref = None
+
+
+def _get_current_span_id():
+    """Resolve the enclosing span_id from hooks.py ContextVar (cached import)."""
+    global _current_span_id_ref
+    if _current_span_id_ref is None:
+        from .hooks import _current_span_id
+        _current_span_id_ref = _current_span_id
+    return _current_span_id_ref.get()
+
+
 # ── Streaming wrappers ────────────────────────────────────────
 
 class _OpenAIStreamWrapper:
@@ -346,6 +360,12 @@ class Recorder:
         self._patch_anthropic_sync()
         self._patch_anthropic_async()
 
+    def next_step_number(self) -> int:
+        """Atomically increment and return the next step number."""
+        with self._lock:
+            self._step_counter += 1
+            return self._step_counter
+
     def unpatch_all(self):
         """Restore all original methods."""
         for key, (cls, method_name, original) in self._originals.items():
@@ -588,13 +608,11 @@ class Recorder:
             req_hash = self._store.blobs.put_json(request_data)
             resp_hash = self._store.blobs.put_json(response_data or {"error": error or "unknown"})
 
-            # Resolve enclosing span from hooks.py ContextVar
             span_id = None
             try:
-                from .hooks import _current_span_id
-                span_id = _current_span_id.get()
+                span_id = _get_current_span_id()
             except Exception:
-                pass
+                logger.debug("Rewind: could not resolve span_id", exc_info=True)
 
             with self._lock:
                 self._step_counter += 1

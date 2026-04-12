@@ -424,13 +424,15 @@ class TestMonkeyPatching(unittest.TestCase):
     def test_openai_patches_preserved_with_agents_sdk(self):
         """Bug 1 fix: OpenAI patches should NOT be removed when Agents SDK is installed."""
         try:
-            from openai.resources.chat.completions import Completions  # noqa: F401
+            from openai.resources.chat.completions import Completions
         except ImportError:
             self.skipTest("openai not installed")
 
+        original = Completions.create
         self.recorder.patch_all()
         self.assertIn("openai_sync", self.recorder._originals)
         self.assertIn("openai_async", self.recorder._originals)
+        self.assertNotEqual(Completions.create, original, "Patches should be active on the class")
 
 
 if __name__ == "__main__":

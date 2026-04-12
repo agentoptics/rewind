@@ -241,16 +241,14 @@ class RewindTracingProcessor(_TracingProcessorBase):
         req_hash = self._store.blobs.put_json(request_data)
         resp_hash = self._store.blobs.put_json(response_data if not error else {"error": error})
 
-        # Share the Recorder's lock and step counter to avoid numbering conflicts
-        lock = self._recorder._lock if self._recorder else self._lock
-        with lock:
-            if self._recorder:
-                self._recorder._step_counter += 1
-                step_number = self._recorder._step_counter
-            else:
+        if self._recorder:
+            step_number = self._recorder.next_step_number()
+        else:
+            with self._lock:
                 self._step_counter += 1
                 step_number = self._step_counter
 
+        with self._lock:
             self._store.create_step(
                 session_id=self._session_id,
                 timeline_id=self._timeline_id,
