@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use rewind_assert::{AssertionEngine, BaselineManager, Tolerance};
-use rewind_eval::{DatasetManager, EvaluatorRegistry, ExperimentRunner, RunConfig};
+use rewind_eval::{DatasetManager, EvaluatorRegistry, ExperimentRunner, RunConfig, extract_timeline_output};
 use rewind_proxy::ProxyServer;
 use rewind_replay::ReplayEngine;
 use rewind_store::Store;
@@ -377,6 +377,36 @@ enum EvalAction {
         /// Experiment name or ID
         experiment: String,
     },
+
+    /// Score a session's timeline outputs using evaluators (LLM-as-judge)
+    Score {
+        /// Session ID, prefix, or "latest"
+        session: String,
+
+        /// Evaluator names (can specify multiple: -e correctness -e safety)
+        #[arg(short, long)]
+        evaluator: Vec<String>,
+
+        /// Score a specific timeline (ID, prefix, or label). Default: main
+        #[arg(short, long)]
+        timeline: Option<String>,
+
+        /// Compare scores across ALL timelines in the session
+        #[arg(long)]
+        compare_timelines: bool,
+
+        /// Expected output JSON for reference-based criteria (e.g., correctness)
+        #[arg(long)]
+        expected: Option<String>,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Force re-scoring even if cached scores exist
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -546,6 +576,7 @@ async fn main() -> Result<()> {
             EvalAction::Compare { left, right, json, force } => cmd_eval_compare(left, right, json, force),
             EvalAction::Experiments { dataset } => cmd_eval_experiments(dataset),
             EvalAction::Show { experiment } => cmd_eval_show(experiment),
+            EvalAction::Score { session, evaluator, timeline, compare_timelines, expected, json, force } => cmd_eval_score(session, evaluator, timeline, compare_timelines, expected, json, force),
         },
         Commands::Web { port } => cmd_web(port).await,
         Commands::Query { sql, tables } => cmd_query(sql, tables),
@@ -1770,6 +1801,7 @@ fn cmd_eval_evaluator_create(name: String, evaluator_type: String, config: Optio
                     "contains" => serde_json::json!({"substring": c}),
                     "regex" => serde_json::json!({"pattern": c}),
                     "custom" => serde_json::json!({"command": c}),
+                    "llm_judge" => serde_json::json!({"criteria": c}),
                     _ => serde_json::json!({"value": c}),
                 }
             };
@@ -2168,6 +2200,237 @@ fn cmd_eval_show(experiment_ref: String) -> Result<()> {
             }
         }
     }
+    println!();
+    Ok(())
+}
+
+fn cmd_eval_score(
+    session_ref: String,
+    evaluator_names: Vec<String>,
+    timeline_ref: Option<String>,
+    compare_timelines: bool,
+    expected_json: Option<String>,
+    json_output: bool,
+    force: bool,
+) -> Result<()> {
+    if evaluator_names.is_empty() {
+        bail!("At least one evaluator is required. Use -e <name> to specify.");
+    }
+
+    let store = Store::open_default()?;
+    let session = resolve_session(&store, &session_ref)?;
+    let all_timelines = store.get_timelines(&session.id)?;
+
+    if all_timelines.is_empty() {
+        bail!("Session '{}' has no timelines — nothing to score", session.name);
+    }
+
+    // Parse expected value if provided
+    let expected: serde_json::Value = match expected_json {
+        Some(ref s) => serde_json::from_str(s)
+            .map_err(|e| anyhow::anyhow!("Invalid --expected JSON: {}", e))?,
+        None => serde_json::Value::Null,
+    };
+
+    // Determine which timelines to score
+    let timelines_to_score: Vec<&rewind_store::Timeline> = if compare_timelines {
+        all_timelines.iter().collect()
+    } else {
+        let tl_id = match timeline_ref {
+            Some(ref r) => resolve_timeline_ref(&all_timelines, r)?,
+            None => {
+                // Default to "main" timeline
+                all_timelines
+                    .iter()
+                    .find(|t| t.label == "main")
+                    .or_else(|| all_timelines.first())
+                    .map(|t| t.id.clone())
+                    .context("No timelines found")?
+            }
+        };
+        all_timelines
+            .iter()
+            .filter(|t| t.id == tl_id)
+            .collect()
+    };
+
+    let registry = EvaluatorRegistry::new(&store);
+
+    // Score each timeline × evaluator
+    struct TimelineResult {
+        label: String,
+        id: String,
+        scores: Vec<EvalResult>,
+    }
+    struct EvalResult {
+        name: String,
+        score: f64,
+        #[allow(dead_code)]
+        passed: bool,
+        #[allow(dead_code)]
+        reasoning: String,
+    }
+    let mut results: Vec<TimelineResult> = Vec::new();
+
+    for tl in &timelines_to_score {
+        let (input, output) = extract_timeline_output(&store, &tl.id)?;
+        let mut scores_for_tl: Vec<EvalResult> = Vec::new();
+
+        for eval_name in &evaluator_names {
+            // Check cache: if we already scored this timeline+evaluator, reuse it
+            let evaluator = store
+                .get_evaluator_by_name(eval_name)?
+                .ok_or_else(|| anyhow::anyhow!("Evaluator '{}' not found", eval_name))?;
+
+            if !force
+                && let Some(cached) = store.get_timeline_score(&tl.id, &evaluator.id)?
+            {
+                scores_for_tl.push(EvalResult {
+                    name: eval_name.clone(),
+                    score: cached.score,
+                    passed: cached.passed,
+                    reasoning: cached.reasoning.clone(),
+                });
+                continue;
+            }
+
+            // Run the evaluator
+            let (evaluator_id, score_result) =
+                registry.score(eval_name, &input, &output, &expected)?;
+
+            // Persist the score
+            let timeline_score = rewind_store::TimelineScore::new(
+                &session.id,
+                &tl.id,
+                &evaluator_id,
+                score_result.score,
+                score_result.passed,
+                &score_result.reasoning,
+                &input.to_string(),
+                &output.to_string(),
+            );
+            store.create_timeline_score(&timeline_score)?;
+
+            scores_for_tl.push(EvalResult {
+                name: eval_name.clone(),
+                score: score_result.score,
+                passed: score_result.passed,
+                reasoning: score_result.reasoning.clone(),
+            });
+        }
+
+        results.push(TimelineResult {
+            label: tl.label.clone(),
+            id: tl.id.clone(),
+            scores: scores_for_tl,
+        });
+    }
+
+    // Output
+    fn avg_score(scores: &[EvalResult]) -> f64 {
+        if scores.is_empty() {
+            0.0
+        } else {
+            scores.iter().map(|s| s.score).sum::<f64>() / scores.len() as f64
+        }
+    }
+
+    if json_output {
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|tl| {
+                let score_map: serde_json::Map<String, serde_json::Value> = tl.scores
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            serde_json::json!({
+                                "score": s.score,
+                                "passed": s.passed,
+                                "reasoning": s.reasoning,
+                            }),
+                        )
+                    })
+                    .collect();
+                serde_json::json!({
+                    "timeline_id": tl.id,
+                    "timeline_label": tl.label,
+                    "scores": score_map,
+                    "avg_score": avg_score(&tl.scores),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_results)?);
+        return Ok(());
+    }
+
+    // Pretty-print table
+    println!("{}", "⏪ Rewind — Timeline Scores".cyan().bold());
+    println!();
+    println!("  {} {}", "Session:".dimmed(), session.name.white().bold());
+    println!(
+        "  {} {}",
+        "Evaluators:".dimmed(),
+        evaluator_names.join(", ").cyan()
+    );
+    println!();
+
+    // Header row
+    let label_width = results.iter().map(|tl| tl.label.len()).max().unwrap_or(8).max(10);
+    let col_width = evaluator_names.iter().map(|n| n.len()).max().unwrap_or(8).max(8);
+
+    print!("  {:<width$}", "Timeline", width = label_width + 2);
+    for name in &evaluator_names {
+        print!("  {:>width$}", name, width = col_width);
+    }
+    println!("  {:>6}", "avg");
+
+    print!("  {}", "─".repeat(label_width + 2));
+    for _ in &evaluator_names {
+        print!("  {}", "─".repeat(col_width));
+    }
+    println!("  {}", "─".repeat(6));
+
+    // Data rows
+    for tl in &results {
+        print!("  {:<width$}", tl.label.white().bold(), width = label_width + 2);
+        let avg = avg_score(&tl.scores);
+        for s in &tl.scores {
+            print!("  {:>width$}", format_score(s.score), width = col_width);
+        }
+        println!("  {:>6}", format_score(avg));
+    }
+
+    // Delta lines: compare each fork against main (first timeline)
+    if results.len() > 1 {
+        println!();
+        let main_tl = results.first().unwrap();
+        let main_avg = avg_score(&main_tl.scores);
+
+        for fork_tl in results.iter().skip(1) {
+            let fork_avg = avg_score(&fork_tl.scores);
+            let delta = fork_avg - main_avg;
+            let delta_str = if delta >= 0.0 {
+                format!("+{:.2}", delta).green()
+            } else {
+                format!("{:.2}", delta).red()
+            };
+            print!(
+                "  Delta ({} vs {}): {} avg",
+                fork_tl.label,
+                main_tl.label,
+                delta_str,
+            );
+            if delta > 0.01 {
+                println!("  {}", "✓".green());
+            } else if delta < -0.01 {
+                println!("  {}", "✗".red());
+            } else {
+                println!("  {}", "─".yellow());
+            }
+        }
+    }
+
     println!();
     Ok(())
 }
