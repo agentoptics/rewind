@@ -236,6 +236,7 @@ async fn handle_request(
     if let (Some(replay_steps), Some(fork_at)) = (&state.replay_steps, state.fork_at_step)
         && step_number <= fork_at
         && let Some(parent_step) = replay_steps.iter().find(|s| s.step_number == step_number)
+        && !parent_step.response_blob.is_empty()
     {
         let resp_data = {
             let store = state.store.lock().unwrap();

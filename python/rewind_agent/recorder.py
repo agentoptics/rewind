@@ -482,7 +482,7 @@ class Recorder:
                 if s["step_number"] == next_step:
                     parent = s
                     break
-            if parent is None:
+            if parent is None or not parent.get("response_blob"):
                 return None
 
             resp_bytes = self._store.blobs.get(parent["response_blob"])
