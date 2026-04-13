@@ -11,10 +11,9 @@ use rewind_store::export::ExportedSession;
 pub fn generate_share_html(exported: &ExportedSession) -> Result<String> {
     let session_json = serde_json::to_string(exported)?;
 
-    // Escape for safe embedding in <script> — prevent </script> injection
-    let escaped_json = session_json
-        .replace('\\', "\\\\")
-        .replace("</script>", "<\\/script>");
+    // Escape </script> to prevent closing the tag early.
+    // No backslash escaping needed — <script type="application/json"> is raw text, not JS.
+    let escaped_json = session_json.replace("</script>", "<\\/script>");
 
     Ok(format!(
         r#"<!DOCTYPE html>
@@ -105,6 +104,13 @@ const VIEWER_SCRIPT: &str = r##"<script>
 (function() {
   const data = JSON.parse(document.getElementById('session-data').textContent);
   const app = document.getElementById('app');
+  if (data.export_version > 1) {
+    const p = document.createElement('p');
+    p.style.cssText = 'color:var(--yellow);padding:40px;text-align:center';
+    p.textContent = 'This file was exported with a newer version of Rewind. Please update to view it.';
+    app.appendChild(p);
+    return;
+  }
   const s = data.session;
   const hasContent = data.include_content;
 
