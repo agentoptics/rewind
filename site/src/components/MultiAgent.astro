@@ -53,14 +53,14 @@
       <!-- Right: Span tree mockup -->
       <div class="overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900/30">
         <div class="border-b border-neutral-800 bg-neutral-900 px-4 py-2.5 flex items-center gap-2">
-          <div class="h-2.5 w-2.5 rounded-full bg-red-500/60"></div>
-          <div class="h-2.5 w-2.5 rounded-full bg-yellow-500/60"></div>
-          <div class="h-2.5 w-2.5 rounded-full bg-green-500/60"></div>
+          <div class="h-3 w-3 rounded-full bg-red-500/70"></div>
+          <div class="h-3 w-3 rounded-full bg-yellow-500/70"></div>
+          <div class="h-3 w-3 rounded-full bg-green-500/70"></div>
           <span class="ml-2 text-[10px] text-neutral-600 font-mono">rewind inspect latest --spans</span>
         </div>
 
-        <div class="bg-neutral-950 p-6 font-mono text-[11px] leading-loose">
-          <div class="text-neutral-500 mb-3">Session: <span class="text-neutral-300">customer-service</span> &middot; Agents: <span class="text-neutral-300">3</span> &middot; Steps: <span class="text-neutral-300">12</span></div>
+        <div class="bg-neutral-950 p-6 font-mono text-[11px] leading-loose" role="img" aria-label="Span tree showing supervisor agent routing to researcher and writer sub-agents. Researcher completes successfully with web search tool call. Writer fails at the final step due to hallucination.">
+          <div class="text-neutral-500 mb-3" aria-hidden="true">Session: <span class="text-neutral-300">customer-service</span> &middot; Agents: <span class="text-neutral-300">3</span> &middot; Steps: <span class="text-neutral-300">12</span></div>
 
           <!-- Supervisor -->
           <div class="flex items-center gap-1.5">

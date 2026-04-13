@@ -38,9 +38,9 @@ const ciFeatures = [
       <div class="lg:col-span-3 overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900/30">
         <div class="border-b border-neutral-800 bg-neutral-900 px-5 py-3 flex items-center justify-between">
           <div class="flex items-center gap-2">
-            <div class="h-2.5 w-2.5 rounded-full bg-red-500/60"></div>
-            <div class="h-2.5 w-2.5 rounded-full bg-yellow-500/60"></div>
-            <div class="h-2.5 w-2.5 rounded-full bg-green-500/60"></div>
+            <div class="h-3 w-3 rounded-full bg-red-500/70"></div>
+            <div class="h-3 w-3 rounded-full bg-yellow-500/70"></div>
+            <div class="h-3 w-3 rounded-full bg-green-500/70"></div>
             <span class="ml-2 text-[10px] text-neutral-600 font-mono">rewind eval</span>
           </div>
           <div class="flex gap-1">
@@ -63,40 +63,42 @@ const ciFeatures = [
           </div>
 
           <!-- Results table -->
-          <div class="space-y-2">
-            <div class="grid grid-cols-[1fr_80px_80px_80px] gap-2 text-[10px] uppercase tracking-wider text-neutral-600 px-3 pb-1">
-              <span>Example</span>
-              <span class="text-center">Exact</span>
-              <span class="text-center">Schema</span>
-              <span class="text-center">LLM Judge</span>
-            </div>
+          <div class="overflow-x-auto -mx-3">
+            <div class="min-w-[340px] space-y-2 px-3">
+              <div class="grid grid-cols-[1fr_56px_56px_64px] sm:grid-cols-[1fr_80px_80px_80px] gap-2 text-[10px] uppercase tracking-wider text-neutral-600 px-3 pb-1">
+                <span>Example</span>
+                <span class="text-center">Exact</span>
+                <span class="text-center">Schema</span>
+                <span class="text-center">Judge</span>
+              </div>
 
-            <div class="grid grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-neutral-900/50 px-3 py-2.5 items-center">
-              <span class="text-xs text-neutral-300 truncate">Book a table for 2</span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span></span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span></span>
-              <span class="text-center text-[10px] text-emerald-400 font-mono">0.95</span>
-            </div>
+              <div class="grid grid-cols-[1fr_56px_56px_64px] sm:grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-neutral-900/50 px-3 py-2.5 items-center">
+                <span class="text-xs text-neutral-300 truncate">Book a table for 2</span>
+                <span class="text-center" aria-label="Pass"><span class="text-emerald-400 text-xs">&#10003;</span></span>
+                <span class="text-center" aria-label="Pass"><span class="text-emerald-400 text-xs">&#10003;</span></span>
+                <span class="text-center text-[10px] text-emerald-400 font-mono">0.95</span>
+              </div>
 
-            <div class="grid grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-neutral-900/50 px-3 py-2.5 items-center">
-              <span class="text-xs text-neutral-300 truncate">Cancel reservation</span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span></span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span></span>
-              <span class="text-center text-[10px] text-emerald-400 font-mono">0.92</span>
-            </div>
+              <div class="grid grid-cols-[1fr_56px_56px_64px] sm:grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-neutral-900/50 px-3 py-2.5 items-center">
+                <span class="text-xs text-neutral-300 truncate">Cancel reservation</span>
+                <span class="text-center" aria-label="Pass"><span class="text-emerald-400 text-xs">&#10003;</span></span>
+                <span class="text-center" aria-label="Pass"><span class="text-emerald-400 text-xs">&#10003;</span></span>
+                <span class="text-center text-[10px] text-emerald-400 font-mono">0.92</span>
+              </div>
 
-            <div class="grid grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-neutral-900/50 px-3 py-2.5 items-center">
-              <span class="text-xs text-neutral-300 truncate">Change date to Friday</span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span></span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-amber-400"></span></span>
-              <span class="text-center text-[10px] text-amber-400 font-mono">0.78</span>
-            </div>
+              <div class="grid grid-cols-[1fr_56px_56px_64px] sm:grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-neutral-900/50 px-3 py-2.5 items-center">
+                <span class="text-xs text-neutral-300 truncate">Change date to Friday</span>
+                <span class="text-center" aria-label="Pass"><span class="text-emerald-400 text-xs">&#10003;</span></span>
+                <span class="text-center" aria-label="Warn"><span class="text-amber-400 text-xs">&#x25cf;</span></span>
+                <span class="text-center text-[10px] text-amber-400 font-mono">0.78</span>
+              </div>
 
-            <div class="grid grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-red-900/10 border border-red-500/10 px-3 py-2.5 items-center">
-              <span class="text-xs text-neutral-300 truncate">Refund my order</span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-red-400"></span></span>
-              <span class="text-center"><span class="inline-block h-2 w-2 rounded-full bg-emerald-400"></span></span>
-              <span class="text-center text-[10px] text-red-400 font-mono">0.41</span>
+              <div class="grid grid-cols-[1fr_56px_56px_64px] sm:grid-cols-[1fr_80px_80px_80px] gap-2 rounded-lg bg-red-900/10 border border-red-500/10 px-3 py-2.5 items-center">
+                <span class="text-xs text-neutral-300 truncate">Refund my order</span>
+                <span class="text-center" aria-label="Fail"><span class="text-red-400 text-xs">&#x2717;</span></span>
+                <span class="text-center" aria-label="Pass"><span class="text-emerald-400 text-xs">&#10003;</span></span>
+                <span class="text-center text-[10px] text-red-400 font-mono">0.41</span>
+              </div>
             </div>
           </div>
 
@@ -116,7 +118,7 @@ const ciFeatures = [
             {evaluators.map(e => (
               <div class="flex items-center justify-between rounded-lg bg-neutral-800/30 px-3 py-2">
                 <span class="text-xs text-neutral-300">{e.name}</span>
-                <span class={`rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider ${
+                <span class={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${
                   e.type === 'ai' ? 'bg-violet-500/10 text-violet-400' :
                   e.type === 'custom' ? 'bg-amber-500/10 text-amber-400' :
                   'bg-neutral-700/50 text-neutral-400'
@@ -148,6 +150,7 @@ const ciFeatures = [
           </div>
           <pre class="bg-neutral-950 p-4 font-mono text-[11px] leading-relaxed overflow-x-auto"><code><span class="text-brand-accent">result</span> <span class="text-neutral-500">=</span> <span class="text-neutral-200">rewind_agent</span><span class="text-neutral-500">.</span><span class="text-neutral-200">evaluate</span><span class="text-neutral-500">(</span>
   <span class="text-neutral-200">dataset</span><span class="text-neutral-500">=</span><span class="text-brand-primary">"booking-tests"</span><span class="text-neutral-500">,</span>
+  <span class="text-neutral-200">target_fn</span><span class="text-neutral-500">=</span><span class="text-neutral-200">my_agent</span><span class="text-neutral-500">,</span>
   <span class="text-neutral-200">evaluators</span><span class="text-neutral-500">=[</span><span class="text-brand-primary">"exact_match"</span><span class="text-neutral-500">,</span> <span class="text-neutral-200">llm_judge</span><span class="text-neutral-500">],</span>
   <span class="text-neutral-200">fail_below</span><span class="text-neutral-500">=</span><span class="text-brand-accent">0.9</span><span class="text-neutral-500">,</span>
 <span class="text-neutral-500">)</span></code></pre>

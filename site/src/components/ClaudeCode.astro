@@ -9,12 +9,12 @@ const mcpTools = [
 ];
 
 const hookEvents = [
-  { event: "Session lifecycle", icon: "&#x1f4cb;" },
-  { event: "Tool calls", icon: "&#x1f527;" },
-  { event: "User prompts", icon: "&#x1f4ac;" },
-  { event: "File edits", icon: "&#x270f;&#xfe0f;" },
-  { event: "Subagent trees", icon: "&#x1f333;" },
-  { event: "Token usage", icon: "&#x1f4b0;" },
+  { event: "Session lifecycle", icon: "\u{1F4CB}" },
+  { event: "Tool calls", icon: "\u{1F527}" },
+  { event: "User prompts", icon: "\u{1F4AC}" },
+  { event: "File edits", icon: "\u270F\uFE0F" },
+  { event: "Subagent trees", icon: "\u{1F333}" },
+  { event: "Token usage", icon: "\u{1F4B0}" },
 ];
 ---
 
@@ -37,7 +37,7 @@ const hookEvents = [
       <!-- Left: Flow diagram -->
       <div class="overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900/30 p-8">
         <h3 class="text-xs font-semibold uppercase tracking-widest text-neutral-500 mb-8">
-          How it works
+          Integration flow
         </h3>
 
         <!-- Flow: Claude Code → Hooks → Rewind → Dashboard -->
@@ -52,7 +52,7 @@ const hookEvents = [
           </div>
 
           <!-- Arrow down -->
-          <div class="flex justify-center text-neutral-700">
+          <div class="flex justify-center text-neutral-700" aria-hidden="true">
             <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 14l-7 7m0 0l-7-7m7 7V3"/></svg>
           </div>
 
@@ -76,7 +76,7 @@ const hookEvents = [
           </div>
 
           <!-- Arrow down -->
-          <div class="flex justify-center text-neutral-700">
+          <div class="flex justify-center text-neutral-700" aria-hidden="true">
             <svg class="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 14l-7 7m0 0l-7-7m7 7V3"/></svg>
           </div>
 
@@ -122,12 +122,12 @@ const hookEvents = [
         <!-- Setup card -->
         <div class="rounded-2xl border border-neutral-800 bg-neutral-900/30 overflow-hidden">
           <div class="border-b border-neutral-800 bg-neutral-900 px-4 py-2.5 flex items-center gap-2">
-            <div class="h-2.5 w-2.5 rounded-full bg-red-500/60"></div>
-            <div class="h-2.5 w-2.5 rounded-full bg-yellow-500/60"></div>
-            <div class="h-2.5 w-2.5 rounded-full bg-green-500/60"></div>
+            <div class="h-3 w-3 rounded-full bg-red-500/70"></div>
+            <div class="h-3 w-3 rounded-full bg-yellow-500/70"></div>
+            <div class="h-3 w-3 rounded-full bg-green-500/70"></div>
             <span class="ml-2 text-[10px] text-neutral-600 font-mono">terminal</span>
           </div>
-          <pre class="bg-neutral-950 p-5 font-mono text-xs leading-relaxed"><code><span class="text-neutral-600"># One-command setup</span>
+          <pre class="bg-neutral-950 p-5 font-mono text-xs leading-relaxed overflow-x-auto"><code><span class="text-neutral-600"># One-command setup</span>
 <span class="text-neutral-500 select-none">$ </span><span class="text-neutral-200">rewind hooks install</span>
 
 <span class="text-neutral-600"># Start the dashboard</span>
@@ -138,7 +138,7 @@ const hookEvents = [
         </div>
 
         <!-- Key stats -->
-        <div class="grid grid-cols-3 gap-3">
+        <div class="grid grid-cols-3 gap-3 sm:grid-cols-3">
           <div class="rounded-xl border border-neutral-800 bg-neutral-900/30 p-4 text-center">
             <div class="text-2xl font-bold text-brand-primary">26</div>
             <div class="text-[10px] uppercase tracking-wider text-neutral-500 mt-1">MCP tools</div>
