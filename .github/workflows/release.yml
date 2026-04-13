@@ -4,6 +4,7 @@ on:
   push:
     branches: [master, main]
     paths: [Cargo.toml]
+  workflow_dispatch:
 
 permissions:
   contents: write
