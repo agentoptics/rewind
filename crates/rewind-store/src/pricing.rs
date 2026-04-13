@@ -3,7 +3,7 @@
 //! Hardcoded prices for common LLM models. Update quarterly.
 //! Used to show cost/time savings after fork-and-execute replays.
 
-use rewind_store::Step;
+use crate::Step;
 use serde::Serialize;
 
 /// Per-model pricing: (input_cost_per_million, output_cost_per_million) in USD.
@@ -71,7 +71,7 @@ pub fn compute_savings(cached_steps: &[Step], live_steps: &[Step]) -> ReplaySavi
 mod tests {
     use super::*;
     use chrono::Utc;
-    use rewind_store::{StepStatus, StepType};
+    use crate::{StepStatus, StepType};
 
     fn make_step(model: &str, tokens_in: u64, tokens_out: u64, duration_ms: u64) -> Step {
         Step {

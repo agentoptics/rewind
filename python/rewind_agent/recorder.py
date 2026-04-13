@@ -481,10 +481,11 @@ class Recorder:
         self._originals = {}
         self._replay_steps = replay_steps  # list of parent step dicts
         self._fork_at_step = fork_at_step  # step cutoff for cached replay
-        # Replay savings tracking
+        # Replay savings tracking (only actual cache hits)
         self._cached_steps_count = 0
         self._cached_tokens = 0
         self._cached_duration_ms = 0
+        self._cached_cost = 0.0
 
     def patch_all(self):
         """Patch all supported SDK clients."""
@@ -514,7 +515,7 @@ class Recorder:
         if self._cached_steps_count == 0:
             return
 
-        cost = _estimate_cost_from_steps(self._replay_steps or [], self._fork_at_step or 0)
+        cost = round(self._cached_cost, 2)
         secs = self._cached_duration_ms / 1000
         if secs >= 60:
             time_str = f"{int(secs // 60)}m {int(secs % 60)}s"
@@ -560,10 +561,13 @@ class Recorder:
 
             self._step_counter += 1
 
-            # Track savings
+            # Track savings (only actual cache hits)
+            tok_in = int(parent.get("tokens_in", 0))
+            tok_out = int(parent.get("tokens_out", 0))
             self._cached_steps_count += 1
-            self._cached_tokens += int(parent.get("tokens_in", 0)) + int(parent.get("tokens_out", 0))
+            self._cached_tokens += tok_in + tok_out
             self._cached_duration_ms += int(parent.get("duration_ms", 0))
+            self._cached_cost += estimate_cost(parent.get("model", ""), tok_in, tok_out)
 
             logger.info(
                 "Rewind: fork replay — served cached step %d/%d (0ms, 0 tokens)",

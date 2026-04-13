@@ -529,6 +529,7 @@ class TestReplaySavingsTracking(unittest.TestCase):
         self.assertEqual(recorder._cached_steps_count, 1)
         self.assertEqual(recorder._cached_tokens, 100 + 50)  # step 1
         self.assertEqual(recorder._cached_duration_ms, 500)
+        self.assertGreater(recorder._cached_cost, 0.0)
 
         # Second cache hit
         result = recorder._try_replay_cached("openai")
@@ -536,6 +537,13 @@ class TestReplaySavingsTracking(unittest.TestCase):
         self.assertEqual(recorder._cached_steps_count, 2)
         self.assertEqual(recorder._cached_tokens, (100 + 50) + (200 + 100))
         self.assertEqual(recorder._cached_duration_ms, 500 + 1000)
+
+        # Cost should be cumulative
+        expected_cost = (
+            estimate_cost("gpt-4o", 100, 50) +
+            estimate_cost("gpt-4o", 200, 100)
+        )
+        self.assertAlmostEqual(recorder._cached_cost, expected_cost, places=6)
 
         # Third call is beyond fork point — live
         result = recorder._try_replay_cached("openai")

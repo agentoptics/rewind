@@ -661,7 +661,7 @@ async fn export_otel(
 async fn get_session_savings(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<rewind_proxy::pricing::ReplaySavings>, (StatusCode, String)> {
+) -> Result<Json<rewind_store::pricing::ReplaySavings>, (StatusCode, String)> {
     let store = state.store.lock().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {e}"))
     })?;
@@ -675,7 +675,7 @@ async fn get_session_savings(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
     })?;
 
-    let mut cumulative = rewind_proxy::pricing::ReplaySavings {
+    let mut cumulative = rewind_store::pricing::ReplaySavings {
         steps_total: 0,
         steps_cached: 0,
         steps_live: 0,
@@ -699,7 +699,7 @@ async fn get_session_savings(
         let cached: Vec<_> = parent_steps.into_iter()
             .filter(|s| s.step_number <= fork_at)
             .collect();
-        let savings = rewind_proxy::pricing::compute_savings(&cached, &own_steps);
+        let savings = rewind_store::pricing::compute_savings(&cached, &own_steps);
 
         cumulative.steps_total += savings.steps_total;
         cumulative.steps_cached += savings.steps_cached;
