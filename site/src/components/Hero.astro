@@ -55,21 +55,25 @@
           title="Copy to clipboard"
         >
           <svg
+            id="copy-icon"
             class="h-4 w-4"
             fill="none"
             stroke="currentColor"
             viewBox="0 0 24 24"
+            aria-hidden="true"
           >
-            <rect
-              x="9"
-              y="9"
-              width="13"
-              height="13"
-              rx="2"
-              stroke-width="2"></rect>
-            <path
-              d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"
-              stroke-width="2"></path>
+            <rect x="9" y="9" width="13" height="13" rx="2" stroke-width="2"></rect>
+            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke-width="2"></path>
+          </svg>
+          <svg
+            id="check-icon"
+            class="h-4 w-4 text-emerald-400 hidden"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
           </svg>
         </button>
       </div>
@@ -119,16 +123,17 @@
 </section>
 
 <script>
+  const COPY_RESET_MS = 2000;
+
   document.getElementById("copy-install")?.addEventListener("click", () => {
     navigator.clipboard.writeText("pip install rewind-agent");
-    const btn = document.getElementById("copy-install");
-    if (btn) {
-      btn.innerHTML =
-        '<svg class="h-4 w-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>';
-      setTimeout(() => {
-        btn.innerHTML =
-          '<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" stroke-width="2"></rect><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke-width="2"></path></svg>';
-      }, 2000);
-    }
+    const copyIcon = document.getElementById("copy-icon");
+    const checkIcon = document.getElementById("check-icon");
+    copyIcon?.classList.add("hidden");
+    checkIcon?.classList.remove("hidden");
+    setTimeout(() => {
+      copyIcon?.classList.remove("hidden");
+      checkIcon?.classList.add("hidden");
+    }, COPY_RESET_MS);
   });
 </script>

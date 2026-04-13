@@ -2,3 +2,7 @@ node_modules/
 dist/
 .vercel/
 .astro/
+.env
+.env.local
+.DS_Store
+*.log
