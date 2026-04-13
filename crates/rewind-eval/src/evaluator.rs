@@ -119,7 +119,28 @@ fn run_llm_judge_evaluator(
         match child.try_wait()? {
             Some(status) => {
                 let duration = start.elapsed();
+                // Always read stdout — error JSON is written there even on non-zero exit
+                let mut stdout_str = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_string(&mut stdout_str);
+                }
+                stdout_str.truncate(100_000);
+
                 if !status.success() {
+                    // Try to parse stdout as error JSON first (Python writes structured errors there)
+                    if let Ok(result) = serde_json::from_str::<serde_json::Value>(stdout_str.trim()) {
+                        let reasoning = result
+                            .get("reasoning")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown error");
+                        let sanitized = sanitize_secrets(reasoning);
+                        return Ok(ScoreResult {
+                            score: 0.0,
+                            passed: false,
+                            reasoning: sanitized,
+                        });
+                    }
+                    // Fall back to stderr
                     let mut stderr_str = String::new();
                     if let Some(mut stderr) = child.stderr.take() {
                         let _ = stderr.read_to_string(&mut stderr_str);
@@ -137,13 +158,6 @@ fn run_llm_judge_evaluator(
                         ),
                     });
                 }
-
-                // Read stdout
-                let mut stdout_str = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    stdout.read_to_string(&mut stdout_str)?;
-                }
-                stdout_str.truncate(100_000);
 
                 // Parse result
                 let result: Value = serde_json::from_str(stdout_str.trim()).map_err(|e| {
