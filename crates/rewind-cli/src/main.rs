@@ -3160,7 +3160,8 @@ async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
     };
 
     // Step 1: Extract data synchronously from Store (Store is not Send)
-    println!(
+    // Use stderr for status messages so --dry-run stdout is clean JSON.
+    eprintln!(
         "{} Extracting session {} ...",
         "⏪".bold(),
         session.id[..8].yellow()
@@ -3170,7 +3171,7 @@ async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
 
     let total = data.total_steps();
     let tl_count = data.timelines.len();
-    println!(
+    eprintln!(
         "   {} steps across {} timeline{}",
         total.to_string().cyan(),
         tl_count,
@@ -3186,8 +3187,15 @@ async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
     };
 
     let span_count = if args.dry_run {
-        println!("{} Dry run — writing spans to stdout:\n", "📋".bold());
-        rewind_otel::export::export_to_stdout(&data, &config)?
+        // Build the proper ExportTraceServiceRequest and output as JSON.
+        // This is importable via `rewind import otel --json-file`.
+        let request = rewind_otel::export::build_otlp_request(&data, &config);
+        let json = serde_json::to_string_pretty(&request)?;
+        println!("{json}");
+        request.resource_spans.iter()
+            .flat_map(|rs| &rs.scope_spans)
+            .map(|ss| ss.spans.len())
+            .sum::<usize>()
     } else {
         println!(
             "{} Exporting to {} ...",
@@ -3197,7 +3205,7 @@ async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
         rewind_otel::export::export_to_otlp(&data, &config)?
     };
 
-    println!(
+    eprintln!(
         "\n{} Exported {} OTel spans (trace_id: {})",
         "✓".green().bold(),
         span_count.to_string().cyan(),
@@ -3205,7 +3213,7 @@ async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
     );
 
     if args.include_content {
-        println!(
+        eprintln!(
             "   {} Full message content included (--include-content)",
             "⚠".yellow()
         );

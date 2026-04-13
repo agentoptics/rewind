@@ -307,6 +307,202 @@ fn emit_spans(
     Ok(span_count)
 }
 
+/// Build an `ExportTraceServiceRequest` from session data.
+///
+/// Unlike `emit_spans` (which goes through the OTel SDK tracer pipeline),
+/// this constructs the protobuf types directly. Used for JSON serialization
+/// and round-trip import/export.
+pub fn build_otlp_request(
+    data: &SessionExportData,
+    config: &ExportConfig,
+) -> opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue as ProtoKv, any_value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{
+        ResourceSpans, ScopeSpans, Span as ProtoSpan, Status as ProtoStatus,
+        span::SpanKind as ProtoSpanKind,
+    };
+
+    let trace_id = trace_id_from_session(&data.session.id).to_bytes().to_vec();
+
+    fn kv(key: &str, val: &str) -> ProtoKv {
+        ProtoKv {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(val.to_string())),
+            }),
+        }
+    }
+
+    fn kv_int(key: &str, val: i64) -> ProtoKv {
+        ProtoKv {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::IntValue(val)),
+            }),
+        }
+    }
+
+    fn to_nanos(dt: &chrono::DateTime<chrono::Utc>) -> u64 {
+        (dt.timestamp() as u64) * 1_000_000_000 + dt.timestamp_subsec_nanos() as u64
+    }
+
+    // Session root span
+    let session_span_id = span_id_from_id(&data.session.id).to_bytes().to_vec();
+    let session_start = to_nanos(&data.session.created_at);
+    let session_end = to_nanos(&data.session.updated_at);
+
+    let session_span = ProtoSpan {
+        trace_id: trace_id.clone(),
+        span_id: session_span_id.clone(),
+        parent_span_id: vec![],
+        name: format!("session {}", data.session.name),
+        kind: ProtoSpanKind::Internal as i32,
+        start_time_unix_nano: session_start,
+        end_time_unix_nano: session_end,
+        attributes: vec![
+            kv("rewind.session.id", &data.session.id),
+            kv("rewind.session.name", &data.session.name),
+            kv("rewind.session.source", data.session.source.as_str()),
+            kv_int("rewind.session.total_steps", data.session.total_steps as i64),
+            kv_int("rewind.session.total_tokens", data.session.total_tokens as i64),
+        ],
+        status: Some(ProtoStatus { code: 0, message: String::new() }),
+        ..Default::default()
+    };
+
+    let mut all_spans = vec![session_span];
+
+    for timeline in &data.timelines {
+        let tl_span_id = span_id_from_id(&timeline.id).to_bytes().to_vec();
+        let tl_start = to_nanos(&timeline.created_at);
+
+        let mut tl_attrs = vec![
+            kv("rewind.timeline.id", &timeline.id),
+            kv("rewind.timeline.label", &timeline.label),
+        ];
+        if let Some(ref parent) = timeline.parent_timeline_id {
+            tl_attrs.push(kv("rewind.timeline.parent_id", parent));
+        }
+        if let Some(fork_at) = timeline.fork_at_step {
+            tl_attrs.push(kv_int("rewind.timeline.fork_at_step", fork_at as i64));
+        }
+
+        let tl_end = data
+            .steps_by_timeline
+            .get(&timeline.id)
+            .and_then(|steps| {
+                steps.iter().map(|s| {
+                    to_nanos(&s.created_at) + s.duration_ms * 1_000_000
+                }).max()
+            })
+            .unwrap_or(tl_start);
+
+        let tl_span = ProtoSpan {
+            trace_id: trace_id.clone(),
+            span_id: tl_span_id.clone(),
+            parent_span_id: session_span_id.clone(),
+            name: format!("timeline {}", timeline.label),
+            kind: ProtoSpanKind::Internal as i32,
+            start_time_unix_nano: tl_start,
+            end_time_unix_nano: tl_end,
+            attributes: tl_attrs,
+            status: Some(ProtoStatus { code: 0, message: String::new() }),
+            ..Default::default()
+        };
+        all_spans.push(tl_span);
+
+        // Step spans
+        if let Some(steps) = data.steps_by_timeline.get(&timeline.id) {
+            for step in steps {
+                let step_span_id = span_id_from_id(&step.id).to_bytes().to_vec();
+                let name = attributes::span_name(step);
+                let kind = match attributes::span_kind(step) {
+                    attributes::OtelSpanKind::Client => ProtoSpanKind::Client,
+                    attributes::OtelSpanKind::Internal => ProtoSpanKind::Internal,
+                };
+
+                let req_blob = data.get_blob(&step.request_blob);
+                let resp_blob = data.get_blob(&step.response_blob);
+                let otel_attrs =
+                    attributes::step_attributes(step, req_blob, resp_blob, config.include_content);
+
+                // Convert opentelemetry::KeyValue → proto KeyValue
+                let attrs: Vec<ProtoKv> = otel_attrs
+                    .into_iter()
+                    .map(|kv_otel| {
+                        let val = match kv_otel.value {
+                            opentelemetry::Value::String(s) => {
+                                Some(any_value::Value::StringValue(s.to_string()))
+                            }
+                            opentelemetry::Value::I64(i) => {
+                                Some(any_value::Value::IntValue(i))
+                            }
+                            opentelemetry::Value::F64(f) => {
+                                Some(any_value::Value::DoubleValue(f))
+                            }
+                            opentelemetry::Value::Bool(b) => {
+                                Some(any_value::Value::BoolValue(b))
+                            }
+                            _ => Some(any_value::Value::StringValue(
+                                kv_otel.value.to_string(),
+                            )),
+                        };
+                        ProtoKv {
+                            key: kv_otel.key.to_string(),
+                            value: Some(AnyValue { value: val }),
+                        }
+                    })
+                    .collect();
+
+                let step_start = to_nanos(&step.created_at);
+                let step_end = step_start + step.duration_ms * 1_000_000;
+
+                let status_code = if step.status == rewind_store::models::StepStatus::Error {
+                    2
+                } else {
+                    0
+                };
+
+                let step_span = ProtoSpan {
+                    trace_id: trace_id.clone(),
+                    span_id: step_span_id,
+                    parent_span_id: tl_span_id.clone(),
+                    name,
+                    kind: kind as i32,
+                    start_time_unix_nano: step_start,
+                    end_time_unix_nano: step_end,
+                    attributes: attrs,
+                    status: Some(ProtoStatus {
+                        code: status_code,
+                        message: step.error.clone().unwrap_or_default(),
+                    }),
+                    ..Default::default()
+                };
+                all_spans.push(step_span);
+            }
+        }
+    }
+
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![
+                    kv("service.name", "rewind"),
+                    kv("service.version", env!("CARGO_PKG_VERSION")),
+                ],
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: all_spans,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
