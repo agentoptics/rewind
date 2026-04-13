@@ -1770,6 +1770,7 @@ fn cmd_eval_evaluator_create(name: String, evaluator_type: String, config: Optio
                     "contains" => serde_json::json!({"substring": c}),
                     "regex" => serde_json::json!({"pattern": c}),
                     "custom" => serde_json::json!({"command": c}),
+                    "llm_judge" => serde_json::json!({"criteria": c}),
                     _ => serde_json::json!({"value": c}),
                 }
             };

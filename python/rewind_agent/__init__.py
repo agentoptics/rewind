@@ -46,6 +46,7 @@ from .evaluation import (
     contains_match,
     regex_match,
     tool_use_match,
+    llm_judge_evaluator,
 )
 
 __all__ = [
@@ -81,6 +82,7 @@ __all__ = [
     "contains_match",
     "regex_match",
     "tool_use_match",
+    "llm_judge_evaluator",
     # OTel export
     "export_otel",
 ]

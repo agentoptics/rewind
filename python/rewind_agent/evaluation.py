@@ -489,12 +489,42 @@ def list_evaluators() -> dict:
 
 # ── Built-in evaluator name map ───────────────────────────────
 
+def _llm_judge_evaluator(input, output, expected, **kwargs):
+    """Built-in LLM-as-judge evaluator. Requires: pip install rewind-agent[openai]"""
+    from .llm_judge import run_judge
+    result = run_judge(input, output, expected, **kwargs)
+    return EvalScore(score=result["score"], passed=result["passed"], reasoning=result["reasoning"])
+
+
 _BUILTIN_EVALUATORS = {
     "exact_match": exact_match,
     "contains_match": contains_match,
     "regex_match": regex_match,
     "tool_use_match": tool_use_match,
+    "llm_judge": _llm_judge_evaluator,
 }
+
+
+def llm_judge_evaluator(criteria="correctness", model="gpt-4o-mini", **kwargs):
+    """
+    Create a configured LLM-as-judge evaluator.
+
+    Usage:
+        result = rewind_agent.evaluate(
+            dataset=ds,
+            target_fn=my_agent,
+            evaluators=[
+                rewind_agent.llm_judge_evaluator(criteria="correctness", model="gpt-4o"),
+                rewind_agent.llm_judge_evaluator(criteria="safety"),
+            ],
+        )
+    """
+    def _judge(input, output, expected):
+        from .llm_judge import run_judge
+        result = run_judge(input, output, expected, criteria=criteria, model=model, **kwargs)
+        return EvalScore(score=result["score"], passed=result["passed"], reasoning=result["reasoning"])
+    _judge.__name__ = f"llm_judge:{criteria}"
+    return _judge
 
 
 def _resolve_evaluator(e):
