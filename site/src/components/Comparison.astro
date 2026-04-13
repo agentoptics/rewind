@@ -1,28 +1,67 @@
 ---
+const otherTools = [
+  "View traces after the run",
+  "Re-run the entire agent to test a fix",
+  "No timeline branching",
+  "Manual before/after comparison",
+  "Separate tools for tracing vs. evals",
+];
 
+const rewindDoes = [
+  "View traces — and change them",
+  "Fork at the failure, replay just the fix",
+  "Branch at any step, cached at 0 tokens",
+  "LLM-as-judge scores diffs automatically",
+  "Tracing, debugging, and evals in one model",
+];
 ---
 
-<section class="border-t border-neutral-800/50 py-20 md:py-28">
+<section class="py-20 md:py-28">
   <div class="mx-auto max-w-4xl px-6">
-    <blockquote
-      class="relative rounded-2xl border border-neutral-800 bg-neutral-900/50 px-8 py-10 text-center md:px-12"
-    >
-      <div
-        class="absolute -top-4 left-1/2 -translate-x-1/2 rounded-full bg-neutral-950 px-4 py-1 text-xs font-semibold uppercase tracking-widest text-brand-cyan"
-      >
+    <div class="text-center mb-12">
+      <span class="inline-block rounded-full bg-brand-primary/10 px-4 py-1.5 text-xs font-semibold uppercase tracking-widest text-brand-primary">
         The difference
+      </span>
+      <h2 class="mt-4 text-3xl font-bold tracking-tight md:text-4xl">
+        Other tools show what happened.<br class="hidden sm:block" />
+        <span class="text-brand-primary">Rewind lets you change it.</span>
+      </h2>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-px overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-800">
+      <!-- Other tools column -->
+      <div class="bg-neutral-950 p-6 md:p-8">
+        <h3 class="mb-5 text-xs font-semibold uppercase tracking-widest text-neutral-500">
+          Langfuse / LangSmith / Helicone
+        </h3>
+        <ul class="space-y-3.5">
+          {otherTools.map((item) => (
+            <li class="flex items-start gap-3 text-sm text-neutral-400">
+              <span class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-neutral-800 text-neutral-500" aria-hidden="true">
+                <svg class="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 12H4"/></svg>
+              </span>
+              {item}
+            </li>
+          ))}
+        </ul>
       </div>
-      <p class="text-lg text-neutral-300 md:text-xl lg:text-2xl">
-        Every observability tool &mdash; Langfuse, LangSmith, Helicone &mdash;
-        shows you <strong class="text-neutral-100">what happened</strong>.
-        <br class="hidden md:block" />
-        None of them let you <strong class="text-neutral-100"
-          >change the past and observe a different future</strong
-        >.
-      </p>
-      <p class="mt-4 text-xl font-bold text-brand-cyan md:text-2xl">
-        Rewind does.
-      </p>
-    </blockquote>
+
+      <!-- Rewind column -->
+      <div class="bg-neutral-900/50 p-6 md:p-8">
+        <h3 class="mb-5 text-xs font-semibold uppercase tracking-widest text-brand-primary">
+          Rewind
+        </h3>
+        <ul class="space-y-3.5">
+          {rewindDoes.map((item) => (
+            <li class="flex items-start gap-3 text-sm text-neutral-200">
+              <span class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-brand-primary/10 text-brand-primary" aria-hidden="true">
+                <svg class="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+              </span>
+              {item}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
   </div>
 </section>

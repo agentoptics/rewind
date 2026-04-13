@@ -5,8 +5,8 @@ export default {
     extend: {
       colors: {
         brand: {
-          cyan: "#22d3ee",
-          violet: "#8b5cf6",
+          primary: "#4ade80",
+          accent: "#fbbf24",
         },
       },
       fontFamily: {
