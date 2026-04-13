@@ -1,3 +1,5 @@
+pub mod pricing;
+
 use anyhow::Result;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
