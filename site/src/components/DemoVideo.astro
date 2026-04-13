@@ -2,7 +2,7 @@
 
 ---
 
-<section id="demo" class="border-t border-neutral-800/50 py-20 md:py-28">
+<section id="demo" class="py-20 md:py-28">
   <div class="mx-auto max-w-5xl px-6">
     <div class="text-center">
       <h2 class="text-3xl font-bold tracking-tight md:text-4xl">
@@ -13,29 +13,74 @@
       </p>
     </div>
 
-    <div class="mt-12 overflow-hidden rounded-2xl border border-neutral-800">
-      <!-- Terminal chrome -->
-      <div
-        class="flex items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-4 py-3"
-      >
-        <div class="h-3 w-3 rounded-full bg-red-500/70"></div>
-        <div class="h-3 w-3 rounded-full bg-yellow-500/70"></div>
-        <div class="h-3 w-3 rounded-full bg-green-500/70"></div>
-        <span class="ml-3 text-xs text-neutral-500 font-mono">rewind</span>
-      </div>
-      <div class="bg-neutral-950 p-2">
-        <video
-          autoplay
-          muted
-          loop
-          playsinline
-          preload="metadata"
-          class="w-full"
-          aria-label="Rewind demo showing trace inspection, timeline diff, and cached replay"
+    <div class="mt-12 grid gap-8 md:grid-cols-[1fr_280px] items-start">
+      <!-- Video in terminal chrome -->
+      <div class="overflow-hidden rounded-2xl border border-neutral-800">
+        <div
+          class="flex items-center gap-2 border-b border-neutral-800 bg-neutral-900 px-4 py-3"
         >
-          <source src="/demo.mp4" type="video/mp4" />
-          <img src="/demo.gif" alt="Rewind demo" class="w-full" loading="lazy" />
-        </video>
+          <div class="h-3 w-3 rounded-full bg-red-500/70"></div>
+          <div class="h-3 w-3 rounded-full bg-yellow-500/70"></div>
+          <div class="h-3 w-3 rounded-full bg-green-500/70"></div>
+          <span class="ml-3 text-xs text-neutral-500 font-mono">rewind</span>
+        </div>
+        <div class="bg-neutral-950 p-2">
+          <video
+            autoplay
+            muted
+            loop
+            playsinline
+            preload="metadata"
+            class="w-full"
+            aria-label="Rewind demo showing trace inspection, timeline diff, and cached replay"
+          >
+            <source src="/demo.mp4" type="video/mp4" />
+            <img src="/demo.gif" alt="Rewind demo" class="w-full" loading="lazy" />
+          </video>
+        </div>
+      </div>
+
+      <!-- Step annotations -->
+      <div class="space-y-4">
+        <div class="rounded-xl border border-neutral-800 bg-neutral-900/30 p-4">
+          <div class="flex items-center gap-2.5 mb-2">
+            <span class="flex h-6 w-6 items-center justify-center rounded-full bg-brand-primary/10 text-xs font-bold text-brand-primary">1</span>
+            <span class="text-sm font-semibold">Record</span>
+          </div>
+          <p class="text-xs leading-relaxed text-neutral-400">
+            Run your agent with <code class="rounded bg-neutral-800 px-1 text-neutral-300">rewind_agent.init()</code>. Every LLM call is captured.
+          </p>
+        </div>
+
+        <div class="rounded-xl border border-neutral-800 bg-neutral-900/30 p-4">
+          <div class="flex items-center gap-2.5 mb-2">
+            <span class="flex h-6 w-6 items-center justify-center rounded-full bg-brand-primary/10 text-xs font-bold text-brand-primary">2</span>
+            <span class="text-sm font-semibold">Inspect</span>
+          </div>
+          <p class="text-xs leading-relaxed text-neutral-400">
+            Open the session. See every step, token count, latency, and full request/response.
+          </p>
+        </div>
+
+        <div class="rounded-xl border border-neutral-800 bg-neutral-900/30 p-4">
+          <div class="flex items-center gap-2.5 mb-2">
+            <span class="flex h-6 w-6 items-center justify-center rounded-full bg-brand-primary/10 text-xs font-bold text-brand-primary">3</span>
+            <span class="text-sm font-semibold">Fork & Fix</span>
+          </div>
+          <p class="text-xs leading-relaxed text-neutral-400">
+            Branch at the failure. Fix your prompt or code. Replay from that point — cached steps cost 0 tokens.
+          </p>
+        </div>
+
+        <div class="rounded-xl border border-neutral-800 bg-neutral-900/30 p-4">
+          <div class="flex items-center gap-2.5 mb-2">
+            <span class="flex h-6 w-6 items-center justify-center rounded-full bg-brand-primary/10 text-xs font-bold text-brand-primary">4</span>
+            <span class="text-sm font-semibold">Prove it</span>
+          </div>
+          <p class="text-xs leading-relaxed text-neutral-400">
+            Diff original vs. forked timelines. Score with LLM-as-judge. Ship with evidence.
+          </p>
+        </div>
       </div>
     </div>
 

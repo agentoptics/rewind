@@ -27,7 +27,7 @@ header() {
     pause 1.5
 }
 
-clear
+clear 2>/dev/null || true
 echo ""
 echo -e "\033[1;36m⏪ Rewind — Time-Travel Debugger for AI Agents\033[0m"
 echo -e "\033[90m   Fix broken agents without re-running them.\033[0m"
@@ -48,12 +48,6 @@ $REWIND diff "$SID" main fixed
 pause 3
 
 header "Steps 1-4 identical. Step 5 diverges: error → success."
-header "Let's score both timelines with an evaluator."
-
-slow_type "rewind eval score latest -e correctness --compare-timelines"
-$REWIND eval score "$SID" -e correctness --compare-timelines
-pause 3
-
 header "Now let's check against our regression baseline."
 
 slow_type "rewind assert check latest --against demo-baseline"
