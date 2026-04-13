@@ -1,6 +1,7 @@
 pub mod api;
 pub mod eval_api;
 pub mod hooks;
+pub mod otlp_ingest;
 mod polling;
 mod spa;
 pub mod transcript;
@@ -214,8 +215,11 @@ impl WebServer {
         let hook_routes = hooks::routes(self.state.clone());
         let ws_route = ws::routes(self.state.clone());
 
+        let otlp_routes = otlp_ingest::routes(self.state.clone());
+
         let app = Router::new()
             .route("/_rewind/health", axum::routing::get(rewind_health))
+            .merge(otlp_routes)
             .nest("/api", api_routes)
             .nest("/api/eval", eval_routes)
             .nest("/api/hooks", hook_routes)

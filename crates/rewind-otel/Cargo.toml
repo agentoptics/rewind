@@ -18,6 +18,10 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 tonic = "0.14"
+opentelemetry-proto = { workspace = true }
+prost = "0.14"
+flate2 = "1"
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
