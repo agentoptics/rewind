@@ -76,4 +76,4 @@ opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 opentelemetry-stdout = { version = "0.31", features = ["trace"] }
 opentelemetry-semantic-conventions = "0.31"
-opentelemetry-proto = { version = "0.31", features = ["gen-tonic-messages", "trace"] }
+opentelemetry-proto = { version = "0.31", features = ["gen-tonic-messages", "trace", "with-serde"] }

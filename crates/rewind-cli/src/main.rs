@@ -206,6 +206,34 @@ enum Commands {
         #[command(subcommand)]
         action: ExportAction,
     },
+
+    /// Import traces from external systems into Rewind
+    #[command(name = "import")]
+    Import {
+        #[command(subcommand)]
+        action: ImportAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportAction {
+    /// Import traces from an OTLP file (protobuf or JSON)
+    Otel(OtelImportArgs),
+}
+
+#[derive(clap::Args)]
+struct OtelImportArgs {
+    /// Import from a protobuf file (ExportTraceServiceRequest)
+    #[arg(long, group = "input")]
+    file: Option<std::path::PathBuf>,
+
+    /// Import from a JSON file (OTLP JSON format)
+    #[arg(long, group = "input")]
+    json_file: Option<std::path::PathBuf>,
+
+    /// Override the session name
+    #[arg(long)]
+    name: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -587,6 +615,9 @@ async fn main() -> Result<()> {
         },
         Commands::Export { action } => match action {
             ExportAction::Otel(args) => cmd_export_otel(args).await,
+        },
+        Commands::Import { action } => match action {
+            ImportAction::Otel(args) => cmd_import_otel(args),
         },
     }
 }
@@ -3179,6 +3210,76 @@ async fn cmd_export_otel(args: OtelExportArgs) -> Result<()> {
             "⚠".yellow()
         );
     }
+
+    Ok(())
+}
+
+// ── Import Commands ─────────────────────────────────────────
+
+fn cmd_import_otel(args: OtelImportArgs) -> Result<()> {
+    let store = Store::open_default()?;
+
+    let (bytes, is_json) = if let Some(ref path) = args.file {
+        let data = std::fs::read(path)
+            .with_context(|| format!("Failed to read file: {}", path.display()))?;
+        println!(
+            "{} Reading protobuf file: {} ({} bytes)",
+            "⏪".bold(),
+            path.display().to_string().cyan(),
+            data.len()
+        );
+        (data, false)
+    } else if let Some(ref path) = args.json_file {
+        let data = std::fs::read(path)
+            .with_context(|| format!("Failed to read file: {}", path.display()))?;
+        println!(
+            "{} Reading JSON file: {} ({} bytes)",
+            "⏪".bold(),
+            path.display().to_string().cyan(),
+            data.len()
+        );
+        (data, true)
+    } else {
+        bail!("Specify --file <path> or --json-file <path>");
+    };
+
+    let request = if is_json {
+        rewind_otel::ingest::decode_otlp_json_request(&bytes)?
+    } else {
+        rewind_otel::ingest::decode_otlp_request(&bytes, false)?
+    };
+
+    let opts = rewind_otel::ingest::IngestOptions {
+        session_name: args.name,
+    };
+
+    let result = rewind_otel::ingest::ingest_trace_request(request, &store, &opts)?;
+
+    println!(
+        "\n{} Imported {} spans → {} steps (session: {})",
+        "✓".green().bold(),
+        result.spans_ingested.to_string().cyan(),
+        result.steps_created.to_string().cyan(),
+        result.session_id[..8].yellow()
+    );
+
+    if result.replay_possible {
+        println!(
+            "   {} Content blobs stored — session is replayable",
+            "🔁".bold()
+        );
+    } else {
+        println!(
+            "   {} No content blobs — session is inspect-only (not replayable)",
+            "👁".bold()
+        );
+    }
+
+    println!(
+        "   {} View with: rewind show {}",
+        "→".bold(),
+        result.session_id[..8].cyan()
+    );
 
     Ok(())
 }

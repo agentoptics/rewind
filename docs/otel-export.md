@@ -2,6 +2,8 @@
 
 Export recorded Rewind sessions as OpenTelemetry traces to any OTLP-compatible backend — Langfuse, Datadog, Grafana Tempo, Jaeger, and more.
 
+> **See also:** [OTel Import](otel-import.md) — import OTLP traces from external systems into Rewind for time-travel debugging.
+
 ## Quick Start
 
 ### CLI

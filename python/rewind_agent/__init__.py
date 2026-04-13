@@ -94,4 +94,10 @@ def export_otel(session_id: str, **kwargs) -> int:
     return export_session(session_id, **kwargs)
 
 
+def import_otel(**kwargs) -> str:
+    """Import an OTel trace into Rewind. See otel_import.import_otel for args."""
+    from .otel_import import import_otel as _import_otel
+    return _import_otel(**kwargs)
+
+
 __version__ = "0.10.0"
