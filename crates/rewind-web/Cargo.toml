@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 rewind-store = { path = "../rewind-store" }
 rewind-replay = { path = "../rewind-replay" }
+rewind-proxy = { path = "../rewind-proxy" }
 rewind-assert = { path = "../rewind-assert" }
 rewind-eval = { path = "../rewind-eval" }
 rewind-otel = { path = "../rewind-otel" }
