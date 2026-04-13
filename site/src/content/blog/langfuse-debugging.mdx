@@ -2,7 +2,7 @@
 title: "I use Langfuse for tracing. Here's why I added Rewind for debugging."
 description: "Langfuse shows you what your agent did. But when step 15 of a 30-step run hallucinates, you can't fix it without re-running everything. Rewind lets you fork at the failure, replay with the fix, and prove it works."
 date: 2026-04-13
-author: "AgentOptics"
+author: "Rishabh Jain"
 tags: ["langfuse", "debugging", "ai-agents", "observability"]
 draft: false
 ---
@@ -11,17 +11,15 @@ Last week my research agent failed at step 15 of a 30-step run. Langfuse showed 
 
 Now what?
 
-![Rewind session trace showing a multi-agent research agent with the writer failing at step 15](/screenshot-session-trace.png)
-
 I changed the system prompt. Re-ran the agent. $1.20 in tokens. 3 minutes of wall time. Different answer, still wrong, different hallucination. Re-ran again. $1.20 more. Another answer. By the fifth attempt I'd spent $6 and 15 minutes, and I still wasn't sure the fix was right because every run gave a different output.
 
 **Langfuse is great at showing you what happened. It can't let you change what happened and observe a different outcome.**
 
 So I built a tool that does.
 
-## 🔍 The problem: observability ≠ debugging
+## The problem: observability is not debugging
 
-Every LLM observability tool (Langfuse, LangSmith, Helicone) solves the same problem: "What did my agent do?" They capture traces, show you token counts, latencies, and the content of each step. That's valuable.
+Most LLM observability tools (Langfuse, LangSmith, Helicone) solve the same problem: "What did my agent do?" They capture traces, show you token counts, latencies, and the content of each step. That's valuable.
 
 But when something breaks at step 15 of a 30-step agent, you're stuck:
 
@@ -31,11 +29,13 @@ But when something breaks at step 15 of a 30-step agent, you're stuck:
 
 I needed something that lets me fork at step 14, replay only the broken part, and prove the fix works. So I built [Rewind](https://github.com/agentoptics/rewind).
 
-## 📥 Step 1: Import the failing trace from Langfuse
+## Step 1: Import the failing trace from Langfuse
 
 I see the broken trace in Langfuse's UI. Copy the trace ID. One command:
 
 ```bash
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
 rewind import from-langfuse --trace abc123
 ```
 
@@ -45,51 +45,26 @@ Rewind calls the Langfuse REST API, fetches the trace with all observations, con
 rewind show latest
 ```
 
-```
-⏪ Rewind — Session Trace
+The span tree shows agent boundaries, tool calls, handoffs, and token counts at each step. In my case it looked like this: the supervisor dispatched to a researcher (which ran two LLM calls and a web search), then handed off to a writer that hallucinated on its final synthesis call. Same data as Langfuse, but now it's in a system that can act on it.
 
-  Session: research-agent
-  Steps: 30   Tokens: 274,200
-  Agents: supervisor, researcher, writer
+![Rewind web dashboard showing the imported trace with span tree and error detail](/screenshot-error-detail.png)
 
-  ▼ ✗ 🤖 supervisor (agent)                          12.4s
-    ▼ ✓ 🤖 researcher (agent)                         5.2s
-      ├ ✓ 🧠  gpt-4o  1.2s  6,420↓ 1,840↑
-      ├ ✓ 🧠  gpt-4o  2.1s  9,380↓ 2,610↑
-      ▼ ✓ 🔧 web_search (tool)  45ms
-    ▼ ✗ 🤖 writer (agent)                             4.1s
-      └ ✗ 🧠  gpt-4o  3.4s  12,100↓ 4,250↑
-      │   ERROR: Hallucination — used stale 2019 data as current fact
-```
-
-Same data as Langfuse, but now it's in a system that can act on it.
-
-![Rewind web dashboard showing the failing trace with span tree and error detail](/screenshot-error-detail.png)
-
-## ⏪ Step 2: Fork at the failure, replay with the fix
+## Step 2: Fork at the failure, replay with the fix
 
 I fix the system prompt in my code (added an instruction to cross-reference dates in search results), then replay from just before the failure:
 
 ```bash
-rewind replay latest --from 14
+rewind replay latest --from 15
 ```
 
-- **Steps 1-13**: served from cache. 0 tokens. 0 API calls. Instant.
-- **Step 14+**: live LLM calls with my updated code.
+- **Steps 1-14**: served from cache. 0 tokens. 0 API calls. Instant.
+- **Step 15+**: live LLM calls with my updated code.
 
-The agent runs the writer sub-agent again with the fix. The first 13 steps don't re-run at all. They're replayed from the recorded data.
-
-```
-⏪ Replay Savings
-  Steps: 13/30 cached (served from fork cache)
-  Tokens saved: 118,750
-  Cost saved: $0.52
-  Time saved: 1m 50s
-```
+The agent runs the writer sub-agent again with the fix. The first 14 steps don't re-run at all. They're replayed from the recorded data.
 
 One replay instead of a full re-run. If the fix isn't right, I replay again. Each time I only pay for the steps after the fork point.
 
-## ✅ Step 3: Prove the fix works with LLM-as-judge
+## Step 3: Prove the fix works with LLM-as-judge
 
 Instead of eyeballing the output, I score both timelines automatically:
 
@@ -110,11 +85,11 @@ rewind eval score latest -e correctness --compare-timelines
 
 Original timeline scores 0.2 on correctness. Fixed timeline scores 0.95. Not me guessing. An evaluator comparing the output against the expected result.
 
-I can set up regression baselines too. Next time I change the prompt, I run `rewind assert check latest --against my-baseline` and get a pass/fail across 37 assertions. No manual review needed.
+I can set up regression baselines too. Next time I change the prompt, I run `rewind assert check latest --against my-baseline` and get a pass/fail. No manual review needed.
 
-## 📤 Step 4: Share the debug session
+## Step 4: Share the debug session
 
-Once the fix is proven, I share the session with my team:
+Once the fix is proven, I share it:
 
 ```bash
 rewind share latest --include-content -o debug-session.html
@@ -124,9 +99,9 @@ This generates a self-contained HTML file. Open it in any browser, no install re
 
 ![Rewind HTML share viewer showing timelines, error, and fork](/screenshot-share-html.png)
 
-I drop the HTML file in Slack. The team can see exactly what broke, what I changed, and the proof that it works. No "trust me, I tested it." The scores are right there.
+Drop the HTML file in Slack. Anyone can see exactly what broke, what changed, and the proof that it works. No "trust me, I tested it." The scores are right there.
 
-## 💰 The cost math
+## The cost math
 
 Debugging before and after:
 
@@ -138,35 +113,37 @@ Debugging before and after:
 | Time | 15 minutes | 3 minutes |
 | Proof the fix works | "Looks right to me" | Correctness score: 0.95 |
 
-*Costs based on GPT-4o API pricing ($2.50/1M input, $10/1M output). Each run consumes ~274K tokens (205K input + 69K output). Cached replay steps use 0 tokens.*
+*Costs based on GPT-4o pricing ($2.50/1M input, $10/1M output). Each run consumes ~274K tokens (205K input + 69K output). Cached replay steps use 0 tokens.*
 
 This was a 30-step agent. For longer runs (50, 100 steps) the savings compound. You only pay for the steps after the fork point.
 
-## 🔄 The workflow I've settled on
+## The workflow I've settled on
 
 1. **Langfuse** monitors production. Every trace is captured.
 2. Something breaks. **Import the trace into Rewind**: `rewind import from-langfuse --trace <id>`
-3. **Fork at the failure**, **replay with the fix**: `rewind replay latest --from 14`
+3. **Fork at the failure**, **replay with the fix**: `rewind replay latest --from 15`
 4. **Prove the fix works**: `rewind eval score latest -e correctness --compare-timelines`
 5. **Share the debug session**: `rewind share latest`
 6. Optionally, **export the fixed trace back to Langfuse**: `rewind export otel latest --endpoint https://cloud.langfuse.com`
 
 Langfuse is my production backbone. Rewind is what I reach for when something breaks.
 
-## 🚀 Try it
+## Try it
 
 ```bash
 pip install rewind-agent
 rewind demo && rewind show latest
 ```
 
-No API keys needed for the demo. `rewind demo` seeds sample data (a research agent that hallucinates at step 5) so you can try `show`, `diff`, `eval score`, `assert check`, and `share` right away.
+No API keys needed for the demo. `rewind demo` seeds a smaller 5-step version of the same pattern (a research agent that hallucinates at step 5). Try `show`, `diff`, `eval score`, `assert check`, and `share` on it.
+
+For the full Langfuse import workflow, see [langfuse-import.md](https://github.com/agentoptics/rewind/blob/master/docs/langfuse-import.md).
 
 - **GitHub**: [agentoptics/rewind](https://github.com/agentoptics/rewind) (MIT licensed)
 - **PyPI**: [rewind-agent](https://pypi.org/project/rewind-agent/)
 - **Langfuse integration docs**: [langfuse-import.md](https://github.com/agentoptics/rewind/blob/master/docs/langfuse-import.md)
 - **Website**: [agentoptics.dev](https://agentoptics.dev)
 
-If you use Langfuse (or LangSmith, or any OTel-compatible backend), Rewind plugs in with one command.
+If you use Langfuse, there's a dedicated one-command import. For LangSmith or any other OTel-compatible backend, export as OTLP and import via `rewind import otel`.
 
 Having trouble with a specific agent failure? [Open a discussion](https://github.com/agentoptics/rewind/discussions) and paste the trace. I'll walk through debugging it with you.
