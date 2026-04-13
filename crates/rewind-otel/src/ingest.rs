@@ -273,6 +273,12 @@ pub fn decode_otlp_request(body: &[u8], is_gzip: bool) -> Result<ExportTraceServ
         .map_err(|e| anyhow::anyhow!("protobuf decode failed: {e}"))
 }
 
+/// Decode an OTLP JSON request from bytes.
+pub fn decode_otlp_json_request(body: &[u8]) -> Result<ExportTraceServiceRequest> {
+    serde_json::from_slice(body)
+        .map_err(|e| anyhow::anyhow!("JSON decode failed: {e}"))
+}
+
 /// Encode an `ExportTraceServiceResponse` to protobuf bytes.
 pub fn encode_otlp_response(response: &ExportTraceServiceResponse) -> Vec<u8> {
     use prost::Message;
@@ -887,5 +893,154 @@ mod tests {
         assert_eq!(steps[0].step_number, 1);
         assert!(steps[0].created_at < steps[1].created_at);
         assert_eq!(steps[1].step_number, 2);
+    }
+
+    #[test]
+    fn test_round_trip_export_import() {
+        use crate::extract::{extract_session_data, ExtractOptions};
+        use rewind_store::models::SessionSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // 1. Create a native session with steps
+        let session = rewind_store::models::Session {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "round-trip-test".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            status: rewind_store::models::SessionStatus::Completed,
+            source: SessionSource::Direct,
+            total_steps: 2,
+            total_tokens: 250,
+            metadata: serde_json::json!({}),
+            thread_id: None,
+            thread_ordinal: None,
+        };
+        store.create_session(&session).unwrap();
+
+        let timeline = rewind_store::models::Timeline::new_root(&session.id);
+        store.create_timeline(&timeline).unwrap();
+
+        // Step 1: LLM call
+        let req1 = serde_json::json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]});
+        let resp1 = serde_json::json!({"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}], "model": "gpt-4o"});
+        let req_hash1 = store.blobs.put_json(&req1).unwrap();
+        let resp_hash1 = store.blobs.put_json(&resp1).unwrap();
+
+        let mut step1 = rewind_store::models::Step::new_llm_call(&timeline.id, &session.id, 1, "gpt-4o");
+        step1.status = rewind_store::models::StepStatus::Success;
+        step1.tokens_in = 100;
+        step1.tokens_out = 50;
+        step1.duration_ms = 1500;
+        step1.request_blob = req_hash1;
+        step1.response_blob = resp_hash1;
+        store.create_step(&step1).unwrap();
+
+        // Step 2: Tool call
+        let mut step2 = rewind_store::models::Step::new_llm_call(&timeline.id, &session.id, 2, "");
+        step2.step_type = rewind_store::models::StepType::ToolCall;
+        step2.status = rewind_store::models::StepStatus::Success;
+        step2.tokens_in = 50;
+        step2.tokens_out = 50;
+        step2.duration_ms = 500;
+        step2.tool_name = Some("search_web".to_string());
+        store.create_step(&step2).unwrap();
+
+        // 2. Extract for export (with content)
+        let data = extract_session_data(&store, &session.id, &ExtractOptions::default()).unwrap();
+        assert_eq!(data.total_steps(), 2);
+
+        // 3. Export to OTel: build spans via emit_spans (using stdout provider to capture)
+        //    Instead of actually exporting, we'll build an ExportTraceServiceRequest
+        //    by ingesting the original and then re-ingesting. We test the JSON round-trip
+        //    of the proto types via serde.
+
+        // Build a request manually that mimics what the exporter would create
+        let root = make_otel_span(
+            &format!("session {}", session.name),
+            &[1; 16], &[1; 8], &[],
+            vec![make_string_attr("rewind.session.id", &session.id)],
+        );
+        let tl = make_otel_span(
+            &format!("timeline {}", timeline.label),
+            &[1; 16], &[2; 8], &[1; 8],
+            vec![make_string_attr("rewind.timeline.id", &timeline.id)],
+        );
+        let mut s1 = make_otel_span(
+            "gen_ai.chat gpt-4o",
+            &[1; 16], &[3; 8], &[2; 8],
+            vec![
+                make_string_attr("gen_ai.request.model", "gpt-4o"),
+                make_int_attr("gen_ai.usage.input_tokens", 100),
+                make_int_attr("gen_ai.usage.output_tokens", 50),
+                make_string_attr("gen_ai.input.messages", &serde_json::to_string(&req1).unwrap()),
+                make_string_attr("gen_ai.output.messages", &serde_json::to_string(&resp1).unwrap()),
+            ],
+        );
+        s1.start_time_unix_nano = 1_700_000_000_000_000_000;
+        s1.end_time_unix_nano = 1_700_000_001_500_000_000;
+
+        let mut s2 = make_otel_span(
+            "tool.execute search_web",
+            &[1; 16], &[4; 8], &[2; 8],
+            vec![make_string_attr("gen_ai.tool.name", "search_web")],
+        );
+        s2.start_time_unix_nano = 1_700_000_002_000_000_000;
+        s2.end_time_unix_nano = 1_700_000_002_500_000_000;
+
+        let request = make_request(vec![root, tl, s1, s2]);
+
+        // 4. Serialize to JSON and back (round-trip through serde)
+        let json_bytes = serde_json::to_vec(&request).unwrap();
+        let reimported = decode_otlp_json_request(&json_bytes).unwrap();
+
+        // 5. Ingest the reimported trace into a fresh store
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = Store::open(dir2.path()).unwrap();
+
+        let result = ingest_trace_request(
+            reimported,
+            &store2,
+            &IngestOptions { session_name: Some("reimported".to_string()) },
+        ).unwrap();
+
+        // 6. Verify
+        assert_eq!(result.steps_created, 2);
+        assert!(result.replay_possible); // content blobs included
+
+        let session2 = store2.get_session(&result.session_id).unwrap().unwrap();
+        assert_eq!(session2.name, "reimported");
+        assert_eq!(session2.source, SessionSource::OtelImport);
+        assert_eq!(session2.total_steps, 2);
+        assert_eq!(session2.total_tokens, 150); // 100+50
+
+        let timelines2 = store2.get_timelines(&result.session_id).unwrap();
+        let steps2 = store2.get_steps(&timelines2[0].id).unwrap();
+        assert_eq!(steps2[0].step_type, rewind_store::models::StepType::LlmCall);
+        assert_eq!(steps2[0].model, "gpt-4o");
+        assert!(!steps2[0].request_blob.is_empty());
+        assert!(!steps2[0].response_blob.is_empty());
+        assert_eq!(steps2[1].step_type, rewind_store::models::StepType::ToolCall);
+        assert_eq!(steps2[1].tool_name.as_deref(), Some("search_web"));
+    }
+
+    #[test]
+    fn test_decode_otlp_json_roundtrip() {
+        let span = make_otel_span(
+            "gen_ai.chat gpt-4o", &[1; 16], &[1; 8], &[],
+            vec![make_string_attr("gen_ai.request.model", "gpt-4o")],
+        );
+        let request = make_request(vec![span]);
+
+        // Serialize to JSON
+        let json_bytes = serde_json::to_vec(&request).unwrap();
+
+        // Deserialize back
+        let decoded = decode_otlp_json_request(&json_bytes).unwrap();
+
+        let spans = collect_spans(&decoded);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "gen_ai.chat gpt-4o");
     }
 }
