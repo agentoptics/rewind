@@ -488,3 +488,124 @@ describe('ActivityTimeline axis mode', () => {
     expect(screen.getByText('Tokens')).toBeTruthy()
   })
 })
+
+describe('ActivityTimeline empty and edge states', () => {
+  const session = makeSession()
+
+  it('renders empty state when no steps and no spans', () => {
+    render(
+      <ActivityTimeline spans={[]} steps={[]} session={session} selectedStepId={null} onSelectStep={() => {}} />
+    )
+    expect(screen.getByText('No activity to display')).toBeTruthy()
+  })
+
+  it('renders a single step session without crashing', () => {
+    const singleStep = [makeStep({ id: 'only', step_number: 1, created_at: '2026-04-14T10:00:00Z', duration_ms: 500 })]
+    const span = makeSpan({ id: 'a1', name: 'solo', steps: singleStep })
+    render(
+      <ActivityTimeline spans={[span]} steps={singleStep} session={session} selectedStepId={null} onSelectStep={() => {}} />
+    )
+    expect(screen.getByText('solo')).toBeTruthy()
+    expect(screen.getByText(/1 lane/)).toBeTruthy()
+  })
+
+  it('renders error steps with red indicators', () => {
+    const errorSteps = [
+      makeStep({ id: 'e1', step_number: 1, status: 'error', created_at: '2026-04-14T10:00:00Z' }),
+      makeStep({ id: 'e2', step_number: 2, status: 'error', created_at: '2026-04-14T10:00:01Z' }),
+    ]
+    const span = makeSpan({ id: 'a1', name: 'buggy', steps: errorSteps })
+    render(
+      <ActivityTimeline spans={[span]} steps={errorSteps} session={session} selectedStepId={null} onSelectStep={() => {}} />
+    )
+    expect(screen.getByText(/2 error/)).toBeTruthy()
+  })
+
+  it('renders all-zero-duration steps without division by zero', () => {
+    const zeroDuration = [
+      makeStep({ id: 'z1', step_number: 1, created_at: '2026-04-14T10:00:00Z', duration_ms: 0 }),
+      makeStep({ id: 'z2', step_number: 2, created_at: '2026-04-14T10:00:00Z', duration_ms: 0 }),
+      makeStep({ id: 'z3', step_number: 3, created_at: '2026-04-14T10:00:00Z', duration_ms: 0 }),
+    ]
+    const span = makeSpan({ id: 'a1', name: 'instant', steps: zeroDuration })
+    const { container } = render(
+      <ActivityTimeline spans={[span]} steps={zeroDuration} session={session} selectedStepId={null} onSelectStep={() => {}} />
+    )
+    const bars = container.querySelectorAll('button[aria-label]')
+    expect(bars.length).toBe(3)
+  })
+})
+
+describe('ActivityTimeline lane-scoped step navigation', () => {
+  const lane1Steps = [
+    makeStep({ id: 'l1-a', step_number: 1, created_at: '2026-04-14T10:00:00Z', duration_ms: 500 }),
+    makeStep({ id: 'l1-b', step_number: 2, created_at: '2026-04-14T10:00:01Z', duration_ms: 500 }),
+  ]
+  const lane2Steps = [
+    makeStep({ id: 'l2-a', step_number: 3, created_at: '2026-04-14T10:00:02Z', duration_ms: 500 }),
+    makeStep({ id: 'l2-b', step_number: 4, created_at: '2026-04-14T10:00:03Z', duration_ms: 500 }),
+  ]
+  const spans: SpanResponse[] = [
+    makeSpan({ id: 'agent-1', name: 'planner', steps: lane1Steps, child_spans: [
+      makeSpan({ id: 'agent-2', name: 'coder', span_type: 'agent', parent_span_id: 'agent-1', steps: lane2Steps }),
+    ] }),
+  ]
+  const allSteps = [...lane1Steps, ...lane2Steps]
+  const session = makeSession()
+
+  it('with no lane focused, ArrowRight traverses all steps across lanes', () => {
+    const onSelectStep = vi.fn()
+    const { container } = render(
+      <ActivityTimeline spans={spans} steps={allSteps} session={session} selectedStepId={null} onSelectStep={onSelectStep} />
+    )
+    const timeline = container.querySelector('[tabindex="0"]') as HTMLElement
+    fireEvent.keyDown(timeline, { key: 'ArrowRight' })
+    expect(onSelectStep).toHaveBeenCalledWith('l1-a')
+
+    onSelectStep.mockClear()
+    const { container: c2 } = render(
+      <ActivityTimeline spans={spans} steps={allSteps} session={session} selectedStepId="l1-b" onSelectStep={onSelectStep} />
+    )
+    const tl2 = c2.querySelector('[tabindex="0"]') as HTMLElement
+    fireEvent.keyDown(tl2, { key: 'ArrowRight' })
+    expect(onSelectStep).toHaveBeenCalledWith('l2-a')
+  })
+
+  it('with lane focused via ArrowDown, ArrowRight stays within that lane', () => {
+    const onSelectStep = vi.fn()
+    const { container } = render(
+      <ActivityTimeline spans={spans} steps={allSteps} session={session} selectedStepId={null} onSelectStep={onSelectStep} />
+    )
+    const timeline = container.querySelector('[tabindex="0"]') as HTMLElement
+    // Focus lane 1 (index 1 = coder, the sub-lane)
+    fireEvent.keyDown(timeline, { key: 'ArrowDown' })
+    fireEvent.keyDown(timeline, { key: 'ArrowDown' })
+    // Now ArrowRight should select within lane 2 (coder) only
+    fireEvent.keyDown(timeline, { key: 'ArrowRight' })
+    expect(onSelectStep).toHaveBeenCalledWith('l2-a')
+  })
+})
+
+describe('buildLanes does not mutate input arrays', () => {
+  it('does not mutate the steps prop for proxy sessions', () => {
+    const steps = [
+      makeStep({ id: 'b', step_number: 2 }),
+      makeStep({ id: 'a', step_number: 1 }),
+    ]
+    const original = [...steps]
+    buildLanes([], steps, makeSession())
+    expect(steps[0].id).toBe(original[0].id)
+    expect(steps[1].id).toBe(original[1].id)
+  })
+
+  it('does not mutate the steps prop for hook sessions', () => {
+    const steps = [
+      makeStep({ id: 'b', step_number: 2, step_type: 'tool_call', tool_name: 'Read' }),
+      makeStep({ id: 'a', step_number: 1, step_type: 'tool_call', tool_name: 'Read' }),
+    ]
+    const original = [...steps]
+    buildLanes([], steps, makeSession({ source: 'hooks' }))
+    expect(steps[0].id).toBe(original[0].id)
+    expect(steps[1].id).toBe(original[1].id)
+  })
+})
