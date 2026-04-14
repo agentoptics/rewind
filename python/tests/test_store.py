@@ -183,6 +183,43 @@ class TestStore(unittest.TestCase):
         self.assertEqual(len(step_numbers), 100)
         self.assertEqual(len(set(step_numbers)), 100)  # All unique
 
+    def test_get_steps_includes_tool_name(self):
+        """get_steps() must return tool_name for each step."""
+        sid, tid = self.store.create_session("tool-name-test")
+        req_hash = self.store.blobs.put_json({"model": "gpt-4o", "messages": []})
+        resp_hash = self.store.blobs.put_json({"choices": []})
+
+        step_id = self.store.create_step(
+            session_id=sid, timeline_id=tid, step_number=1,
+            step_type="tool_call", status="success", model="gpt-4o",
+            duration_ms=50, tokens_in=5, tokens_out=3,
+            request_blob=req_hash, response_blob=resp_hash,
+            tool_name="Read",
+        )
+
+        steps = self.store.get_steps(tid)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("tool_name", steps[0])
+        self.assertEqual(steps[0]["tool_name"], "Read")
+
+    def test_get_steps_tool_name_null(self):
+        """get_steps() returns None for tool_name when not set."""
+        sid, tid = self.store.create_session("no-tool-name")
+        req_hash = self.store.blobs.put_json({"model": "gpt-4o"})
+        resp_hash = self.store.blobs.put_json({"choices": []})
+
+        self.store.create_step(
+            session_id=sid, timeline_id=tid, step_number=1,
+            step_type="llm_call", status="success", model="gpt-4o",
+            duration_ms=100, tokens_in=10, tokens_out=5,
+            request_blob=req_hash, response_blob=resp_hash,
+        )
+
+        steps = self.store.get_steps(tid)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("tool_name", steps[0])
+        self.assertIsNone(steps[0]["tool_name"])
+
     def test_timestamps_are_rfc3339(self):
         """Verify timestamps are valid RFC 3339."""
         sid, _ = self.store.create_session("test")
