@@ -12,6 +12,8 @@ use rewind_tui::TuiApp;
 use rewind_web::WebServer;
 use std::net::{SocketAddr, TcpStream};
 
+const DEFAULT_WEB_PORT: u16 = 4800;
+
 #[derive(Parser)]
 #[command(
     name = "rewind",
@@ -49,7 +51,7 @@ enum Commands {
         web: bool,
 
         /// Port for the web dashboard (used with --web)
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value_t = DEFAULT_WEB_PORT)]
         web_port: u16,
 
         /// Skip TLS certificate verification for upstream connections (INSECURE)
@@ -189,7 +191,7 @@ enum Commands {
     /// Start the web dashboard (flight recorder + air traffic control)
     Web {
         /// Port for the web server
-        #[arg(short, long, default_value = "8080")]
+        #[arg(short, long, default_value_t = DEFAULT_WEB_PORT)]
         port: u16,
     },
 
@@ -628,7 +630,7 @@ enum HooksAction {
     /// Install Rewind hooks into Claude Code settings
     Install {
         /// Rewind server port
-        #[arg(short, long, default_value = "4800")]
+        #[arg(short, long, default_value_t = DEFAULT_WEB_PORT)]
         port: u16,
     },
 
@@ -638,7 +640,7 @@ enum HooksAction {
     /// Show status of Rewind hooks and server
     Status {
         /// Rewind server port to check
-        #[arg(short, long, default_value = "4800")]
+        #[arg(short, long, default_value_t = DEFAULT_WEB_PORT)]
         port: u16,
     },
 }
@@ -873,7 +875,7 @@ fn cmd_sessions() -> Result<()> {
 
     println!();
     println!("  Run {} to inspect a session.", "rewind inspect <session-id>".green());
-    print_web_hint(4800, None);
+    print_web_hint(DEFAULT_WEB_PORT, None);
     Ok(())
 }
 
@@ -963,7 +965,7 @@ fn cmd_show(session_ref: String, flat: bool) -> Result<()> {
 
     println!();
     println!("  Run {} to explore interactively.", format!("rewind inspect {}", &session.id[..8]).green());
-    print_web_hint(4800, Some(&session.id));
+    print_web_hint(DEFAULT_WEB_PORT, Some(&session.id));
     Ok(())
 }
 
@@ -2774,7 +2776,7 @@ async fn cmd_hooks_install(port: u16) -> Result<()> {
     }
 
     // Write script with REWIND_PORT baked in if non-default
-    let script_content = if port != 4800 {
+    let script_content = if port != DEFAULT_WEB_PORT {
         HOOK_SCRIPT.replace(
             "REWIND_PORT=\"${REWIND_PORT:-4800}\"",
             &format!("REWIND_PORT=\"${{REWIND_PORT:-{}}}\"", port),
@@ -4129,7 +4131,7 @@ fn cmd_import_from_langfuse(args: LangfuseImportArgs) -> Result<()> {
         "secret_key": args.secret_key,
         "host": args.host,
         "session_name": args.name,
-        "rewind_endpoint": "http://127.0.0.1:4800",
+        "rewind_endpoint": format!("http://127.0.0.1:{}", DEFAULT_WEB_PORT),
     });
     let payload_str = serde_json::to_string(&payload)?;
 
