@@ -49,7 +49,8 @@ Agent broke at step 30? Fix step 30 - not steps 1 through 29 again. Each re-run 
 
 | Capability | What it means |
 |:---|:---|
-| **Fork & Replay** | Branch the execution timeline at any step. Fix your code, run `rewind replay --from 4`. Steps 1-4 served from cache (0 tokens, 0ms). Only the fixed step re-runs live. **No other tool does this.** |
+| **`rewind fix`** | Agent broke? `rewind fix latest` — an LLM diagnoses the failure, suggests a fix (model swap, system prompt, temperature, retry), and optionally forks + replays with the patch to verify it works. One command from "broken" to "proven fix." Diagnosis works on all sessions; `--apply` requires proxy-recorded sessions. **No other tool does this.** |
+| **Fork & Replay** | Branch the execution timeline at any step. Fix your code, run `rewind replay --from 4`. Steps 1-4 served from cache (0 tokens, 0ms). Only the fixed step re-runs live. |
 | **Prove the Fix** | Score original vs. forked timelines with LLM-as-judge: `rewind replay → rewind eval score → proof the fix works`. Correctness, coherence, safety, relevance  scored automatically. |
 | **Import & Debug** | Import production traces from Langfuse, Datadog, or any OTel backend (`rewind import otel`). Fork at the failure, replay locally, export the fix back. Debug production failures without re-running in production. |
 | **Record** | A transparent proxy captures every LLM call. Streaming works in real-time - zero added latency. Or one-line Python SDK: `rewind_agent.init()`. |
@@ -117,6 +118,42 @@ rewind diff latest main fixed           # see exactly what diverged
   ═ Step  3  identical
   ≠ Step  4  [stale data]  →  [fresh data]
   ≠ Step  5  [error] 700tok   →  [success] 715tok
+```
+
+### AI diagnosis - let the debugger debug
+
+```bash
+rewind fix latest
+```
+
+```
+⏪ Diagnosing session "research-agent-demo" (5 steps)...
+
+  Failure: Step 5 — llmcall (gpt-4o) — error
+  Error: HALLUCINATION: Agent used stale 2019 projection as current fact
+  Root cause: The agent relied on outdated data due to a search API rate
+              limit, leading to incorrect population figures.
+
+  Suggested fix: retry_step
+  Confidence:    high
+
+  To apply this fix automatically:
+    rewind fix latest --apply
+```
+
+One command: diagnose the failure, suggest a fix, and optionally verify it. `--apply --command` automates the entire loop:
+
+```bash
+rewind fix latest --apply --yes --command "python agent.py"
+# Fork at step 4, replay with fix...
+# Steps 1-4: cached (0 tokens, 0ms)
+# ✓ Agent finished — 531 tokens saved, 1.2s saved
+```
+
+Skip the AI entirely and test your own theory:
+
+```bash
+rewind fix latest --hypothesis "swap_model:gpt-4o" --apply --yes --command "python agent.py"
 ```
 
 ### Evaluate before shipping - catch regressions in CI
@@ -207,6 +244,7 @@ See the [Getting Started guide](docs/getting-started.md) for more options.
 | Feature | Description | Guide | Example |
 |:---|:---|:---|:---|
 | **Recording** | One line to start (`init()`), or a transparent HTTP proxy for any language. Monkey-patches OpenAI + Anthropic SDKs in-process. Streaming pass-through with zero added latency. | [recording.md](docs/recording.md) | [05_direct_mode.py](examples/05_direct_mode.py) |
+| **`rewind fix`** | Agent broke? `rewind fix latest` diagnoses the failure with an LLM, suggests a fix (model swap, system prompt, temperature, retry), and optionally forks + replays with the patch applied. `--hypothesis` lets you skip diagnosis and test your own theory. | [fix.md](docs/fix.md) | - |
 | **Replay from Failure** | Agent fails at step 5? Fix your code, replay from step 4. Steps 1-4 served from cache (0 tokens, 0ms). Only the fixed step re-runs live. Diff the original vs replayed timeline. | [replay-and-forking.md](docs/replay-and-forking.md) | [06_replay_from_failure.py](examples/06_replay_from_failure.py) |
 | **Regression Testing** | Turn any recorded session into a baseline. After code changes, check step types, models, tool calls, token counts, and error status. 3-line GitHub Action for CI. | [regression-testing.md](docs/regression-testing.md) | [07_regression_testing.py](examples/07_regression_testing.py) |
 | **Evaluation** | Create datasets of test cases, run your agent against them, score with built-in evaluators (exact match, contains, regex, JSON schema, tool use, LLM-as-judge), compare experiments side-by-side. CI-ready with `--fail-below` thresholds. | [evaluation.md](docs/evaluation.md) | [08_evaluation.py](examples/08_evaluation.py) |
@@ -269,6 +307,7 @@ Use your existing tool for production dashboards and alerting. Use Rewind when s
 | **v0.8** | LLM-as-judge evaluators, timeline scoring, `rewind eval score` command | ✅ Shipped |
 | **v0.9** | OTel trace ingestion - import OTLP traces, debug production failures locally | ✅ Shipped |
 | **v0.10** | Langfuse import, replay cost savings calculator, session sharing (HTML export) | ✅ Shipped |
+| **v0.11** | `rewind fix` - AI-powered diagnosis, proxy request rewriting, hypothesis testing | ✅ Shipped |
 | **v1.0** | Rewind Cloud - collaborative debugging, hosted sharing, live breakpoints, semantic diff | Planned |
 
 ## Why "Rewind"?

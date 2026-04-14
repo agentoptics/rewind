@@ -30,6 +30,15 @@ Rewind is a time-travel debugger for AI agents -- a single binary with zero depe
 | `rewind eval compare <left> <right>` | Compare two experiments side-by-side |
 | `rewind eval show <experiment>` | Show detailed experiment results |
 | `rewind eval experiments` | List all experiments |
+| `rewind fix <session>` | AI-powered diagnosis -- find root cause, suggest fix, optionally fork + replay with patch ([guide](fix.md)) |
+| `rewind fix <session> --apply` | Apply the suggested fix: fork, start proxy with rewrites, wait for re-run |
+| `rewind fix <session> --apply -c <cmd>` | Fully automated: diagnose, fork, run agent, report savings |
+| `rewind fix <session> --hypothesis <fix>` | Skip diagnosis, test a fix directly (e.g., `swap_model:gpt-4o`) |
+| `rewind eval score <session> -e <evaluator>` | Score a session's timeline with LLM-as-judge or other evaluators |
+| `rewind share <session>` | Generate a self-contained HTML file for sharing (no install needed) |
+| `rewind import otel --json-file <path>` | Import OTLP traces from JSON or protobuf files |
+| `rewind import from-langfuse --trace <id>` | Import a trace from Langfuse by ID |
+| `rewind hooks install` | Install Claude Code hooks for session observation |
 | `rewind export otel <session>` | Export a session as OpenTelemetry traces via OTLP ([guide](otel-export.md)) |
 | `rewind query "SQL"` | Run a read-only SQL query against the Rewind database |
 | `rewind query --tables` | Show all tables and their column schemas |
