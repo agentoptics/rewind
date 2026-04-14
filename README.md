@@ -269,6 +269,7 @@ See the [Getting Started guide](docs/getting-started.md) for more options.
 | **Session Sharing** | Export a session as a self-contained HTML file that works offline. Step tree, span tree, timeline diffs, scores - all in one portable file. `rewind share latest` for metadata-only, `--include-content` for full LLM content. | - | - |
 | **SQL Query Explorer** | Run ad-hoc SQL against the Rewind database. Token usage by model, average step duration, sessions with errors, cost estimation - read-only, safe to explore. | [sql-queries.md](docs/sql-queries.md) | - |
 | **CLI Reference** | Full command reference for all 29 CLI commands. | [cli-reference.md](docs/cli-reference.md) | - |
+| **CLI Walkthrough** | Every command run with real output — install, demo, fork, replay, diff, assert, eval, share, query, and more. Copy-paste examples with actual terminal output. | [cli-walkthrough.md](docs/cli-walkthrough.md) | - |
 
 ## Compatibility
 
