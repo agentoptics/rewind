@@ -57,15 +57,17 @@ function collectSpanSteps(span: SpanResponse): StepResponse[] {
 function flattenAgentSpans(
   spans: SpanResponse[],
   parentIsAgent: boolean,
+  depth: number = 0,
 ): { span: SpanResponse; isSubLane: boolean }[] {
+  if (depth > 20) return []
   const result: { span: SpanResponse; isSubLane: boolean }[] = []
   for (const span of spans) {
     if (span.span_type === 'agent' || (!parentIsAgent && span.parent_span_id === null)) {
       result.push({ span, isSubLane: parentIsAgent })
-      result.push(...flattenAgentSpans(span.child_spans, true))
+      result.push(...flattenAgentSpans(span.child_spans, true, depth + 1))
     } else if (span.parent_span_id === null) {
       result.push({ span, isSubLane: false })
-      result.push(...flattenAgentSpans(span.child_spans, true))
+      result.push(...flattenAgentSpans(span.child_spans, true, depth + 1))
     }
   }
   return result
@@ -154,7 +156,7 @@ export function buildLanes(
     id: 'main',
     label: 'Main',
     isSubLane: false,
-    steps: steps.sort((a, b) => a.step_number - b.step_number),
+    steps: [...steps].sort((a, b) => a.step_number - b.step_number),
     color: LANE_COLORS[0],
     positionMode: 'created_at',
   }]
@@ -194,7 +196,7 @@ export function viewportReducer(state: ViewportState, action: ViewportAction): V
     case 'reset':
       return { ...state, zoom: 1, offset: 0 }
     case 'pan':
-      return { ...state, offset: state.offset + action.delta }
+      return { ...state, offset: Math.max(0, state.offset + action.delta) }
     case 'set_offset':
       return { ...state, offset: action.offset }
     case 'focus_lane':
@@ -224,7 +226,7 @@ interface BarLayout {
   widthPct: number
 }
 
-function computeBarLayouts(
+export function computeBarLayouts(
   steps: StepResponse[],
   positionMode: 'created_at' | 'step_number',
   sessionBounds: { startMs: number; endMs: number; maxStep: number },
@@ -236,8 +238,9 @@ function computeBarLayouts(
     const { maxStep } = sessionBounds
     if (maxStep <= 0) return []
     return steps.map(step => {
+      // Cost is a rough visual estimate for relative sizing; production pricing comes from backend pricing.rs
       const metric = axisMode === 'tokens' ? step.tokens_in + step.tokens_out
-        : axisMode === 'cost' ? (step.tokens_in * 3 + step.tokens_out * 15) / 1_000_000
+        : axisMode === 'cost' ? (step.tokens_in + step.tokens_out * 3)
         : step.duration_ms
       return {
         step,
@@ -249,13 +252,17 @@ function computeBarLayouts(
 
   const { startMs, endMs } = sessionBounds
   const totalMs = endMs - startMs
-  if (totalMs <= 0) return steps.map(step => ({ step, leftPct: 0, widthPct: 100 }))
+  if (totalMs <= 0) return steps.map((step, i) => ({
+    step,
+    leftPct: steps.length > 1 ? (i / (steps.length - 1)) * 90 : 0,
+    widthPct: Math.max(0.5, 90 / Math.max(1, steps.length)),
+  }))
 
   return steps.map(step => {
     const stepStart = new Date(step.created_at).getTime()
     const leftPct = ((stepStart - startMs) / totalMs) * 100
     const metric = axisMode === 'tokens' ? step.tokens_in + step.tokens_out
-      : axisMode === 'cost' ? (step.tokens_in * 3 + step.tokens_out * 15) / 1_000_000
+      : axisMode === 'cost' ? (step.tokens_in + step.tokens_out * 3)
       : step.duration_ms
     const widthPct = axisMode === 'duration'
       ? Math.max(0.3, (step.duration_ms / totalMs) * 100)
@@ -318,28 +325,21 @@ export function ActivityTimeline({
 
   const sessionBounds = useMemo(() => {
     const allSteps = lanes.flatMap(l => l.steps)
-    if (allSteps.length === 0) return { startMs: 0, endMs: 0, maxStep: 0 }
+    if (allSteps.length === 0) return { startMs: 0, endMs: 1, maxStep: 0 }
 
-    const times = allSteps.map(s => new Date(s.created_at).getTime())
-    const endTimes = allSteps.map(s => new Date(s.created_at).getTime() + s.duration_ms)
-    return {
-      startMs: Math.min(...times),
-      endMs: Math.max(...endTimes),
-      maxStep: Math.max(...allSteps.map(s => s.step_number)),
-    }
+    return allSteps.reduce((acc, s) => {
+      const t = new Date(s.created_at).getTime()
+      return {
+        startMs: Math.min(acc.startMs, t),
+        endMs: Math.max(acc.endMs, t + s.duration_ms),
+        maxStep: Math.max(acc.maxStep, s.step_number),
+      }
+    }, { startMs: Infinity, endMs: -Infinity, maxStep: 0 })
   }, [lanes])
 
-  const stepMetricValue = useCallback((step: StepResponse): number => {
-    switch (axisMode) {
-      case 'tokens': return step.tokens_in + step.tokens_out
-      case 'cost': return (step.tokens_in * 3 + step.tokens_out * 15) / 1_000_000
-      default: return step.duration_ms
-    }
-  }, [axisMode])
-
-  const totalRange = lanes[0]?.positionMode === 'step_number'
+  const totalRange = Math.max(1, lanes[0]?.positionMode === 'step_number'
     ? sessionBounds.maxStep
-    : sessionBounds.endMs - sessionBounds.startMs
+    : sessionBounds.endMs - sessionBounds.startMs)
 
   const handleBarClick = useCallback((stepId: string) => {
     onSelectStep(stepId === selectedStepId ? null : stepId)
@@ -610,6 +610,7 @@ export function ActivityTimeline({
                       <button
                         key={step.id}
                         onClick={() => handleBarClick(step.id)}
+                        aria-label={`Step ${step.step_number}: ${step.tool_name || step.step_type_label}`}
                         title={[
                           step.tool_name || step.step_type_label,
                           step.model,

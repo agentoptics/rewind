@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { useStore } from '@/hooks/use-store'
 import { cn, formatTokens, formatDuration } from '@/lib/utils'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { ArrowLeft, Equal, Diff, ArrowLeftRight } from 'lucide-react'
 import type { Timeline, TimelineDiff, StepDiffEntry } from '@/types/api'
 
@@ -25,13 +25,14 @@ export function DiffView({ sessionId }: { sessionId: string }) {
     enabled: canDiff,
   })
 
-  // Auto-select when timelines load
-  if (timelines.length >= 2 && !leftId) {
-    const root = timelines.find(t => !t.parent_timeline_id)
-    const fork = timelines.find(t => t.parent_timeline_id)
-    if (root) setLeftId(root.id)
-    if (fork) setRightId(fork.id)
-  }
+  useEffect(() => {
+    if (timelines.length >= 2 && !leftId) {
+      const root = timelines.find(t => !t.parent_timeline_id)
+      const fork = timelines.find(t => t.parent_timeline_id)
+      if (root) setLeftId(root.id)
+      if (fork) setRightId(fork.id)
+    }
+  }, [timelines, leftId])
 
   return (
     <div className="flex flex-col h-full">

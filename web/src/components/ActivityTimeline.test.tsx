@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { buildLanes, viewportReducer, computeLaneAnalytics, ActivityTimeline, type Lane, type ViewportState } from './ActivityTimeline'
+import { buildLanes, viewportReducer, computeLaneAnalytics, computeBarLayouts, ActivityTimeline, type Lane, type ViewportState } from './ActivityTimeline'
 import type { SpanResponse, StepResponse, Session } from '@/types/api'
 
 function makeStep(overrides: Partial<StepResponse> = {}): StepResponse {
@@ -221,6 +221,63 @@ describe('viewportReducer', () => {
       { type: 'wheel_zoom', deltaY: -100, cursorFraction: 0.5, totalRange: 10000 }
     )
     expect(state.zoom).toBeGreaterThan(2)
+  })
+
+  it('pan clamps offset to >= 0', () => {
+    const state = viewportReducer(initial, { type: 'pan', delta: -500 })
+    expect(state.offset).toBe(0)
+  })
+})
+
+describe('computeBarLayouts', () => {
+  const bounds = { startMs: 1000, endMs: 5000, maxStep: 5 }
+
+  it('computes positions for step_number mode', () => {
+    const steps = [
+      makeStep({ id: 'a', step_number: 1, duration_ms: 500 }),
+      makeStep({ id: 'b', step_number: 3, duration_ms: 200 }),
+    ]
+    const bars = computeBarLayouts(steps, 'step_number', bounds)
+    expect(bars).toHaveLength(2)
+    expect(bars[0].leftPct).toBe(0)
+    expect(bars[1].leftPct).toBeCloseTo(40)
+    expect(bars[0].widthPct).toBeGreaterThan(0)
+  })
+
+  it('computes positions for created_at mode', () => {
+    const steps = [
+      makeStep({ id: 'a', step_number: 1, created_at: '2026-04-14T10:00:01Z', duration_ms: 1000 }),
+      makeStep({ id: 'b', step_number: 2, created_at: '2026-04-14T10:00:03Z', duration_ms: 500 }),
+    ]
+    const b = { startMs: new Date('2026-04-14T10:00:01Z').getTime(), endMs: new Date('2026-04-14T10:00:03.5Z').getTime(), maxStep: 2 }
+    const bars = computeBarLayouts(steps, 'created_at', b)
+    expect(bars).toHaveLength(2)
+    expect(bars[0].leftPct).toBeCloseTo(0)
+    expect(bars[1].leftPct).toBeGreaterThan(0)
+  })
+
+  it('returns empty array for empty steps', () => {
+    expect(computeBarLayouts([], 'created_at', bounds)).toHaveLength(0)
+  })
+
+  it('handles zero totalMs with even spacing', () => {
+    const steps = [
+      makeStep({ id: 'a', step_number: 1, created_at: '2026-04-14T10:00:00Z', duration_ms: 0 }),
+      makeStep({ id: 'b', step_number: 2, created_at: '2026-04-14T10:00:00Z', duration_ms: 0 }),
+    ]
+    const b = { startMs: new Date('2026-04-14T10:00:00Z').getTime(), endMs: new Date('2026-04-14T10:00:00Z').getTime(), maxStep: 2 }
+    const bars = computeBarLayouts(steps, 'created_at', b)
+    expect(bars).toHaveLength(2)
+    expect(bars[0].leftPct).toBe(0)
+    expect(bars[1].leftPct).toBe(90)
+    expect(bars[0].widthPct).toBeGreaterThan(0)
+  })
+
+  it('handles tokens axis mode', () => {
+    const steps = [makeStep({ id: 'a', step_number: 1, duration_ms: 100, tokens_in: 500, tokens_out: 200 })]
+    const bars = computeBarLayouts(steps, 'step_number', bounds, 'tokens')
+    expect(bars).toHaveLength(1)
+    expect(bars[0].widthPct).toBeGreaterThan(0)
   })
 })
 
