@@ -14,11 +14,11 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 authors = ["Rewind Contributors"]
 license = "MIT"
-description = "Chrome DevTools for AI agents — checkpoint, replay, intervene, diff."
+description = "Chrome DevTools for AI agents - checkpoint, replay, intervene, diff."
 
 [workspace.dependencies]
 # Async runtime
