@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest'
-import { buildLanes, viewportReducer, type Lane, type ViewportState } from './ActivityTimeline'
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen, fireEvent } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { buildLanes, viewportReducer, ActivityTimeline, type Lane, type ViewportState } from './ActivityTimeline'
 import type { SpanResponse, StepResponse, Session } from '@/types/api'
 
 function makeStep(overrides: Partial<StepResponse> = {}): StepResponse {
@@ -220,5 +222,98 @@ describe('viewportReducer', () => {
       { type: 'wheel_zoom', deltaY: -100, cursorFraction: 0.5, totalRange: 10000 }
     )
     expect(state.zoom).toBeGreaterThan(2)
+  })
+})
+
+describe('ActivityTimeline keyboard navigation', () => {
+  const threeSteps: StepResponse[] = [
+    makeStep({ id: 'a', step_number: 1, created_at: '2026-04-14T10:00:00Z', duration_ms: 1000 }),
+    makeStep({ id: 'b', step_number: 2, created_at: '2026-04-14T10:00:01Z', duration_ms: 2000 }),
+    makeStep({ id: 'c', step_number: 3, created_at: '2026-04-14T10:00:03Z', duration_ms: 500 }),
+  ]
+  const spanWithSteps = makeSpan({
+    id: 'agent-1',
+    name: 'main-agent',
+    steps: threeSteps,
+  })
+  const session = makeSession()
+
+  function renderTimeline(selectedStepId: string | null = null) {
+    const onSelectStep = vi.fn()
+    const result = render(
+      <ActivityTimeline
+        spans={[spanWithSteps]}
+        steps={threeSteps}
+        session={session}
+        selectedStepId={selectedStepId}
+        onSelectStep={onSelectStep}
+      />
+    )
+    // RTL's result.container is a wrapper div; our component root with tabIndex is inside it
+    const timeline = result.container.querySelector('[tabindex="0"]') as HTMLElement
+    return { onSelectStep, timeline, ...result }
+  }
+
+  it('j selects the first step when nothing is selected', () => {
+    const { onSelectStep, timeline } = renderTimeline(null)
+    expect(timeline).toBeTruthy()
+    fireEvent.keyDown(timeline, { key: 'j' })
+    expect(onSelectStep).toHaveBeenCalledWith('a')
+  })
+
+  it('j selects the next step when a step is already selected', () => {
+    const { onSelectStep, timeline } = renderTimeline('a')
+    fireEvent.keyDown(timeline, { key: 'j' })
+    expect(onSelectStep).toHaveBeenCalledWith('b')
+  })
+
+  it('k selects the previous step', () => {
+    const { onSelectStep, timeline } = renderTimeline('b')
+    fireEvent.keyDown(timeline, { key: 'k' })
+    expect(onSelectStep).toHaveBeenCalledWith('a')
+  })
+
+  it('k does nothing when on the first step', () => {
+    const { onSelectStep, timeline } = renderTimeline('a')
+    fireEvent.keyDown(timeline, { key: 'k' })
+    expect(onSelectStep).not.toHaveBeenCalled()
+  })
+
+  it('j does nothing when on the last step', () => {
+    const { onSelectStep, timeline } = renderTimeline('c')
+    fireEvent.keyDown(timeline, { key: 'j' })
+    expect(onSelectStep).not.toHaveBeenCalled()
+  })
+
+  it('Escape deselects the current step', () => {
+    const { onSelectStep, timeline } = renderTimeline('b')
+    fireEvent.keyDown(timeline, { key: 'Escape' })
+    expect(onSelectStep).toHaveBeenCalledWith(null)
+  })
+
+  it('ArrowDown works as alternative to j', () => {
+    const { onSelectStep, timeline } = renderTimeline(null)
+    fireEvent.keyDown(timeline, { key: 'ArrowDown' })
+    expect(onSelectStep).toHaveBeenCalledWith('a')
+  })
+
+  it('ArrowUp works as alternative to k', () => {
+    const { onSelectStep, timeline } = renderTimeline('b')
+    fireEvent.keyDown(timeline, { key: 'ArrowUp' })
+    expect(onSelectStep).toHaveBeenCalledWith('a')
+  })
+
+  it('zoom keys do not call onSelectStep', () => {
+    const { onSelectStep, timeline } = renderTimeline('a')
+    fireEvent.keyDown(timeline, { key: '+' })
+    fireEvent.keyDown(timeline, { key: '-' })
+    fireEvent.keyDown(timeline, { key: '0' })
+    expect(onSelectStep).not.toHaveBeenCalled()
+  })
+
+  it('renders zoom indicator when zoom > 1 after pressing +', () => {
+    const { timeline } = renderTimeline(null)
+    fireEvent.keyDown(timeline, { key: '+' })
+    expect(screen.getByText(/Reset/)).toBeTruthy()
   })
 })

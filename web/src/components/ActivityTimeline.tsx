@@ -357,55 +357,49 @@ export function ActivityTimeline({
     }
   }, [totalRange, viewport.zoom])
 
-  // Keyboard navigation
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    const handler = (e: KeyboardEvent) => {
-      const allSteps = lanes.flatMap(l => l.steps)
-      switch (e.key) {
-        case '+': case '=': e.preventDefault(); dispatch({ type: 'zoom_in' }); break
-        case '-': e.preventDefault(); dispatch({ type: 'zoom_out' }); break
-        case '0': e.preventDefault(); dispatch({ type: 'reset' }); break
-        case 'h': case 'ArrowLeft':
-          if (!e.shiftKey) { e.preventDefault(); dispatch({ type: 'pan', delta: -totalRange / viewport.zoom * 0.15 }) }
-          break
-        case 'l': case 'ArrowRight':
-          if (!e.shiftKey) { e.preventDefault(); dispatch({ type: 'pan', delta: totalRange / viewport.zoom * 0.15 }) }
-          break
-        case 'j': case 'ArrowDown': {
-          e.preventDefault()
-          if (e.shiftKey) {
-            const next = viewport.focusedLaneIndex !== null
-              ? Math.min(lanes.length - 1, viewport.focusedLaneIndex + 1)
-              : 0
-            dispatch({ type: 'focus_lane', index: next })
-          } else {
-            const currentIdx = allSteps.findIndex(s => s.id === selectedStepId)
-            if (currentIdx < allSteps.length - 1) onSelectStep(allSteps[currentIdx + 1].id)
-            else if (currentIdx === -1 && allSteps.length > 0) onSelectStep(allSteps[0].id)
-          }
-          break
+  // Keyboard navigation — React event handler (not addEventListener)
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    const allSteps = lanes.flatMap(l => l.steps)
+    switch (e.key) {
+      case '+': case '=': e.preventDefault(); dispatch({ type: 'zoom_in' }); break
+      case '-': e.preventDefault(); dispatch({ type: 'zoom_out' }); break
+      case '0': e.preventDefault(); dispatch({ type: 'reset' }); break
+      case 'h': case 'ArrowLeft':
+        if (!e.shiftKey) { e.preventDefault(); dispatch({ type: 'pan', delta: -totalRange / viewport.zoom * 0.15 }) }
+        break
+      case 'l': case 'ArrowRight':
+        if (!e.shiftKey) { e.preventDefault(); dispatch({ type: 'pan', delta: totalRange / viewport.zoom * 0.15 }) }
+        break
+      case 'j': case 'ArrowDown': {
+        e.preventDefault()
+        if (e.shiftKey) {
+          const next = viewport.focusedLaneIndex !== null
+            ? Math.min(lanes.length - 1, viewport.focusedLaneIndex + 1)
+            : 0
+          dispatch({ type: 'focus_lane', index: next })
+        } else {
+          const currentIdx = allSteps.findIndex(s => s.id === selectedStepId)
+          if (currentIdx < allSteps.length - 1) onSelectStep(allSteps[currentIdx + 1].id)
+          else if (currentIdx === -1 && allSteps.length > 0) onSelectStep(allSteps[0].id)
         }
-        case 'k': case 'ArrowUp': {
-          e.preventDefault()
-          if (e.shiftKey) {
-            const prev = viewport.focusedLaneIndex !== null
-              ? Math.max(0, viewport.focusedLaneIndex - 1)
-              : 0
-            dispatch({ type: 'focus_lane', index: prev })
-          } else {
-            const currentIdx = allSteps.findIndex(s => s.id === selectedStepId)
-            if (currentIdx > 0) onSelectStep(allSteps[currentIdx - 1].id)
-          }
-          break
-        }
-        case 'Enter': break
-        case 'Escape': e.preventDefault(); onSelectStep(null); break
+        break
       }
+      case 'k': case 'ArrowUp': {
+        e.preventDefault()
+        if (e.shiftKey) {
+          const prev = viewport.focusedLaneIndex !== null
+            ? Math.max(0, viewport.focusedLaneIndex - 1)
+            : 0
+          dispatch({ type: 'focus_lane', index: prev })
+        } else {
+          const currentIdx = allSteps.findIndex(s => s.id === selectedStepId)
+          if (currentIdx > 0) onSelectStep(allSteps[currentIdx - 1].id)
+        }
+        break
+      }
+      case 'Enter': break
+      case 'Escape': e.preventDefault(); onSelectStep(null); break
     }
-    el.addEventListener('keydown', handler)
-    return () => el.removeEventListener('keydown', handler)
   }, [lanes, selectedStepId, onSelectStep, viewport.zoom, viewport.focusedLaneIndex, totalRange])
 
   if (lanes.length === 0) {
@@ -429,6 +423,7 @@ export function ActivityTimeline({
       className="flex flex-col overflow-hidden h-full focus:outline-none"
       ref={containerRef}
       tabIndex={0}
+      onKeyDown={handleKeyDown}
     >
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-neutral-800 bg-neutral-900/50 shrink-0">
