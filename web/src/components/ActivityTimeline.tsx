@@ -343,6 +343,8 @@ export function ActivityTimeline({
 
   const handleBarClick = useCallback((stepId: string) => {
     onSelectStep(stepId === selectedStepId ? null : stepId)
+    // Re-focus the container so keyboard navigation continues to work
+    containerRef.current?.focus()
   }, [onSelectStep, selectedStepId])
 
   // Auto-follow: when new steps arrive during live recording, pan viewport to show them
@@ -370,16 +372,17 @@ export function ActivityTimeline({
   // Drag-to-pan handlers — disables auto-follow
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return
-    setAutoFollow(false)
     isDragging.current = true
     dragStartX.current = e.clientX
     dragStartOffset.current = viewport.offset
-    e.preventDefault()
+    // Focus the container for keyboard navigation (don't preventDefault — it blocks focus)
+    containerRef.current?.focus()
   }, [viewport.offset])
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!isDragging.current || !laneAreaRef.current) return
+      setAutoFollow(false)
       const rect = laneAreaRef.current.getBoundingClientRect()
       const barAreaWidth = rect.width - LABEL_WIDTH
       if (barAreaWidth <= 0) return
@@ -568,7 +571,7 @@ export function ActivityTimeline({
               >
                 {/* Label column */}
                 <button
-                  onClick={() => setAnalyticsLaneId(analyticsLaneId === lane.id ? null : lane.id)}
+                  onClick={() => { setAnalyticsLaneId(analyticsLaneId === lane.id ? null : lane.id); containerRef.current?.focus() }}
                   className={cn(
                     'shrink-0 flex items-center gap-1.5 px-2 border-b border-r border-neutral-800/50',
                     'bg-neutral-900/80 sticky left-0 z-10 text-left cursor-pointer hover:bg-neutral-800/50 transition-colors',
