@@ -318,6 +318,17 @@ class Store:
         except sqlite3.OperationalError:
             pass
 
+        # v0.6 migrations: hooks integration — session source and step tool_name
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'proxy'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self._conn.execute("ALTER TABLE steps ADD COLUMN tool_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_steps_session_tool ON steps(session_id, tool_name)")
+
         self.blobs = BlobStore(os.path.join(root, "objects"))
         self._lock = threading.Lock()
 
@@ -360,6 +371,7 @@ class Store:
         response_blob: str,
         error: str = None,
         span_id: str = None,
+        tool_name: str = None,
     ) -> str:
         """Insert a step record. Returns the step ID."""
         step_id = _new_id()
@@ -367,11 +379,11 @@ class Store:
 
         self._conn.execute(
             "INSERT INTO steps (id, timeline_id, session_id, step_number, step_type, status, "
-            "created_at, duration_ms, tokens_in, tokens_out, model, request_blob, response_blob, error, span_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, duration_ms, tokens_in, tokens_out, model, request_blob, response_blob, error, span_id, tool_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (step_id, timeline_id, session_id, step_number, step_type, status,
              now, duration_ms, tokens_in, tokens_out, model,
-             request_blob, response_blob, error, span_id),
+             request_blob, response_blob, error, span_id, tool_name),
         )
         self._conn.commit()
         return step_id
@@ -446,7 +458,7 @@ class Store:
         """Return all steps for a timeline, ordered by step_number."""
         rows = self._conn.execute(
             "SELECT id, timeline_id, session_id, step_number, step_type, status, "
-            "duration_ms, tokens_in, tokens_out, model, request_blob, response_blob, error, span_id "
+            "duration_ms, tokens_in, tokens_out, model, request_blob, response_blob, error, span_id, tool_name "
             "FROM steps WHERE timeline_id = ? ORDER BY step_number", (timeline_id,)
         ).fetchall()
         return [
@@ -454,7 +466,7 @@ class Store:
              "step_number": r[3], "step_type": r[4], "status": r[5],
              "duration_ms": r[6], "tokens_in": r[7], "tokens_out": r[8],
              "model": r[9], "request_blob": r[10], "response_blob": r[11],
-             "error": r[12], "span_id": r[13]}
+             "error": r[12], "span_id": r[13], "tool_name": r[14]}
             for r in rows
         ]
 

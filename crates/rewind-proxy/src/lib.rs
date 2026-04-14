@@ -17,6 +17,23 @@ use futures_util::StreamExt;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
+/// Configuration for rewriting LLM requests after the fork point.
+#[derive(Clone, Debug, Default)]
+pub struct RewriteConfig {
+    /// Swap the model field (must stay within the same provider).
+    pub model: Option<String>,
+    /// Inject or append a system message.
+    pub system_inject: Option<String>,
+    /// Override the temperature parameter.
+    pub temperature: Option<f64>,
+}
+
+impl RewriteConfig {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.system_inject.is_none() && self.temperature.is_none()
+    }
+}
+
 pub struct ProxyServer {
     store: Arc<Mutex<Store>>,
     session_id: String,
@@ -30,6 +47,8 @@ pub struct ProxyServer {
     fork_at_step: Option<u32>,
     /// Skip TLS certificate verification for upstream connections
     insecure: bool,
+    /// Request rewriting rules applied to post-fork steps
+    rewrite_config: Option<RewriteConfig>,
 }
 
 #[derive(Clone)]
@@ -43,6 +62,7 @@ struct ProxyState {
     replay_steps: Option<Arc<Vec<Step>>>,
     fork_at_step: Option<u32>,
     client: reqwest::Client,
+    rewrite_config: Option<RewriteConfig>,
 }
 
 impl ProxyServer {
@@ -70,6 +90,7 @@ impl ProxyServer {
             replay_steps: None,
             fork_at_step: None,
             insecure,
+            rewrite_config: None,
         })
     }
 
@@ -101,6 +122,40 @@ impl ProxyServer {
             replay_steps: Some(replay_steps),
             fork_at_step: Some(fork_at_step),
             insecure: false,
+            rewrite_config: None,
+        })
+    }
+
+    /// Fork-and-execute with request rewriting: steps after the fork point have
+    /// their request bodies modified before forwarding to upstream.
+    pub fn new_fork_execute_with_rewrites(
+        store: Store,
+        session_id: &str,
+        fork_timeline_id: &str,
+        replay_steps: Vec<Step>,
+        fork_at_step: u32,
+        upstream_base: &str,
+        rewrite_config: RewriteConfig,
+    ) -> Result<Self> {
+        tracing::info!(
+            session_id = %session_id,
+            fork_timeline_id = %fork_timeline_id,
+            fork_at_step = fork_at_step,
+            rewrite = ?rewrite_config,
+            "Starting fork-and-execute proxy with request rewriting",
+        );
+
+        Ok(ProxyServer {
+            store: Arc::new(Mutex::new(store)),
+            session_id: session_id.to_string(),
+            timeline_id: fork_timeline_id.to_string(),
+            step_counter: Arc::new(Mutex::new(0)),
+            upstream_base: upstream_base.to_string(),
+            instant_replay: false,
+            replay_steps: Some(replay_steps),
+            fork_at_step: Some(fork_at_step),
+            insecure: false,
+            rewrite_config: Some(rewrite_config),
         })
     }
 
@@ -137,6 +192,7 @@ impl ProxyServer {
             replay_steps: self.replay_steps.map(Arc::new),
             fork_at_step: self.fork_at_step,
             client: make_client(self.insecure),
+            rewrite_config: self.rewrite_config,
         };
 
         loop {
@@ -329,7 +385,7 @@ async fn handle_request(
     );
 
     for (key, value) in parts.headers.iter() {
-        if key == "host" || key == "connection" {
+        if key == "host" || key == "connection" || key == "content-length" {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -337,8 +393,24 @@ async fn handle_request(
         }
     }
 
+    let final_body = if let Some(ref rewrite) = state.rewrite_config
+        && !rewrite.is_empty()
+    {
+        let rewritten = apply_rewrites(&body_bytes, rewrite, &model);
+        tracing::info!(
+            step = step_number,
+            model_swap = ?rewrite.model,
+            system_inject = rewrite.system_inject.is_some(),
+            temperature = ?rewrite.temperature,
+            "Applying request rewrite",
+        );
+        rewritten
+    } else {
+        body_bytes.to_vec()
+    };
+
     let start = std::time::Instant::now();
-    let upstream_resp = upstream_req.body(body_bytes.to_vec()).send().await;
+    let upstream_resp = upstream_req.body(final_body).send().await;
 
     match upstream_resp {
         Ok(resp) if streaming => {
@@ -787,4 +859,212 @@ fn is_tool_call_response(resp_bytes: &[u8]) -> bool {
     }
 
     false
+}
+
+fn is_anthropic_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("claude") || m.contains("anthropic")
+}
+
+fn apply_rewrites(body: &[u8], config: &RewriteConfig, model: &str) -> Vec<u8> {
+    let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+
+    if let Some(ref new_model) = config.model {
+        let current_is_anthropic = is_anthropic_model(model);
+        let target_is_anthropic = is_anthropic_model(new_model);
+        if current_is_anthropic != target_is_anthropic {
+            tracing::warn!(
+                current = model, target = new_model,
+                "Cross-provider model swap skipped — body format incompatible"
+            );
+        } else {
+            val["model"] = serde_json::Value::String(new_model.clone());
+        }
+    }
+
+    if let Some(temp) = config.temperature {
+        val["temperature"] = serde_json::json!(temp);
+    }
+
+    if let Some(ref system_msg) = config.system_inject {
+        if is_anthropic_model(model) {
+            match val.get("system") {
+                Some(s) if s.is_string() => {
+                    let existing = s.as_str().unwrap_or("");
+                    val["system"] = serde_json::json!(format!("{}\n\n{}", existing, system_msg));
+                }
+                Some(s) if s.is_array() => {
+                    if let Some(arr) = val.get_mut("system").and_then(|a| a.as_array_mut()) {
+                        arr.push(serde_json::json!({"type": "text", "text": system_msg}));
+                    }
+                }
+                _ => {
+                    val["system"] = serde_json::json!(system_msg);
+                }
+            }
+        } else if let Some(messages) = val.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            if messages.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system") {
+                if let Some(existing) = messages[0].get("content").and_then(|c| c.as_str()) {
+                    messages[0]["content"] = serde_json::json!(format!("{}\n\n{}", existing, system_msg));
+                }
+            } else {
+                let system = serde_json::json!({"role": "system", "content": system_msg});
+                messages.insert(0, system);
+            }
+        }
+    }
+
+    serde_json::to_vec(&val).unwrap_or_else(|_| body.to_vec())
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn test_model_swap_openai() {
+        let body = serde_json::json!({"model": "gpt-4o-mini", "messages": []});
+        let config = RewriteConfig { model: Some("gpt-4o".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "gpt-4o-mini");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(val["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_model_swap_anthropic() {
+        let body = serde_json::json!({"model": "claude-3-haiku-20240307", "messages": []});
+        let config = RewriteConfig { model: Some("claude-3-5-sonnet-latest".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "claude-3-haiku-20240307");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(val["model"], "claude-3-5-sonnet-latest");
+    }
+
+    #[test]
+    fn test_cross_provider_swap_blocked() {
+        let body = serde_json::json!({"model": "gpt-4o", "messages": []});
+        let config = RewriteConfig { model: Some("claude-3-5-sonnet-latest".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "gpt-4o");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(val["model"], "gpt-4o", "cross-provider swap should be blocked");
+    }
+
+    #[test]
+    fn test_temperature_override() {
+        let body = serde_json::json!({"model": "gpt-4o", "temperature": 1.0, "messages": []});
+        let config = RewriteConfig { temperature: Some(0.2), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "gpt-4o");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(val["temperature"], 0.2);
+    }
+
+    #[test]
+    fn test_system_inject_openai_no_existing() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let config = RewriteConfig { system_inject: Some("Be careful".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "gpt-4o");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        let messages = val["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "Be careful");
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn test_system_inject_openai_existing() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "hello"}
+            ]
+        });
+        let config = RewriteConfig { system_inject: Some("Also be careful.".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "gpt-4o");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        let messages = val["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        let system_content = messages[0]["content"].as_str().unwrap();
+        assert!(system_content.contains("You are helpful."));
+        assert!(system_content.contains("Also be careful."));
+    }
+
+    #[test]
+    fn test_system_inject_anthropic_string() {
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet-latest",
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let config = RewriteConfig { system_inject: Some("Also be careful.".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "claude-3-5-sonnet-latest");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        let system = val["system"].as_str().unwrap();
+        assert!(system.contains("You are helpful."));
+        assert!(system.contains("Also be careful."));
+        assert!(val["messages"].as_array().unwrap().iter().all(|m| m["role"] != "system"),
+            "Anthropic messages must NOT contain role:system");
+    }
+
+    #[test]
+    fn test_system_inject_anthropic_array() {
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet-latest",
+            "system": [{"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let config = RewriteConfig { system_inject: Some("Also be careful.".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "claude-3-5-sonnet-latest");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        let system_arr = val["system"].as_array().unwrap();
+        assert_eq!(system_arr.len(), 2);
+        assert_eq!(system_arr[0]["text"], "You are helpful.");
+        assert_eq!(system_arr[1]["text"], "Also be careful.");
+        assert_eq!(system_arr[1]["type"], "text");
+    }
+
+    #[test]
+    fn test_system_inject_anthropic_no_existing() {
+        let body = serde_json::json!({
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let config = RewriteConfig { system_inject: Some("Be careful.".into()), ..Default::default() };
+        let result = apply_rewrites(&serde_json::to_vec(&body).unwrap(), &config, "claude-3-5-sonnet-latest");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(val["system"], "Be careful.");
+    }
+
+    #[test]
+    fn test_non_json_passthrough() {
+        let body = b"not json at all";
+        let config = RewriteConfig { model: Some("gpt-4o".into()), ..Default::default() };
+        let result = apply_rewrites(body, &config, "gpt-4o-mini");
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn test_empty_config_no_changes() {
+        let body = serde_json::json!({"model": "gpt-4o", "messages": [], "temperature": 0.7});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let config = RewriteConfig::default();
+        let result = apply_rewrites(&bytes, &config, "gpt-4o");
+        let val: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(val["model"], "gpt-4o");
+        assert_eq!(val["temperature"], 0.7);
+    }
+
+    #[test]
+    fn test_is_anthropic_model_detection() {
+        assert!(is_anthropic_model("claude-3-5-sonnet-latest"));
+        assert!(is_anthropic_model("claude-3-haiku-20240307"));
+        assert!(is_anthropic_model("Claude-3-Opus"));
+        assert!(!is_anthropic_model("gpt-4o"));
+        assert!(!is_anthropic_model("gpt-4o-mini"));
+        assert!(!is_anthropic_model("o1"));
+    }
 }

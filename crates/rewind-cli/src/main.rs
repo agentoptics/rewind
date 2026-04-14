@@ -233,6 +233,52 @@ enum Commands {
         #[command(subcommand)]
         action: ImportAction,
     },
+
+    /// Diagnose a failed session and suggest a fix
+    Fix {
+        /// Session ID, prefix, or 'latest'
+        session: String,
+
+        /// Model for the diagnosis LLM call
+        #[arg(long, default_value = "gpt-4o-mini")]
+        diagnosis_model: String,
+
+        /// Apply the fix: fork, start proxy with rewrites, and optionally score
+        #[arg(long)]
+        apply: bool,
+
+        /// Agent command to re-run against the patched proxy (requires --apply)
+        #[arg(long, short, requires = "apply")]
+        command: Option<String>,
+
+        /// Upstream LLM base URL for replay
+        #[arg(long, default_value = "https://api.openai.com")]
+        upstream: String,
+
+        /// Proxy port for replay
+        #[arg(long, default_value_t = 8443)]
+        port: u16,
+
+        /// Analyze a specific step instead of auto-detecting the error step
+        #[arg(long)]
+        step: Option<u32>,
+
+        /// Describe expected behavior (for soft failures with no error step)
+        #[arg(long)]
+        expected: Option<String>,
+
+        /// Skip diagnosis — directly test a fix hypothesis (e.g., 'swap_model:gpt-4o')
+        #[arg(long)]
+        hypothesis: Option<String>,
+
+        /// Skip confirmation prompts
+        #[arg(long)]
+        yes: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -665,6 +711,9 @@ async fn main() -> Result<()> {
         Commands::Import { action } => match action {
             ImportAction::Otel(args) => cmd_import_otel(args),
             ImportAction::FromLangfuse(args) => cmd_import_from_langfuse(args),
+        },
+        Commands::Fix { session, diagnosis_model, apply, command, upstream, port, step, expected, hypothesis, yes, json } => {
+            cmd_fix(session, diagnosis_model, apply, command, upstream, port, step, expected, hypothesis, yes, json).await
         },
     }
 }
@@ -3202,6 +3251,556 @@ fn create_step_with_blobs(
 
     store.create_step(&step)?;
     Ok(())
+}
+
+// ── Fix Command ──────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_fix(
+    session_ref: String,
+    diagnosis_model: String,
+    apply: bool,
+    agent_command: Option<String>,
+    upstream: String,
+    port: u16,
+    step_override: Option<u32>,
+    expected: Option<String>,
+    hypothesis: Option<String>,
+    yes: bool,
+    json_output: bool,
+) -> Result<()> {
+    let store = Store::open_default()?;
+    let session = resolve_session(&store, &session_ref)?;
+    let timeline = store.get_root_timeline(&session.id)?
+        .context("No timeline found for session")?;
+
+    let steps = store.get_steps(&timeline.id)?;
+    if steps.is_empty() {
+        bail!("Session has no steps to diagnose.");
+    }
+
+    if apply && !matches!(session.source, rewind_store::SessionSource::Proxy) {
+        bail!(
+            "This session was recorded in {:?} mode. \
+             --apply requires a proxy-recorded session (source=proxy). \
+             Re-record with `rewind record` to use --apply.",
+            session.source
+        );
+    }
+
+    let failure_step = find_failure_step(&steps, &session, step_override)?;
+    let failure_step_num = failure_step.step_number;
+
+    // ── Hypothesis mode: skip diagnosis, parse fix directly ──
+    let result = if let Some(ref hyp) = hypothesis {
+        if !apply {
+            bail!("--hypothesis requires --apply to test the fix.");
+        }
+        parse_hypothesis(hyp, failure_step_num)?
+    } else {
+        // ── Diagnosis mode: call LLM ──
+        if !json_output {
+            eprintln!(
+                "{}\n",
+                format!(
+                    "⏪ Diagnosing session \"{}\" ({} steps)...",
+                    session.name, steps.len()
+                )
+                .cyan()
+                .bold()
+            );
+        }
+
+        let payload = build_diagnosis_payload(
+            &store, &session, &steps, failure_step, failure_step_num,
+            &expected, &diagnosis_model,
+        );
+        run_fix_subprocess(&payload).await?
+    };
+
+    let fix_type = result.get("fix_type").and_then(|v| v.as_str()).unwrap_or("no_fix");
+
+    // ── Diagnosis-only mode ──
+    if !apply {
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            print_fix_diagnosis(&result, failure_step);
+        }
+        return Ok(());
+    }
+
+    // ── Apply mode ──
+    if fix_type == "no_fix" {
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            print_fix_diagnosis(&result, failure_step);
+            eprintln!("  {} No proxy-level fix available. The issue is in agent code.", "⚠".yellow().bold());
+        }
+        return Ok(());
+    }
+
+    let fork_from = result.get("fork_from").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+    let fork_from = fork_from.max(1).min(steps.len() as u32);
+
+    let rewrite_config = build_rewrite_config(&result);
+
+    // Dry-run preview
+    if !yes && !json_output {
+        print_fix_diagnosis(&result, failure_step);
+        println!();
+        println!("  {}", "⏪ Proposed fix:".cyan().bold());
+        println!("  {} {}", "Fix type:".dimmed(), fix_type.yellow().bold());
+        if let Some(ref m) = rewrite_config.model {
+            println!("  {} {} → {}", "Model:".dimmed(), failure_step.model, m.green());
+        }
+        if rewrite_config.system_inject.is_some() {
+            println!("  {} system message will be injected", "Inject:".dimmed());
+        }
+        if let Some(t) = rewrite_config.temperature {
+            println!("  {} {}", "Temperature:".dimmed(), t);
+        }
+        println!("  {} step {}", "Fork from:".dimmed(), fork_from);
+        println!("  {} {} (0 tokens, 0ms)", "Steps cached:".dimmed(), fork_from);
+        println!("  {} {}+ (forwarded with rewrite)", "Steps live:".dimmed(), fork_from + 1);
+        println!();
+
+        eprint!("  Apply this fix? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("  Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Fork
+    let engine = ReplayEngine::new(&store);
+    let parent_steps = engine.get_full_timeline_steps(&timeline.id, &session.id)?;
+    let fork = engine.fork(&session.id, &timeline.id, fork_from, &format!("fix-{}", fix_type))?;
+
+    // Start proxy with rewrites (or without for retry_step)
+    let proxy = if fix_type == "retry_step" {
+        ProxyServer::new_fork_execute(
+            store, &session.id, &fork.id, parent_steps.clone(), fork_from, &upstream,
+        )?
+    } else {
+        ProxyServer::new_fork_execute_with_rewrites(
+            store, &session.id, &fork.id, parent_steps.clone(), fork_from, &upstream,
+            rewrite_config,
+        )?
+    };
+
+    if !json_output {
+        println!();
+        println!("{}", "⏪ Fix applied — proxy running".cyan().bold());
+        println!("  {} {}", "Session:".dimmed(), session.name.white().bold());
+        println!("  {} step {}", "Fork at:".dimmed(), fork_from);
+        println!("  {} {}", "Fix type:".dimmed(), fix_type.yellow());
+        println!("  {} {}", "Fork ID:".dimmed(), fork.id[..12].to_string().dimmed());
+        println!("  {} {}", "Proxy:".dimmed(), format!("http://127.0.0.1:{}", port).yellow());
+        println!();
+    }
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+
+    if let Some(ref cmd_str) = agent_command {
+        // ── --command mode: run agent automatically ──
+        if !json_output {
+            eprintln!("  {} {}", "Running:".dimmed(), cmd_str.green());
+            eprintln!();
+        }
+
+        let proxy_handle = tokio::spawn(async move {
+            if let Err(e) = proxy.run(addr).await {
+                eprintln!("  {} Proxy error: {}", "✗".red(), e);
+            }
+        });
+
+        // Wait for the proxy to be ready (poll health endpoint)
+        let health_url = format!("http://127.0.0.1:{}/_rewind/health", port);
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if client.get(&health_url).send().await.is_ok() {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            proxy_handle.abort();
+            bail!("Proxy failed to start on port {} within 2s. Is the port in use?", port);
+        }
+
+        let status = run_agent_command(cmd_str, port).await?;
+        if !json_output {
+            if status.success() {
+                eprintln!("  {} Agent finished (exit 0)", "✓".green());
+            } else {
+                eprintln!("  {} Agent finished (exit {})", "⚠".yellow(), status);
+            }
+        }
+
+        // TODO: replace abort() with graceful shutdown (CancellationToken or oneshot)
+        // to avoid losing in-flight step data if the proxy is mid-write.
+        proxy_handle.abort();
+    } else {
+        // ── --apply mode: wait for manual re-run ──
+        if !json_output {
+            println!("  {} Point your agent at this proxy:", "→".cyan());
+            println!("    {}", format!("export OPENAI_BASE_URL=http://127.0.0.1:{}/v1", port).green());
+            println!("    {}", format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{}/anthropic", port).green());
+            println!();
+            println!("  {} to stop and score.", "Ctrl+C".yellow().bold());
+            println!();
+        }
+
+        proxy.run(addr).await?;
+    }
+
+    // ── Replay savings ──
+    if !json_output {
+        eprintln!();
+        eprintln!("{}", "⏪ Replay savings".cyan().bold());
+    }
+
+    let score_store = Store::open_default()?;
+    let all_timelines = score_store.get_timelines(&session.id)?;
+    let forks: Vec<_> = all_timelines.iter().filter(|t| t.id == fork.id).collect();
+    print_session_savings(&score_store, &forks);
+
+    if !json_output {
+        println!();
+        println!("  {} Compare in detail:", "→".cyan());
+        println!("    {}", format!("rewind diff {} {} {}", &session.id[..8], &timeline.id[..8], &fork.id[..8]).green());
+        println!("    {}", format!("rewind eval score {} --compare-timelines -e task_completion", &session.id[..8]).green());
+    }
+
+    println!();
+    Ok(())
+}
+
+fn build_diagnosis_payload(
+    store: &Store,
+    session: &rewind_store::Session,
+    steps: &[rewind_store::Step],
+    failure_step: &rewind_store::Step,
+    failure_step_num: u32,
+    expected: &Option<String>,
+    diagnosis_model: &str,
+) -> serde_json::Value {
+    let failure_request = if !failure_step.request_blob.is_empty() {
+        store.blobs.get_json::<serde_json::Value>(&failure_step.request_blob).ok()
+    } else {
+        None
+    };
+    let failure_response = if !failure_step.response_blob.is_empty() {
+        store.blobs.get_json::<serde_json::Value>(&failure_step.response_blob).ok()
+    } else {
+        None
+    };
+
+    let preceding_steps: Vec<serde_json::Value> = steps.iter()
+        .filter(|s| {
+            s.step_number < failure_step_num
+                && s.step_number >= failure_step_num.saturating_sub(3)
+        })
+        .map(|s| {
+            let req = if !s.request_blob.is_empty() {
+                store.blobs.get_json::<serde_json::Value>(&s.request_blob).ok()
+            } else {
+                None
+            };
+            let resp = if !s.response_blob.is_empty() {
+                store.blobs.get_json::<serde_json::Value>(&s.response_blob).ok()
+            } else {
+                None
+            };
+            serde_json::json!({
+                "step_number": s.step_number,
+                "request": req,
+                "response": resp,
+            })
+        })
+        .collect();
+
+    let steps_summary: Vec<serde_json::Value> = steps.iter().map(|s| {
+        serde_json::json!({
+            "step_number": s.step_number,
+            "step_type": format!("{:?}", s.step_type).to_lowercase(),
+            "status": format!("{:?}", s.status).to_lowercase(),
+            "model": s.model,
+            "tokens_in": s.tokens_in,
+            "tokens_out": s.tokens_out,
+            "duration_ms": s.duration_ms,
+            "tool_name": s.tool_name,
+            "error": s.error,
+        })
+    }).collect();
+
+    serde_json::json!({
+        "session": {
+            "id": session.id,
+            "name": session.name,
+            "status": format!("{:?}", session.status).to_lowercase(),
+            "total_steps": session.total_steps,
+        },
+        "steps": steps_summary,
+        "failure_step": failure_step_num,
+        "failure_context": {
+            "request": failure_request,
+            "response": failure_response,
+            "preceding_steps": preceding_steps,
+        },
+        "expected": expected,
+        "config": {
+            "model": diagnosis_model,
+        },
+    })
+}
+
+fn parse_hypothesis(hyp: &str, failure_step_num: u32) -> Result<serde_json::Value> {
+    let parts: Vec<&str> = hyp.splitn(2, ':').collect();
+    let fix_type = parts[0];
+    let param = parts.get(1).unwrap_or(&"");
+
+    let valid_types = ["swap_model", "inject_system", "adjust_temperature", "retry_step"];
+    if !valid_types.contains(&fix_type) {
+        bail!(
+            "Unknown fix type '{}'. Valid: {}",
+            fix_type,
+            valid_types.join(", ")
+        );
+    }
+
+    let fix_params = match fix_type {
+        "swap_model" => {
+            if param.is_empty() {
+                bail!("swap_model requires a model name, e.g., --hypothesis swap_model:gpt-4o");
+            }
+            serde_json::json!({"model": param})
+        }
+        "inject_system" => {
+            if param.is_empty() {
+                bail!("inject_system requires content, e.g., --hypothesis 'inject_system:Be more careful'");
+            }
+            serde_json::json!({"content": param})
+        }
+        "adjust_temperature" => {
+            let temp: f64 = param.parse().map_err(|_| anyhow::anyhow!(
+                "adjust_temperature requires a number, e.g., --hypothesis adjust_temperature:0.2"
+            ))?;
+            serde_json::json!({"temperature": temp})
+        }
+        "retry_step" => serde_json::json!({}),
+        _ => serde_json::json!({}),
+    };
+
+    Ok(serde_json::json!({
+        "root_cause": format!("User hypothesis: {}", hyp),
+        "failed_step": failure_step_num,
+        "fork_from": failure_step_num.saturating_sub(1).max(1),
+        "fix_type": fix_type,
+        "fix_params": fix_params,
+        "explanation": format!("Testing user-specified fix: {}", hyp),
+        "confidence": "manual",
+    }))
+}
+
+fn build_rewrite_config(result: &serde_json::Value) -> rewind_proxy::RewriteConfig {
+    let fix_type = result.get("fix_type").and_then(|v| v.as_str()).unwrap_or("no_fix");
+    let fix_params = result.get("fix_params").cloned().unwrap_or(serde_json::json!({}));
+
+    rewind_proxy::RewriteConfig {
+        model: if fix_type == "swap_model" {
+            fix_params.get("model").and_then(|v| v.as_str()).map(String::from)
+        } else {
+            None
+        },
+        system_inject: if fix_type == "inject_system" {
+            fix_params.get("content").and_then(|v| v.as_str()).map(String::from)
+        } else {
+            None
+        },
+        temperature: if fix_type == "adjust_temperature" {
+            fix_params.get("temperature").and_then(|v| v.as_f64())
+        } else {
+            None
+        },
+    }
+}
+
+async fn run_agent_command(cmd_str: &str, port: u16) -> Result<std::process::ExitStatus> {
+    if cmd_str.trim().is_empty() {
+        bail!("Empty --command string");
+    }
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", cmd_str]);
+    cmd.env("OPENAI_BASE_URL", format!("http://127.0.0.1:{}/v1", port));
+    cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}/anthropic", port));
+
+    let status = cmd.status().await.map_err(|e| {
+        anyhow::anyhow!("Failed to run agent command '{}': {}", cmd_str, e)
+    })?;
+    Ok(status)
+}
+
+fn find_failure_step<'a>(
+    steps: &'a [rewind_store::Step],
+    session: &rewind_store::Session,
+    step_override: Option<u32>,
+) -> Result<&'a rewind_store::Step> {
+    if let Some(n) = step_override {
+        return steps.iter().find(|s| s.step_number == n)
+            .context(format!(
+                "--step {} not found (session has steps 1..{})",
+                n, steps.last().unwrap().step_number
+            ));
+    }
+
+    if let Some(s) = steps.iter().find(|s| s.status == rewind_store::StepStatus::Error) {
+        return Ok(s);
+    }
+
+    if matches!(session.status, rewind_store::SessionStatus::Failed) {
+        return Ok(steps.last().unwrap());
+    }
+
+    eprintln!(
+        "  {} No error step found. Analyzing last step. For better results, pass {}.",
+        "⚠".yellow().bold(),
+        "--expected 'description of correct behavior'".dimmed()
+    );
+    Ok(steps.last().unwrap())
+}
+
+async fn run_fix_subprocess(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    let payload_str = serde_json::to_string(payload)?;
+    let timeout = std::time::Duration::from_secs(120);
+
+    let output = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("python3")
+            .args(["-m", "rewind_agent.fix"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!(
+                "Failed to spawn diagnosis subprocess (python3 -m rewind_agent.fix): {}. \
+                 Is rewind-agent installed? Run: pip install rewind-agent[openai]",
+                e
+            ))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload_str.as_bytes()).map_err(|e| {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::anyhow!("Failed to write diagnostic payload ({} bytes): {}", payload_str.len(), e)
+            })?;
+        }
+
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait()? {
+                Some(_) => {
+                    let output = child.wait_with_output()?;
+                    return Ok(output);
+                }
+                None => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!("Diagnosis timed out after {}s", timeout.as_secs());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }).await.map_err(|e| anyhow::anyhow!("Diagnosis task panicked: {}", e))??;
+
+    let mut stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
+    stdout_str.truncate(100_000);
+
+    if !output.status.success() {
+        if let Ok(result) = serde_json::from_str::<serde_json::Value>(stdout_str.trim()) {
+            return Ok(result);
+        }
+        let mut stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+        stderr_str.truncate(1000);
+        bail!(
+            "Diagnosis subprocess failed (exit {}): {}",
+            output.status, stderr_str.trim()
+        );
+    }
+
+    let result: serde_json::Value = serde_json::from_str(stdout_str.trim())
+        .map_err(|e| anyhow::anyhow!(
+            "Diagnosis output is not valid JSON: {}. Got: '{}'",
+            e, stdout_str.chars().take(200).collect::<String>()
+        ))?;
+    Ok(result)
+}
+
+fn print_fix_diagnosis(result: &serde_json::Value, failure_step: &rewind_store::Step) {
+    let fix_type = result.get("fix_type").and_then(|v| v.as_str()).unwrap_or("no_fix");
+    let confidence = result.get("confidence").and_then(|v| v.as_str()).unwrap_or("low");
+    let root_cause = result.get("root_cause").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let explanation = result.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
+    let fork_from = result.get("fork_from").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let step_type = format!("{:?}", failure_step.step_type).to_lowercase();
+    let status = format!("{:?}", failure_step.status).to_lowercase();
+
+    println!("  {} Step {} — {} ({}) — {}", "Failure:".dimmed(),
+        failure_step.step_number, step_type, failure_step.model, status);
+
+    if let Some(ref err) = failure_step.error {
+        println!("  {} {}", "Error:".dimmed(), err.red());
+    }
+
+    println!("  {} {}", "Root cause:".dimmed(), root_cause.white());
+    println!();
+
+    if fix_type != "no_fix" {
+        let fix_params = result.get("fix_params").cloned().unwrap_or(serde_json::json!({}));
+        let params_str = if fix_params.is_object() && !fix_params.as_object().unwrap().is_empty() {
+            serde_json::to_string(&fix_params).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        println!("  {} {} {}", "Suggested fix:".dimmed(),
+            fix_type.yellow().bold(),
+            if params_str.is_empty() { String::new() } else { format!("→ {}", params_str) });
+        if !explanation.is_empty() {
+            println!("  {} {}", "Reasoning:".dimmed(), explanation);
+        }
+        println!("  {} {}", "Confidence:".dimmed(), match confidence {
+            "high" => confidence.green().bold().to_string(),
+            "medium" => confidence.yellow().to_string(),
+            _ => confidence.red().to_string(),
+        });
+
+        if fork_from > 0 {
+            println!();
+            println!("  To apply this fix automatically:");
+            println!("    {}", format!("rewind fix {} --apply", "latest").green());
+        }
+    } else {
+        println!("  {} {}", "Diagnosis:".dimmed(), "no_fix — issue is in agent code, not LLM behavior".yellow());
+        if !explanation.is_empty() {
+            println!("  {} {}", "Reasoning:".dimmed(), explanation);
+        }
+        println!("  {} {}", "Confidence:".dimmed(), confidence.dimmed());
+    }
+
+    println!();
 }
 
 // ── Helpers ───────────────────────────────────────────────────
