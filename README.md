@@ -122,6 +122,10 @@ rewind diff latest main fixed           # see exactly what diverged
 
 ### AI diagnosis - let the debugger debug
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/agentoptics/rewind/master/assets/fix-demo.gif" alt="rewind fix demo - diagnose, fork, replay" width="800">
+</p>
+
 ```bash
 rewind fix latest
 ```
