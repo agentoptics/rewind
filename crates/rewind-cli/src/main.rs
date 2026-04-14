@@ -3431,7 +3431,11 @@ fn run_fix_subprocess(payload: &serde_json::Value) -> Result<serde_json::Value> 
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        let _ = stdin.write_all(payload_str.as_bytes());
+        if let Err(e) = stdin.write_all(payload_str.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Failed to write diagnostic payload ({} bytes) to subprocess: {}", payload_str.len(), e);
+        }
     }
 
     let timeout = std::time::Duration::from_secs(120);

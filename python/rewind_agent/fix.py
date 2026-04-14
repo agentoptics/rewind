@@ -262,7 +262,18 @@ def run_diagnosis(payload: dict) -> dict:
             message = response.choices[0].message
             if message.tool_calls and len(message.tool_calls) > 0:
                 call = message.tool_calls[0]
-                args = json.loads(call.function.arguments)
+                try:
+                    args = json.loads(call.function.arguments)
+                except (json.JSONDecodeError, TypeError) as parse_err:
+                    return {
+                        "root_cause": f"LLM produced invalid function call arguments: {parse_err}",
+                        "failed_step": failure_step_num,
+                        "fork_from": max(1, (failure_step_num or 1) - 1),
+                        "fix_type": "no_fix",
+                        "fix_params": {},
+                        "explanation": "The diagnosis model returned malformed JSON in the tool call. Try a different --diagnosis-model.",
+                        "confidence": "low",
+                    }
 
                 fix_type = args.get("fix_type", "no_fix")
                 if fix_type not in VALID_FIX_TYPES:
@@ -343,6 +354,8 @@ def main():
             "fix_type": "no_fix", "fix_params": {},
             "explanation": "", "confidence": "low",
         }
+        print(json.dumps(result))
+        sys.exit(1)
 
     print(json.dumps(result))
 
