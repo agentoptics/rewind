@@ -310,34 +310,46 @@ describe('ActivityTimeline keyboard navigation', () => {
     return { onSelectStep, timeline, ...result }
   }
 
-  it('j selects the first step when nothing is selected', () => {
+  it('ArrowRight selects the first step when nothing is selected', () => {
     const { onSelectStep, timeline } = renderTimeline(null)
     expect(timeline).toBeTruthy()
-    fireEvent.keyDown(timeline, { key: 'j' })
+    fireEvent.keyDown(timeline, { key: 'ArrowRight' })
     expect(onSelectStep).toHaveBeenCalledWith('a')
   })
 
-  it('j selects the next step when a step is already selected', () => {
+  it('l selects the next step (vim-style)', () => {
     const { onSelectStep, timeline } = renderTimeline('a')
-    fireEvent.keyDown(timeline, { key: 'j' })
+    fireEvent.keyDown(timeline, { key: 'l' })
     expect(onSelectStep).toHaveBeenCalledWith('b')
   })
 
-  it('k selects the previous step', () => {
+  it('ArrowLeft selects the previous step', () => {
     const { onSelectStep, timeline } = renderTimeline('b')
-    fireEvent.keyDown(timeline, { key: 'k' })
+    fireEvent.keyDown(timeline, { key: 'ArrowLeft' })
     expect(onSelectStep).toHaveBeenCalledWith('a')
   })
 
-  it('k does nothing when on the first step', () => {
+  it('h selects the previous step (vim-style)', () => {
+    const { onSelectStep, timeline } = renderTimeline('c')
+    fireEvent.keyDown(timeline, { key: 'h' })
+    expect(onSelectStep).toHaveBeenCalledWith('b')
+  })
+
+  it('ArrowLeft does nothing when on the first step', () => {
     const { onSelectStep, timeline } = renderTimeline('a')
-    fireEvent.keyDown(timeline, { key: 'k' })
+    fireEvent.keyDown(timeline, { key: 'ArrowLeft' })
     expect(onSelectStep).not.toHaveBeenCalled()
   })
 
-  it('j does nothing when on the last step', () => {
+  it('ArrowRight does nothing when on the last step', () => {
     const { onSelectStep, timeline } = renderTimeline('c')
-    fireEvent.keyDown(timeline, { key: 'j' })
+    fireEvent.keyDown(timeline, { key: 'ArrowRight' })
+    expect(onSelectStep).not.toHaveBeenCalled()
+  })
+
+  it('ArrowDown moves to next lane (not step)', () => {
+    const { onSelectStep, timeline } = renderTimeline(null)
+    fireEvent.keyDown(timeline, { key: 'ArrowDown' })
     expect(onSelectStep).not.toHaveBeenCalled()
   })
 
@@ -347,16 +359,10 @@ describe('ActivityTimeline keyboard navigation', () => {
     expect(onSelectStep).toHaveBeenCalledWith(null)
   })
 
-  it('ArrowDown works as alternative to j', () => {
+  it('Shift+ArrowRight pans viewport instead of selecting step', () => {
     const { onSelectStep, timeline } = renderTimeline(null)
-    fireEvent.keyDown(timeline, { key: 'ArrowDown' })
-    expect(onSelectStep).toHaveBeenCalledWith('a')
-  })
-
-  it('ArrowUp works as alternative to k', () => {
-    const { onSelectStep, timeline } = renderTimeline('b')
-    fireEvent.keyDown(timeline, { key: 'ArrowUp' })
-    expect(onSelectStep).toHaveBeenCalledWith('a')
+    fireEvent.keyDown(timeline, { key: 'ArrowRight', shiftKey: true })
+    expect(onSelectStep).not.toHaveBeenCalled()
   })
 
   it('zoom keys do not call onSelectStep', () => {
