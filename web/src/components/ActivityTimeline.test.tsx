@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildLanes, type Lane } from './ActivityTimeline'
+import { buildLanes, viewportReducer, type Lane, type ViewportState } from './ActivityTimeline'
 import type { SpanResponse, StepResponse, Session } from '@/types/api'
 
 function makeStep(overrides: Partial<StepResponse> = {}): StepResponse {
@@ -169,5 +169,56 @@ describe('buildLanes', () => {
       const hasSteps = lanes.some(l => l.steps.length > 0)
       expect(hasSteps).toBe(true)
     })
+  })
+})
+
+describe('viewportReducer', () => {
+  const initial: ViewportState = { zoom: 1, offset: 0, focusedLaneIndex: null }
+
+  it('zooms in, clamped to max 50', () => {
+    const state = viewportReducer(initial, { type: 'zoom_in' })
+    expect(state.zoom).toBeGreaterThan(1)
+
+    let s = { ...initial, zoom: 50 }
+    s = viewportReducer(s, { type: 'zoom_in' })
+    expect(s.zoom).toBe(50)
+  })
+
+  it('zooms out, clamped to min 1', () => {
+    const state = viewportReducer({ ...initial, zoom: 5 }, { type: 'zoom_out' })
+    expect(state.zoom).toBeLessThan(5)
+
+    let s = { ...initial, zoom: 1 }
+    s = viewportReducer(s, { type: 'zoom_out' })
+    expect(s.zoom).toBe(1)
+  })
+
+  it('resets zoom to 1', () => {
+    const state = viewportReducer({ ...initial, zoom: 10, offset: 500 }, { type: 'reset' })
+    expect(state.zoom).toBe(1)
+    expect(state.offset).toBe(0)
+  })
+
+  it('pans by delta', () => {
+    const state = viewportReducer(initial, { type: 'pan', delta: 100 })
+    expect(state.offset).toBe(100)
+  })
+
+  it('sets offset directly', () => {
+    const state = viewportReducer(initial, { type: 'set_offset', offset: 250 })
+    expect(state.offset).toBe(250)
+  })
+
+  it('focuses a lane by index', () => {
+    const state = viewportReducer(initial, { type: 'focus_lane', index: 2 })
+    expect(state.focusedLaneIndex).toBe(2)
+  })
+
+  it('handles wheel zoom at a cursor position', () => {
+    const state = viewportReducer(
+      { zoom: 2, offset: 100, focusedLaneIndex: null },
+      { type: 'wheel_zoom', deltaY: -100, cursorFraction: 0.5, totalRange: 10000 }
+    )
+    expect(state.zoom).toBeGreaterThan(2)
   })
 })
