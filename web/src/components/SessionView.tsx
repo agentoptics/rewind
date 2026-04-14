@@ -66,6 +66,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   }
 
   const totalDuration = steps.reduce((sum, s) => sum + s.duration_ms, 0)
+  const errorCount = steps.filter(s => s.status === 'error').length
   const hasForked = (detail?.timelines.length ?? 0) > 1
   const isHook = session.source === 'hooks'
   const isCursor = isHook && (
@@ -112,9 +113,9 @@ export function SessionView({ sessionId }: { sessionId: string }) {
               <span className="flex items-center gap-1 text-neutral-500"><Zap size={12} /> {formatTokens(session.metadata.cache_tokens as number)} cached</span>
             )}
             <span className="flex items-center gap-1"><Clock size={12} /> {formatDuration(totalDuration)}</span>
-            {steps.filter(s => s.status === 'error').length > 0 && (
+            {errorCount > 0 && (
               <span className="flex items-center gap-1 text-red-400">
-                {steps.filter(s => s.status === 'error').length} errors
+                {errorCount} errors
               </span>
             )}
             {spans.length > 0 && (() => {

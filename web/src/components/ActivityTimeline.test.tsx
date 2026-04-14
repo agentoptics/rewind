@@ -409,7 +409,7 @@ describe('ActivityTimeline axis mode', () => {
     )
     expect(screen.getByText('duration')).toBeTruthy()
     expect(screen.getByText('tokens')).toBeTruthy()
-    expect(screen.getByText('cost')).toBeTruthy()
+    expect(screen.getByText('cost (est.)')).toBeTruthy()
   })
 
   it('disables tokens and cost for Cursor sessions', () => {
@@ -418,7 +418,7 @@ describe('ActivityTimeline axis mode', () => {
     )
     const tokensBtn = screen.getByText('tokens')
     expect(tokensBtn.closest('button')?.disabled).toBe(true)
-    const costBtn = screen.getByText('cost')
+    const costBtn = screen.getByText('cost (est.)')
     expect(costBtn.closest('button')?.disabled).toBe(true)
   })
 

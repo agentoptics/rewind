@@ -375,7 +375,7 @@ export function ActivityTimeline({
     isDragging.current = true
     dragStartX.current = e.clientX
     dragStartOffset.current = viewport.offset
-    // Focus the container for keyboard navigation (don't preventDefault — it blocks focus)
+    if (laneAreaRef.current) laneAreaRef.current.style.cursor = 'grabbing'
     containerRef.current?.focus()
   }, [viewport.offset])
 
@@ -391,7 +391,10 @@ export function ActivityTimeline({
       const rangeDelta = (pxDelta / barAreaWidth) * visibleRange
       dispatch({ type: 'set_offset', offset: Math.max(0, dragStartOffset.current + rangeDelta) })
     }
-    const onUp = () => { isDragging.current = false }
+    const onUp = () => {
+      isDragging.current = false
+      if (laneAreaRef.current) laneAreaRef.current.style.cursor = 'grab'
+    }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
     return () => {
@@ -444,6 +447,11 @@ export function ActivityTimeline({
       case 'Escape': e.preventDefault(); onSelectStep(null); break
     }
   }, [lanes, selectedStepId, onSelectStep, viewport.zoom, viewport.focusedLaneIndex, totalRange])
+
+  const minimapBars = useMemo(
+    () => lanes.map(lane => ({ lane, bars: computeBarLayouts(lane.steps, lane.positionMode, sessionBounds) })),
+    [lanes, sessionBounds],
+  )
 
   if (lanes.length === 0) {
     return (
@@ -520,7 +528,7 @@ export function ActivityTimeline({
                       : 'text-neutral-500 hover:text-neutral-300'
                 )}
               >
-                {mode}
+                {mode === 'cost' ? 'cost (est.)' : mode}
               </button>
             )
           })}
@@ -538,7 +546,7 @@ export function ActivityTimeline({
       {/* Minimap */}
       <Minimap
         lanes={lanes}
-        sessionBounds={sessionBounds}
+        minimapBars={minimapBars}
         totalRange={totalRange}
         viewport={viewport}
         onSetOffset={(offset) => dispatch({ type: 'set_offset', offset })}
@@ -554,7 +562,7 @@ export function ActivityTimeline({
       <div
         ref={laneAreaRef}
         className="flex-1 overflow-hidden select-none"
-        style={{ cursor: isDragging.current ? 'grabbing' : 'grab' }}
+        style={{ cursor: 'grab' }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
       >
@@ -734,7 +742,7 @@ function LaneAnalytics({ lane, onClose }: { lane: Lane; onClose: () => void }) {
       {Object.keys(analytics.typeCounts).length > 1 && (
         <div className="mt-1.5 flex gap-1">
           {Object.entries(analytics.typeCounts).map(([type, count]) => {
-            const maxCount = Math.max(...Object.values(analytics.typeCounts))
+            const maxCount = Object.values(analytics.typeCounts).reduce((a, b) => Math.max(a, b), 0)
             return (
               <div key={type} className="flex-1">
                 <div className="h-1.5 rounded-full bg-neutral-800 overflow-hidden">
@@ -754,13 +762,13 @@ function LaneAnalytics({ lane, onClose }: { lane: Lane; onClose: () => void }) {
 
 function Minimap({
   lanes,
-  sessionBounds,
+  minimapBars,
   totalRange,
   viewport,
   onSetOffset,
 }: {
   lanes: Lane[]
-  sessionBounds: { startMs: number; endMs: number; maxStep: number }
+  minimapBars: { lane: Lane; bars: BarLayout[] }[]
   totalRange: number
   viewport: ViewportState
   onSetOffset: (offset: number) => void
@@ -815,10 +823,9 @@ function Minimap({
           <span className="text-[9px] text-neutral-600 uppercase tracking-wider">Overview</span>
         </div>
         <div className="flex-1 relative">
-          {lanes.map((lane) => {
-            const bars = computeBarLayouts(lane.steps, lane.positionMode, sessionBounds)
+          {minimapBars.map(({ lane, bars }, laneIdx) => {
             const laneH = Math.max(2, (36 - 4) / lanes.length)
-            const laneTop = (lanes.indexOf(lane)) * laneH + 2
+            const laneTop = laneIdx * laneH + 2
             return bars.map(({ step, leftPct, widthPct }) => (
               <div
                 key={step.id}
