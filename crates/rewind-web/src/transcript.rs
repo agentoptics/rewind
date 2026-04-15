@@ -436,7 +436,10 @@ pub fn backfill_tokens(state: &crate::AppState, session_ids: &[String]) {
         let transcript_path = {
             let store = match state.store.lock() {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!("Poisoned lock during token backfill for {session_id}: {e}");
+                    continue;
+                }
             };
             match store.get_session(session_id) {
                 Ok(Some(s)) => s
@@ -474,7 +477,10 @@ pub fn backfill_tokens(state: &crate::AppState, session_ids: &[String]) {
 
         let store = match state.store.lock() {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!("Poisoned lock during token backfill for {session_id}: {e}");
+                continue;
+            }
         };
         if let Ok(Some(session)) = store.get_session(session_id)
             && session.total_tokens < new_tokens

@@ -221,12 +221,18 @@ impl WebServer {
             // Best-effort token backfill from transcript files before notifying frontend
             transcript::backfill_tokens(state, &ids);
 
+            // Re-read sessions from DB so WebSocket events carry real values
+            let store = state.store.lock().ok();
             for id in &ids {
+                let (steps, tokens) = store.as_ref()
+                    .and_then(|s| s.get_session(id).ok().flatten())
+                    .map(|s| (s.total_steps, s.total_tokens))
+                    .unwrap_or((0, 0));
                 let _ = state.event_tx.send(StoreEvent::SessionUpdated {
                     session_id: id.clone(),
                     status: "completed".to_string(),
-                    total_steps: 0,
-                    total_tokens: 0,
+                    total_steps: steps,
+                    total_tokens: tokens,
                 });
             }
         }
