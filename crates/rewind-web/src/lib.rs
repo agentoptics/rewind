@@ -138,6 +138,10 @@ impl WebServer {
         let drain_state = self.state.clone();
         let drain_count = Self::drain_hook_buffer(&drain_state).await;
 
+        // Auto-complete stale recording sessions (must run AFTER buffer drain so
+        // buffered SessionEnd events have a chance to update `updated_at` first)
+        let stale_count = Self::cleanup_stale_sessions(&drain_state);
+
         let app = self.build_router();
 
         // Bind first so port-in-use errors appear before the success banner
@@ -155,6 +159,9 @@ impl WebServer {
         if drain_count > 0 {
             println!("  \x1b[2mDrained:\x1b[0m  \x1b[32m{} buffered hook events\x1b[0m", drain_count);
         }
+        if stale_count > 0 {
+            println!("  \x1b[2mCleaned:\x1b[0m  \x1b[33m{} stale sessions auto-completed\x1b[0m", stale_count);
+        }
 
         println!();
 
@@ -166,7 +173,7 @@ impl WebServer {
         ));
 
         // Start background transcript sync: creates LlmCall steps + aggregates tokens
-        let transcript_state = drain_state;
+        let transcript_state = drain_state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -176,8 +183,55 @@ impl WebServer {
             }
         });
 
+        // Periodic stale session cleanup (every 5 minutes)
+        let cleanup_state = drain_state;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                Self::cleanup_stale_sessions(&cleanup_state);
+            }
+        });
+
         axum::serve(listener, app).await?;
         Ok(())
+    }
+
+    /// Complete stale recording sessions and emit WebSocket updates.
+    /// Returns the number of sessions auto-completed.
+    fn cleanup_stale_sessions(state: &AppState) -> usize {
+        let stale_threshold = chrono::Duration::minutes(30);
+
+        let ids = match state.store.lock() {
+            Ok(store) => match store.complete_stale_sessions(stale_threshold) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!("Stale session cleanup failed: {e}");
+                    return 0;
+                }
+            },
+            Err(e) => {
+                tracing::error!("Lock error during stale session cleanup: {e}");
+                return 0;
+            }
+        };
+
+        if !ids.is_empty() {
+            tracing::info!("Auto-completed {} stale sessions: {:?}", ids.len(), ids);
+
+            // Best-effort token backfill from transcript files before notifying frontend
+            transcript::backfill_tokens(state, &ids);
+
+            for id in &ids {
+                let _ = state.event_tx.send(StoreEvent::SessionUpdated {
+                    session_id: id.clone(),
+                    status: "completed".to_string(),
+                    total_steps: 0,
+                    total_tokens: 0,
+                });
+            }
+        }
+
+        ids.len()
     }
 
     /// Drain buffered hook events from ~/.rewind/hooks/buffer.jsonl
