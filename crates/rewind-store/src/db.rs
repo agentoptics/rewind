@@ -364,6 +364,29 @@ impl Store {
         Ok(())
     }
 
+    /// Mark recording sessions as completed if no activity for `stale_after` duration.
+    /// Returns the IDs of sessions that were completed.
+    pub fn complete_stale_sessions(&self, stale_after: chrono::Duration) -> Result<Vec<String>> {
+        let cutoff = (chrono::Utc::now() - stale_after).to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM sessions WHERE status = 'recording' AND updated_at < ?1",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !ids.is_empty() {
+            self.conn.execute(
+                "UPDATE sessions SET status = 'completed', updated_at = ?1
+                 WHERE status = 'recording' AND updated_at < ?2",
+                params![now, cutoff],
+            )?;
+        }
+        Ok(ids)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, created_at, updated_at, status, source, total_steps, total_tokens, metadata, thread_id, thread_ordinal
@@ -1549,4 +1572,90 @@ fn dirs_path() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".rewind")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Session, SessionSource, SessionStatus};
+    use chrono::{Duration, Utc};
+
+    fn test_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        (store, dir)
+    }
+
+    fn insert_session(store: &Store, id: &str, status: SessionStatus, updated_at: chrono::DateTime<Utc>) {
+        let session = Session {
+            id: id.into(),
+            name: format!("session-{id}"),
+            created_at: updated_at,
+            updated_at,
+            status,
+            source: SessionSource::Hooks,
+            total_steps: 0,
+            total_tokens: 0,
+            metadata: serde_json::json!({}),
+            thread_id: None,
+            thread_ordinal: None,
+        };
+        store.create_session(&session).unwrap();
+    }
+
+    #[test]
+    fn complete_stale_sessions_marks_old_recording_completed() {
+        let (store, _dir) = test_store();
+        let two_hours_ago = Utc::now() - Duration::hours(2);
+        insert_session(&store, "stale-1", SessionStatus::Recording, two_hours_ago);
+
+        let completed = store.complete_stale_sessions(Duration::minutes(30)).unwrap();
+        assert_eq!(completed, vec!["stale-1"]);
+
+        let session = store.get_session("stale-1").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn complete_stale_sessions_skips_recent_recording() {
+        let (store, _dir) = test_store();
+        let just_now = Utc::now();
+        insert_session(&store, "active-1", SessionStatus::Recording, just_now);
+
+        let completed = store.complete_stale_sessions(Duration::minutes(30)).unwrap();
+        assert!(completed.is_empty());
+
+        let session = store.get_session("active-1").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Recording);
+    }
+
+    #[test]
+    fn complete_stale_sessions_skips_already_completed() {
+        let (store, _dir) = test_store();
+        let two_hours_ago = Utc::now() - Duration::hours(2);
+        insert_session(&store, "done-1", SessionStatus::Completed, two_hours_ago);
+
+        let completed = store.complete_stale_sessions(Duration::minutes(30)).unwrap();
+        assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn complete_stale_sessions_returns_all_affected_ids() {
+        let (store, _dir) = test_store();
+        let old = Utc::now() - Duration::hours(3);
+        let recent = Utc::now();
+        insert_session(&store, "stale-a", SessionStatus::Recording, old);
+        insert_session(&store, "stale-b", SessionStatus::Recording, old);
+        insert_session(&store, "active-c", SessionStatus::Recording, recent);
+        insert_session(&store, "done-d", SessionStatus::Completed, old);
+
+        let mut completed = store.complete_stale_sessions(Duration::minutes(30)).unwrap();
+        completed.sort();
+        assert_eq!(completed, vec!["stale-a", "stale-b"]);
+
+        // active-c still recording
+        assert_eq!(store.get_session("active-c").unwrap().unwrap().status, SessionStatus::Recording);
+        // done-d still completed (not double-updated)
+        assert_eq!(store.get_session("done-d").unwrap().unwrap().status, SessionStatus::Completed);
+    }
 }

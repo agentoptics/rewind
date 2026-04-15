@@ -426,6 +426,77 @@ fn parse_transcript(path: &Path) -> anyhow::Result<TranscriptSummary> {
     Ok(summary)
 }
 
+// ── Token backfill for stale sessions ──────────────────────
+
+/// Attempt to backfill token totals for sessions that were auto-completed.
+/// Reads `metadata.transcript_path` for each session ID and parses the
+/// transcript file. Failures are logged and skipped (best-effort).
+pub fn backfill_tokens(state: &crate::AppState, session_ids: &[String]) {
+    for session_id in session_ids {
+        let transcript_path = {
+            let store = match state.store.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Poisoned lock during token backfill for {session_id}: {e}");
+                    continue;
+                }
+            };
+            match store.get_session(session_id) {
+                Ok(Some(s)) => s
+                    .metadata
+                    .get("transcript_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                _ => continue,
+            }
+        };
+
+        let transcript_path = match transcript_path {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let path = std::path::Path::new(&transcript_path);
+        if !path.exists() {
+            continue;
+        }
+
+        let summary = match parse_transcript(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("Token backfill skipped for {session_id}: {e}");
+                continue;
+            }
+        };
+
+        let new_tokens = summary.new_tokens();
+        let cache_tokens = summary.cache_tokens();
+        if new_tokens == 0 && cache_tokens == 0 {
+            continue;
+        }
+
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Poisoned lock during token backfill for {session_id}: {e}");
+                continue;
+            }
+        };
+        if let Ok(Some(session)) = store.get_session(session_id)
+            && session.total_tokens < new_tokens
+        {
+            let _ = store.update_session_tokens(session_id, new_tokens);
+            let mut meta = session.metadata.clone();
+            meta["cache_tokens"] = serde_json::json!(cache_tokens);
+            if let Some(ref model) = summary.model {
+                meta["model"] = serde_json::json!(model);
+            }
+            let _ = store.update_session_metadata(session_id, &meta);
+            tracing::debug!("Backfilled tokens for {session_id}: {new_tokens} new, {cache_tokens} cached");
+        }
+    }
+}
+
 // ── Sync function: steps + tokens ───────────────────────────
 
 /// Iterate over all active hook sessions, read their transcript files,
