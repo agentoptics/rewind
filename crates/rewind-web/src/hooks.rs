@@ -324,11 +324,14 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
     tracing::info!("Creating hook session for {} (partial={})", &claude_session_id[..8.min(claude_session_id.len())], partial);
 
     let display_name = if let Some(src) = hook_source.filter(|s| *s != "claude-code") {
-        let suffix = cwd
-            .map(|p| p.trim_start_matches('/'))
-            .and_then(|p| p.strip_prefix(src))
-            .map(|rest| rest.trim_start_matches('/'))
-            .filter(|s| !s.is_empty());
+        // Find hook_source as a path segment anywhere in cwd, use everything after it
+        let suffix = cwd.and_then(|p| {
+            let parts: Vec<&str> = p.split('/').collect();
+            parts.iter().position(|seg| *seg == src).and_then(|i| {
+                let rest = parts[i + 1..].join("/");
+                if rest.is_empty() { None } else { Some(rest) }
+            })
+        });
         match suffix {
             Some(s) => format!("{}/{}", src, s),
             None => src.to_string(),

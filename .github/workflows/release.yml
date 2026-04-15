@@ -78,6 +78,10 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
+          # musl-tools provides the x86_64 musl-gcc wrapper.
+          # gcc-aarch64-linux-gnu is a glibc-based cross-linker, but Rust
+          # statically links musl's libc — the GNU linker just needs to
+          # produce aarch64 ELF output. Do not remove it.
           sudo apt-get install -y musl-tools
           if [[ "${{ matrix.target }}" == aarch64* ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu
