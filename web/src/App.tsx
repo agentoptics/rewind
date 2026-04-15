@@ -3,8 +3,6 @@ import { SessionView } from '@/components/SessionView'
 import { DiffView } from '@/components/DiffView'
 import { BaselinesView } from '@/components/BaselinesView'
 import { EvalDashboard } from '@/components/EvalDashboard'
-import { ThreadList } from '@/components/ThreadList'
-import { ThreadView } from '@/components/ThreadView'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { useStore } from '@/hooks/use-store'
 
@@ -24,8 +22,6 @@ export function App() {
           <BaselinesView />
         ) : view === 'evaluations' ? (
           <EvalDashboard />
-        ) : view === 'threads' ? (
-          <ThreadList />
         ) : (
           <EmptyState />
         )}

@@ -5,8 +5,7 @@ interface UIState {
   selectedTimelineId: string | null
   selectedStepId: string | null
   sidebarCollapsed: boolean
-  view: 'sessions' | 'diff' | 'baselines' | 'evaluations' | 'threads'
-  selectedThreadId: string | null
+  view: 'sessions' | 'diff' | 'baselines' | 'evaluations'
 
   // Eval state
   selectedDatasetName: string | null
@@ -18,7 +17,6 @@ interface UIState {
   selectStep: (id: string | null) => void
   toggleSidebar: () => void
   setView: (view: UIState['view']) => void
-  selectThread: (id: string | null) => void
   selectDataset: (name: string | null) => void
   selectExperiment: (id: string | null) => void
   setEvalTab: (tab: UIState['evalTab']) => void
@@ -41,7 +39,6 @@ export const useStore = create<UIState>((set) => {
     selectedStepId: initial.stepId,
     sidebarCollapsed: false,
     view: 'sessions',
-    selectedThreadId: null,
 
     // Eval state
     selectedDatasetName: null,
@@ -56,7 +53,6 @@ export const useStore = create<UIState>((set) => {
     selectStep: (id) => set({ selectedStepId: id }),
     toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
     setView: (view) => set({ view }),
-    selectThread: (id) => set({ selectedThreadId: id, view: 'threads' }),
     selectDataset: (name) => set({ selectedDatasetName: name }),
     selectExperiment: (id) => set({ selectedExperimentId: id }),
     setEvalTab: (tab) => set({ evalTab: tab }),
