@@ -351,7 +351,84 @@ async fn test_hook_source_cli_stored() {
     );
 }
 
-// ── Test 10: hook_source preserved across partial → full session ──
+// ── Test 10: session revived on SessionStart after SessionEnd ──
+
+#[tokio::test]
+async fn test_session_revived_on_session_start_after_end() {
+    let (app, store, _tmp, hooks) = setup();
+
+    // SessionStart creates the session (Recording)
+    let start1 = make_envelope("SessionStart", "test-session-revive", json!({}));
+    let (status, _) = post_json(app.clone(), "/api/hooks/event", start1).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sess_state = hooks.sessions.get("test-session-revive").unwrap();
+    let sid = sess_state.session_id.clone();
+    drop(sess_state);
+
+    assert_eq!(
+        store.lock().unwrap().get_session(&sid).unwrap().unwrap().status,
+        SessionStatus::Recording,
+        "Session should start as Recording"
+    );
+
+    // SessionEnd marks it Completed (fires between turns)
+    let mut end_env = make_envelope("SessionEnd", "test-session-revive", json!({}));
+    end_env["timestamp"] = json!("2026-04-11T10:30:01.000Z");
+    let (status, _) = post_json(app.clone(), "/api/hooks/event", end_env).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        store.lock().unwrap().get_session(&sid).unwrap().unwrap().status,
+        SessionStatus::Completed,
+        "Session should be Completed after SessionEnd"
+    );
+
+    // Second SessionStart revives it back to Recording
+    let mut start2 = make_envelope("SessionStart", "test-session-revive", json!({}));
+    start2["timestamp"] = json!("2026-04-11T10:30:02.000Z");
+    let (status, body) = post_json(app.clone(), "/api/hooks/event", start2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["message"], "session_revived", "Should return session_revived");
+
+    assert_eq!(
+        store.lock().unwrap().get_session(&sid).unwrap().unwrap().status,
+        SessionStatus::Recording,
+        "Session should be revived to Recording after second SessionStart"
+    );
+}
+
+#[tokio::test]
+async fn test_failed_session_not_revived() {
+    let (app, store, _tmp, hooks) = setup();
+
+    // Create a session
+    let start = make_envelope("SessionStart", "test-session-no-revive", json!({}));
+    let (status, _) = post_json(app.clone(), "/api/hooks/event", start).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sess_state = hooks.sessions.get("test-session-no-revive").unwrap();
+    let sid = sess_state.session_id.clone();
+    drop(sess_state);
+
+    // Manually set it to Failed in the DB
+    store.lock().unwrap().update_session_status(&sid, SessionStatus::Failed).unwrap();
+
+    // SessionStart should NOT revive a Failed session
+    let mut start2 = make_envelope("SessionStart", "test-session-no-revive", json!({}));
+    start2["timestamp"] = json!("2026-04-11T10:30:01.000Z");
+    let (status, body) = post_json(app, "/api/hooks/event", start2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["message"], "session_created", "Should not return session_revived for Failed");
+
+    assert_eq!(
+        store.lock().unwrap().get_session(&sid).unwrap().unwrap().status,
+        SessionStatus::Failed,
+        "Failed session should NOT be revived to Recording"
+    );
+}
+
+// ── Test 12: hook_source preserved across partial → full session ──
 
 #[tokio::test]
 async fn test_hook_source_preserved_on_session_start() {
