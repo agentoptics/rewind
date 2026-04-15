@@ -4,7 +4,7 @@ import type {
   Timeline, TimelineDiff,
   EvalDataset, DatasetExample, EvalExperiment,
   ExperimentResultDetail, ExperimentComparisonView,
-  SpanResponse, ThreadSummary, ThreadDetail,
+  SpanResponse,
 } from '@/types/api'
 
 const BASE = '/api'
@@ -56,13 +56,11 @@ export const api = {
   evalExperimentResults: (id: string) => get<ExperimentResultDetail[]>(`/eval/experiments/${id}/results`),
   evalCompare: (left: string, right: string) => get<ExperimentComparisonView>(`/eval/compare?left=${left}&right=${right}`),
 
-  // Spans & Threads
+  // Spans
   sessionSpans: (id: string, timeline?: string) => {
     const q = timeline ? `?timeline=${encodeURIComponent(timeline)}` : ''
     return get<SpanResponse[]>(`/sessions/${id}/spans${q}`)
   },
-  threads: () => get<ThreadSummary[]>('/threads'),
-  thread: (id: string) => get<ThreadDetail>(`/threads/${id}`),
 
   // OTel Export
   exportOtel: (sessionId: string, opts: { include_content?: boolean; timeline_id?: string | null; all_timelines?: boolean } = {}) =>

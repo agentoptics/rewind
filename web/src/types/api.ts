@@ -258,14 +258,3 @@ export interface SpanResponse {
   steps: StepResponse[]
 }
 
-export interface ThreadSummary {
-  thread_id: string
-  session_count: number
-  total_steps: number
-  total_tokens: number
-}
-
-export interface ThreadDetail {
-  thread_id: string
-  sessions: Session[]
-}
