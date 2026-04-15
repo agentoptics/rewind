@@ -197,7 +197,7 @@ enum Commands {
 
         /// Host/IP to bind to (use 0.0.0.0 for container/K8s deployments)
         #[arg(long, default_value = "127.0.0.1", env = "REWIND_BIND_HOST")]
-        host: String,
+        host: std::net::IpAddr,
     },
 
     /// Evaluation system — datasets, evaluators, experiments, comparisons
@@ -775,10 +775,10 @@ async fn cmd_record(name: String, port: u16, upstream: String, replay: bool, web
     }
 }
 
-async fn cmd_web(port: u16, host: String) -> Result<()> {
+async fn cmd_web(port: u16, host: std::net::IpAddr) -> Result<()> {
     let store = Store::open_default()?;
     let web_server = WebServer::new_standalone(store);
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let addr = SocketAddr::new(host, port);
     web_server.run(addr).await
 }
 
