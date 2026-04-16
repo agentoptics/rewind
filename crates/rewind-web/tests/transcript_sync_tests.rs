@@ -403,7 +403,7 @@ fn test_rehydrate_old_claude_session_id_key() {
 
 #[test]
 fn test_rehydrate_new_external_session_id_key() {
-    let (state, store, _tmp, hooks) = setup();
+    let (_state, store, _tmp, hooks) = setup();
 
     let mut session = Session::new("new-format-session");
     session.source = SessionSource::Hooks;
@@ -433,7 +433,7 @@ fn test_rehydrate_new_external_session_id_key() {
 
 #[test]
 fn test_rehydrate_skips_sessions_without_any_session_key() {
-    let (state, store, _tmp, hooks) = setup();
+    let (_state, store, _tmp, hooks) = setup();
 
     let mut session = Session::new("no-key-session");
     session.source = SessionSource::Hooks;
@@ -460,7 +460,7 @@ fn test_rehydrate_skips_sessions_without_any_session_key() {
 
 #[test]
 fn test_rehydrate_prefers_new_key_over_old() {
-    let (state, store, _tmp, hooks) = setup();
+    let (_state, store, _tmp, hooks) = setup();
 
     // Session with BOTH keys (shouldn't happen but tests priority)
     let mut session = Session::new("dual-key-session");
@@ -493,7 +493,7 @@ fn test_rehydrate_prefers_new_key_over_old() {
 
 #[test]
 fn test_rehydrate_skips_non_hook_sessions() {
-    let (state, store, _tmp, hooks) = setup();
+    let (_state, store, _tmp, hooks) = setup();
 
     // A proxy session (not hooks) should be skipped
     let mut session = Session::new("proxy-session");

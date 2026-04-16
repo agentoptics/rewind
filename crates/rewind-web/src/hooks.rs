@@ -103,6 +103,7 @@ impl HookIngestionState {
                 None => continue,
             };
 
+            // Already rehydrated (shouldn't happen but be safe)
             if self.sessions.contains_key(&external_session_id) {
                 continue;
             }
@@ -282,6 +283,8 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
 fn ensure_session(state: &AppState, external_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
     // Fast path: session already exists in memory
     if state.hooks.sessions.contains_key(external_session_id) {
+        // Backfill transcript_path and hook_source if missing.
+        // Only acquire the store lock when there's something that could be backfilled.
         if (transcript_path.is_some() || hook_source.is_some())
             && let Some(sess_state) = state.hooks.sessions.get(external_session_id)
             && let Ok(store) = state.store.lock()
@@ -316,6 +319,7 @@ fn ensure_session(state: &AppState, external_session_id: &str, cwd: Option<&str>
         .lock()
         .map_err(|e| anyhow::anyhow!("Session creation lock poisoned: {e}"))?;
 
+    // Double-check after acquiring lock (another thread may have created it)
     if state.hooks.sessions.contains_key(external_session_id) {
         tracing::debug!("Hook session {} created by another thread", &external_session_id[..8.min(external_session_id.len())]);
         return Ok(());
