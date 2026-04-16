@@ -65,6 +65,22 @@ fn seed_step(store: &Arc<Mutex<Store>>, session: &Session, timeline: &Timeline, 
     step
 }
 
+fn seed_tool_step(store: &Arc<Mutex<Store>>, session: &Session, timeline: &Timeline, n: u32, tool_name: &str) -> Step {
+    let s = store.lock().unwrap();
+    let response = json!({"result": "ok"});
+    let res_blob = s.blobs.put_json(&response).unwrap();
+
+    let mut step = Step::new_llm_call(&timeline.id, &session.id, n, "");
+    step.step_type = StepType::ToolCall;
+    step.status = StepStatus::Success;
+    step.tool_name = Some(tool_name.to_string());
+    step.duration_ms = 100;
+    step.response_blob = res_blob;
+    s.create_step(&step).unwrap();
+    s.update_session_stats(&session.id, n, 0).unwrap();
+    step
+}
+
 async fn get_json(app: Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let req = Request::builder()
         .uri(uri)
@@ -449,4 +465,56 @@ async fn test_export_otel_returns_404_for_missing_session() {
         json!({}),
     ).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── tool_name in API responses ──────────────────────────
+
+#[tokio::test]
+async fn test_steps_list_includes_tool_name() {
+    let (app, store, _tmp) = setup();
+    let (session, timeline) = seed_session(&store);
+    seed_tool_step(&store, &session, &timeline, 1, "get_cluster_pods");
+    seed_tool_step(&store, &session, &timeline, 2, "__llm_call__");
+
+    let (status, body) = get_json(app, &format!("/api/sessions/{}/steps", session.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    let steps = body.as_array().unwrap();
+    assert_eq!(steps[0]["tool_name"], "get_cluster_pods");
+    assert_eq!(steps[1]["tool_name"], "__llm_call__");
+}
+
+#[tokio::test]
+async fn test_steps_list_tool_name_null_when_not_set() {
+    let (app, store, _tmp) = setup();
+    let (session, timeline) = seed_session(&store);
+    seed_step(&store, &session, &timeline, 1);
+
+    let (status, body) = get_json(app, &format!("/api/sessions/{}/steps", session.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    let steps = body.as_array().unwrap();
+    assert!(steps[0]["tool_name"].is_null());
+}
+
+#[tokio::test]
+async fn test_step_detail_includes_tool_name() {
+    let (app, store, _tmp) = setup();
+    let (session, timeline) = seed_session(&store);
+    let step = seed_tool_step(&store, &session, &timeline, 1, "list_services");
+
+    let (status, body) = get_json(app, &format!("/api/steps/{}", step.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["tool_name"], "list_services");
+    assert_eq!(body["step_type"], "tool_call");
+}
+
+#[tokio::test]
+async fn test_step_detail_tool_name_null_for_llm_step() {
+    let (app, store, _tmp) = setup();
+    let (session, timeline) = seed_session(&store);
+    let step = seed_step(&store, &session, &timeline, 1);
+
+    let (status, body) = get_json(app, &format!("/api/steps/{}", step.id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["tool_name"].is_null());
+    assert_eq!(body["step_type"], "llm_call");
 }

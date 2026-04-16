@@ -27,6 +27,9 @@ web/dist/
 # Python dist
 dist/
 
+# Use-case implementation docs (per-customer, not public)
+/use-cases/
+
 # Internal research (not public)
 /research/
 

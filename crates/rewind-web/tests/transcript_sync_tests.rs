@@ -24,13 +24,13 @@ fn setup() -> (AppState, Arc<Mutex<Store>>, TempDir, Arc<HookIngestionState>) {
 /// Returns the rewind session_id.
 fn create_hook_session(
     state: &AppState,
-    claude_session_id: &str,
+    external_session_id: &str,
     transcript_path: &str,
 ) -> String {
     let mut session = Session::new("test-session");
     session.source = SessionSource::Hooks;
     session.metadata = serde_json::json!({
-        "claude_session_id": claude_session_id,
+        "external_session_id": external_session_id,
         "transcript_path": transcript_path,
     });
 
@@ -45,7 +45,7 @@ fn create_hook_session(
     }
 
     state.hooks.sessions.insert(
-        claude_session_id.to_string(),
+        external_session_id.to_string(),
         rewind_web::hooks::HookSessionState {
             session_id: rewind_session_id.clone(),
             timeline_id,
@@ -365,4 +365,174 @@ async fn test_sync_thinking_preview() {
     assert_eq!(text_block["text"], "Here is my conclusion.");
     let thinking_block = content.iter().find(|b| b["type"] == "thinking").unwrap();
     assert_eq!(thinking_block["thinking"], "Internal reasoning about the problem...");
+}
+
+#[test]
+fn test_rehydrate_old_claude_session_id_key() {
+    let (state, store, _tmp, hooks) = setup();
+
+    // Simulate a session written with the old "claude_session_id" metadata key
+    // (from before the rename to "external_session_id")
+    let mut session = Session::new("old-format-session");
+    session.source = SessionSource::Hooks;
+    session.metadata = serde_json::json!({
+        "claude_session_id": "old-sess-abc",
+        "hook_source": "claude-code",
+    });
+    let timeline = Timeline::new_root(&session.id);
+    {
+        let s = store.lock().unwrap();
+        s.create_session(&session).unwrap();
+        s.create_timeline(&timeline).unwrap();
+    }
+
+    // Rehydrate — should pick up the old key via fallback
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+
+    // The session should be found by its external session ID
+    assert!(
+        hooks.sessions.contains_key("old-sess-abc"),
+        "rehydrate should find sessions with old claude_session_id metadata key"
+    );
+    let sess_state = hooks.sessions.get("old-sess-abc").unwrap();
+    assert_eq!(sess_state.session_id, session.id);
+}
+
+#[test]
+fn test_rehydrate_new_external_session_id_key() {
+    let (_state, store, _tmp, hooks) = setup();
+
+    let mut session = Session::new("new-format-session");
+    session.source = SessionSource::Hooks;
+    session.metadata = serde_json::json!({
+        "external_session_id": "new-sess-xyz",
+        "hook_source": "ray-agent",
+    });
+    let timeline = Timeline::new_root(&session.id);
+    {
+        let s = store.lock().unwrap();
+        s.create_session(&session).unwrap();
+        s.create_timeline(&timeline).unwrap();
+    }
+
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+
+    assert!(
+        hooks.sessions.contains_key("new-sess-xyz"),
+        "rehydrate should find sessions with new external_session_id key"
+    );
+    let sess_state = hooks.sessions.get("new-sess-xyz").unwrap();
+    assert_eq!(sess_state.session_id, session.id);
+}
+
+#[test]
+fn test_rehydrate_skips_sessions_without_any_session_key() {
+    let (_state, store, _tmp, hooks) = setup();
+
+    let mut session = Session::new("no-key-session");
+    session.source = SessionSource::Hooks;
+    session.metadata = serde_json::json!({
+        "hook_source": "unknown",
+    });
+    let timeline = Timeline::new_root(&session.id);
+    {
+        let s = store.lock().unwrap();
+        s.create_session(&session).unwrap();
+        s.create_timeline(&timeline).unwrap();
+    }
+
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+
+    assert_eq!(
+        hooks.sessions.len(), 0,
+        "sessions without external_session_id or claude_session_id should be skipped"
+    );
+}
+
+#[test]
+fn test_rehydrate_prefers_new_key_over_old() {
+    let (_state, store, _tmp, hooks) = setup();
+
+    // Session with BOTH keys (shouldn't happen but tests priority)
+    let mut session = Session::new("dual-key-session");
+    session.source = SessionSource::Hooks;
+    session.metadata = serde_json::json!({
+        "external_session_id": "new-id",
+        "claude_session_id": "old-id",
+    });
+    let timeline = Timeline::new_root(&session.id);
+    {
+        let s = store.lock().unwrap();
+        s.create_session(&session).unwrap();
+        s.create_timeline(&timeline).unwrap();
+    }
+
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+
+    assert!(
+        hooks.sessions.contains_key("new-id"),
+        "should use external_session_id when both keys present"
+    );
+    assert!(
+        !hooks.sessions.contains_key("old-id"),
+        "should NOT use claude_session_id when external_session_id exists"
+    );
+}
+
+#[test]
+fn test_rehydrate_skips_non_hook_sessions() {
+    let (_state, store, _tmp, hooks) = setup();
+
+    // A proxy session (not hooks) should be skipped
+    let mut session = Session::new("proxy-session");
+    session.source = SessionSource::Proxy;
+    session.metadata = serde_json::json!({
+        "external_session_id": "proxy-sess-1",
+    });
+    let timeline = Timeline::new_root(&session.id);
+    {
+        let s = store.lock().unwrap();
+        s.create_session(&session).unwrap();
+        s.create_timeline(&timeline).unwrap();
+    }
+
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+
+    assert_eq!(
+        hooks.sessions.len(), 0,
+        "proxy sessions should not be rehydrated into hook state"
+    );
+}
+
+#[test]
+fn test_rehydrate_does_not_duplicate_existing() {
+    let (state, store, _tmp, hooks) = setup();
+
+    let rewind_id = create_hook_session(&state, "existing-sess", "");
+
+    // Rehydrate should not duplicate the already-loaded session
+    let count_before = hooks.sessions.len();
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+    assert_eq!(
+        hooks.sessions.len(), count_before,
+        "rehydrate should not duplicate sessions already in memory"
+    );
 }

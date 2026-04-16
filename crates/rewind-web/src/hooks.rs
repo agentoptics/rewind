@@ -31,9 +31,9 @@ pub struct HookEventEnvelope {
     pub payload: serde_json::Value,
 }
 
-/// Inner payload specific to Claude Code hooks.
+/// Inner payload for hook events from any source (Claude Code, Cursor, ray-agent, etc.).
 #[derive(Debug, Deserialize)]
-pub struct ClaudeCodeHookPayload {
+pub struct HookPayload {
     pub session_id: String,
     pub hook_event_name: Option<String>,
     pub tool_name: Option<String>,
@@ -94,13 +94,17 @@ impl HookIngestionState {
                 continue;
             }
 
-            let claude_session_id = match session.metadata.get("claude_session_id").and_then(|v| v.as_str()) {
+            let external_session_id = match session.metadata
+                .get("external_session_id")
+                .or_else(|| session.metadata.get("claude_session_id"))
+                .and_then(|v| v.as_str())
+            {
                 Some(id) => id.to_string(),
                 None => continue,
             };
 
             // Already rehydrated (shouldn't happen but be safe)
-            if self.sessions.contains_key(&claude_session_id) {
+            if self.sessions.contains_key(&external_session_id) {
                 continue;
             }
 
@@ -120,7 +124,7 @@ impl HookIngestionState {
             };
 
             self.sessions.insert(
-                claude_session_id,
+                external_session_id,
                 HookSessionState {
                     session_id: session.id.clone(),
                     timeline_id,
@@ -252,7 +256,7 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
         return Ok(Some("duplicate".to_string()));
     }
 
-    let payload: ClaudeCodeHookPayload = serde_json::from_value(envelope.payload.clone())
+    let payload: HookPayload = serde_json::from_value(envelope.payload.clone())
         .map_err(|e| anyhow::anyhow!("Failed to parse hook payload: {e}"))?;
 
     // Normalize event_type to lowercase for case-insensitive matching.
@@ -276,13 +280,13 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
 /// Ensure a session exists in both the store and in-memory state.
 /// If the session doesn't exist yet (e.g. a non-SessionStart event arrived first),
 /// create it with partial=true metadata.
-fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
+fn ensure_session(state: &AppState, external_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
     // Fast path: session already exists in memory
-    if state.hooks.sessions.contains_key(claude_session_id) {
+    if state.hooks.sessions.contains_key(external_session_id) {
         // Backfill transcript_path and hook_source if missing.
         // Only acquire the store lock when there's something that could be backfilled.
         if (transcript_path.is_some() || hook_source.is_some())
-            && let Some(sess_state) = state.hooks.sessions.get(claude_session_id)
+            && let Some(sess_state) = state.hooks.sessions.get(external_session_id)
             && let Ok(store) = state.store.lock()
             && let Ok(Some(session)) = store.get_session(&sess_state.session_id)
         {
@@ -297,17 +301,17 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
                     meta["hook_source"] = serde_json::json!(src);
                 }
                 let _ = store.update_session_metadata(&sess_state.session_id, &meta);
-                tracing::info!("Backfilled metadata for session {}", &claude_session_id[..8.min(claude_session_id.len())]);
+                tracing::info!("Backfilled metadata for session {}", &external_session_id[..8.min(external_session_id.len())]);
             }
         }
         return Ok(());
     }
 
-    tracing::debug!("Hook session {} not found, creating...", &claude_session_id[..8.min(claude_session_id.len())]);
+    tracing::debug!("Hook session {} not found, creating...", &external_session_id[..8.min(external_session_id.len())]);
 
     // Slow path: need to create session.
     // Use a dedicated per-process mutex to serialize session creation and prevent
-    // concurrent requests from both creating sessions for the same claude_session_id.
+    // concurrent requests from both creating sessions for the same external_session_id.
     use std::sync::OnceLock;
     static SESSION_CREATE_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     let _guard = SESSION_CREATE_LOCK
@@ -316,12 +320,12 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
         .map_err(|e| anyhow::anyhow!("Session creation lock poisoned: {e}"))?;
 
     // Double-check after acquiring lock (another thread may have created it)
-    if state.hooks.sessions.contains_key(claude_session_id) {
-        tracing::debug!("Hook session {} created by another thread", &claude_session_id[..8.min(claude_session_id.len())]);
+    if state.hooks.sessions.contains_key(external_session_id) {
+        tracing::debug!("Hook session {} created by another thread", &external_session_id[..8.min(external_session_id.len())]);
         return Ok(());
     }
 
-    tracing::info!("Creating hook session for {} (partial={})", &claude_session_id[..8.min(claude_session_id.len())], partial);
+    tracing::info!("Creating hook session for {} (partial={})", &external_session_id[..8.min(external_session_id.len())], partial);
 
     let display_name = if let Some(src) = hook_source.filter(|s| *s != "claude-code") {
         // Find hook_source as a path segment anywhere in cwd, use everything after it
@@ -342,12 +346,12 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
             .unwrap_or("session")
             .to_string()
     };
-    let short_id = &claude_session_id[..std::cmp::min(8, claude_session_id.len())];
+    let short_id = &external_session_id[..std::cmp::min(8, external_session_id.len())];
     let session_name = format!("{} ({})", display_name, short_id);
 
     let mut session = Session::new(&session_name);
     session.source = SessionSource::Hooks;
-    let mut meta = serde_json::json!({"claude_session_id": claude_session_id});
+    let mut meta = serde_json::json!({"external_session_id": external_session_id});
     if partial {
         meta["partial"] = serde_json::json!(true);
     }
@@ -375,7 +379,7 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
 
     // Insert into DashMap AFTER successful store operations
     state.hooks.sessions.insert(
-        claude_session_id.to_string(),
+        external_session_id.to_string(),
         HookSessionState {
             session_id: rewind_session_id,
             timeline_id,
@@ -388,7 +392,7 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
     Ok(())
 }
 
-fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload, source: &str) -> anyhow::Result<Option<String>> {
+fn handle_session_start(state: &AppState, payload: &HookPayload, source: &str) -> anyhow::Result<Option<String>> {
     ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), false)?;
 
     let mut revived = false;
@@ -436,7 +440,7 @@ fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload, sourc
     Ok(Some(if revived { "session_revived" } else { "session_created" }.to_string()))
 }
 
-fn handle_pre_tool_use(state: &AppState, payload: &ClaudeCodeHookPayload, source: &str) -> anyhow::Result<Option<String>> {
+fn handle_pre_tool_use(state: &AppState, payload: &HookPayload, source: &str) -> anyhow::Result<Option<String>> {
     ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
@@ -486,7 +490,7 @@ fn handle_pre_tool_use(state: &AppState, payload: &ClaudeCodeHookPayload, source
 
 fn handle_post_tool_use(
     state: &AppState,
-    payload: &ClaudeCodeHookPayload,
+    payload: &HookPayload,
     status: StepStatus,
     source: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -580,7 +584,7 @@ fn handle_post_tool_use(
     Ok(None)
 }
 
-fn handle_user_prompt(state: &AppState, payload: &ClaudeCodeHookPayload, raw_payload: &serde_json::Value, source: &str) -> anyhow::Result<Option<String>> {
+fn handle_user_prompt(state: &AppState, payload: &HookPayload, raw_payload: &serde_json::Value, source: &str) -> anyhow::Result<Option<String>> {
     ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
@@ -619,7 +623,7 @@ fn handle_user_prompt(state: &AppState, payload: &ClaudeCodeHookPayload, raw_pay
     Ok(None)
 }
 
-fn handle_session_end(state: &AppState, payload: &ClaudeCodeHookPayload) -> anyhow::Result<Option<String>> {
+fn handle_session_end(state: &AppState, payload: &HookPayload) -> anyhow::Result<Option<String>> {
     if !state.hooks.sessions.contains_key(&payload.session_id) {
         // Session never started — nothing to close
         return Ok(Some("unknown_session".to_string()));
@@ -658,7 +662,7 @@ fn handle_session_end(state: &AppState, payload: &ClaudeCodeHookPayload) -> anyh
 
 fn handle_generic_event(
     state: &AppState,
-    payload: &ClaudeCodeHookPayload,
+    payload: &HookPayload,
     event_type: &str,
     raw_payload: &serde_json::Value,
     source: &str,

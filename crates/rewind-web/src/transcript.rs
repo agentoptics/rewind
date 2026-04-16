@@ -515,14 +515,14 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
             .sessions
             .iter()
             .map(|entry| {
-                let claude_id = entry.key().clone();
+                let external_id = entry.key().clone();
                 let rewind_id = entry.value().session_id.clone();
-                (rewind_id, claude_id)
+                (rewind_id, external_id)
             })
             .collect()
     };
 
-    for (rewind_session_id, claude_session_id) in &sessions_to_check {
+    for (rewind_session_id, external_session_id) in &sessions_to_check {
         // Read transcript_path, byte offset, hook_source, and discovery state from session metadata (brief lock)
         let (transcript_path, stored_offset, hook_source, discovery_attempted) = {
             let store = match state.store.lock() {
@@ -565,7 +565,7 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                     continue;
                 }
 
-                match discover_cursor_transcript(claude_session_id) {
+                match discover_cursor_transcript(external_session_id) {
                     Some(discovered) => {
                         // Persist the discovered path so we don't scan again
                         if let Ok(store) = state.store.lock()
@@ -577,7 +577,7 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                         }
                         tracing::info!(
                             "Discovered Cursor transcript for session {}: {}",
-                            &claude_session_id[..8.min(claude_session_id.len())],
+                            &external_session_id[..8.min(external_session_id.len())],
                             &discovered
                         );
                         discovered
@@ -614,7 +614,7 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
 
         // Clone session state fields upfront and drop the DashMap guard
         // to avoid holding it across the entire line-processing loop (#5).
-        let (timeline_id, root_span_id, step_counter) = match state.hooks.sessions.get(claude_session_id) {
+        let (timeline_id, root_span_id, step_counter) = match state.hooks.sessions.get(external_session_id) {
             Some(s) => (
                 s.timeline_id.clone(),
                 s.root_span_id.clone(),
@@ -753,7 +753,7 @@ pub fn sync_transcript_steps(state: &AppState) -> anyhow::Result<usize> {
                 }
 
                 // Sync the authoritative counter back to the DashMap (#3)
-                if let Some(sess_state) = state.hooks.sessions.get(claude_session_id) {
+                if let Some(sess_state) = state.hooks.sessions.get(external_session_id) {
                     let local_val = step_counter.load(Ordering::Relaxed);
                     sess_state.step_counter.fetch_max(local_val, Ordering::Relaxed);
                 }

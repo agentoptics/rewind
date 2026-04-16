@@ -57,7 +57,7 @@ enum ClientMessage {
 #[serde(tag = "type")]
 enum ServerMessage {
     #[serde(rename = "step")]
-    Step { data: StepEventData },
+    Step { data: Box<StepEventData> },
     #[serde(rename = "session_update")]
     SessionUpdate { data: SessionUpdateData },
     #[serde(rename = "subscribed")]
@@ -77,6 +77,7 @@ struct StepEventData {
     tokens_in: u64,
     tokens_out: u64,
     error: Option<String>,
+    tool_name: Option<String>,
     response_preview: String,
     created_at: String,
 }
@@ -131,7 +132,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     crate::api::extract_preview_from_store(&store, &step.response_blob)
                                 };
                                 Some(ServerMessage::Step {
-                                    data: StepEventData {
+                                    data: Box::new(StepEventData {
                                         id: step.id.clone(),
                                         step_number: step.step_number,
                                         step_type: step.step_type.as_str().to_string(),
@@ -143,9 +144,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         tokens_in: step.tokens_in,
                                         tokens_out: step.tokens_out,
                                         error: step.error.clone(),
+                                        tool_name: step.tool_name.clone(),
                                         response_preview: preview,
                                         created_at: step.created_at.to_rfc3339(),
-                                    },
+                                    }),
                                 })
                             } else {
                                 None
