@@ -31,9 +31,9 @@ pub struct HookEventEnvelope {
     pub payload: serde_json::Value,
 }
 
-/// Inner payload specific to Claude Code hooks.
+/// Inner payload for hook events from any source (Claude Code, Cursor, ray-agent, etc.).
 #[derive(Debug, Deserialize)]
-pub struct ClaudeCodeHookPayload {
+pub struct HookPayload {
     pub session_id: String,
     pub hook_event_name: Option<String>,
     pub tool_name: Option<String>,
@@ -252,7 +252,7 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
         return Ok(Some("duplicate".to_string()));
     }
 
-    let payload: ClaudeCodeHookPayload = serde_json::from_value(envelope.payload.clone())
+    let payload: HookPayload = serde_json::from_value(envelope.payload.clone())
         .map_err(|e| anyhow::anyhow!("Failed to parse hook payload: {e}"))?;
 
     // Normalize event_type to lowercase for case-insensitive matching.
@@ -388,7 +388,7 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
     Ok(())
 }
 
-fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload, source: &str) -> anyhow::Result<Option<String>> {
+fn handle_session_start(state: &AppState, payload: &HookPayload, source: &str) -> anyhow::Result<Option<String>> {
     ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), false)?;
 
     let mut revived = false;
@@ -436,7 +436,7 @@ fn handle_session_start(state: &AppState, payload: &ClaudeCodeHookPayload, sourc
     Ok(Some(if revived { "session_revived" } else { "session_created" }.to_string()))
 }
 
-fn handle_pre_tool_use(state: &AppState, payload: &ClaudeCodeHookPayload, source: &str) -> anyhow::Result<Option<String>> {
+fn handle_pre_tool_use(state: &AppState, payload: &HookPayload, source: &str) -> anyhow::Result<Option<String>> {
     ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
@@ -486,7 +486,7 @@ fn handle_pre_tool_use(state: &AppState, payload: &ClaudeCodeHookPayload, source
 
 fn handle_post_tool_use(
     state: &AppState,
-    payload: &ClaudeCodeHookPayload,
+    payload: &HookPayload,
     status: StepStatus,
     source: &str,
 ) -> anyhow::Result<Option<String>> {
@@ -580,7 +580,7 @@ fn handle_post_tool_use(
     Ok(None)
 }
 
-fn handle_user_prompt(state: &AppState, payload: &ClaudeCodeHookPayload, raw_payload: &serde_json::Value, source: &str) -> anyhow::Result<Option<String>> {
+fn handle_user_prompt(state: &AppState, payload: &HookPayload, raw_payload: &serde_json::Value, source: &str) -> anyhow::Result<Option<String>> {
     ensure_session(state, &payload.session_id, payload.cwd.as_deref(), payload.transcript_path.as_deref(), Some(source), true)?;
 
     let sess_state = state.hooks.sessions.get(&payload.session_id)
@@ -619,7 +619,7 @@ fn handle_user_prompt(state: &AppState, payload: &ClaudeCodeHookPayload, raw_pay
     Ok(None)
 }
 
-fn handle_session_end(state: &AppState, payload: &ClaudeCodeHookPayload) -> anyhow::Result<Option<String>> {
+fn handle_session_end(state: &AppState, payload: &HookPayload) -> anyhow::Result<Option<String>> {
     if !state.hooks.sessions.contains_key(&payload.session_id) {
         // Session never started — nothing to close
         return Ok(Some("unknown_session".to_string()));
@@ -658,7 +658,7 @@ fn handle_session_end(state: &AppState, payload: &ClaudeCodeHookPayload) -> anyh
 
 fn handle_generic_event(
     state: &AppState,
-    payload: &ClaudeCodeHookPayload,
+    payload: &HookPayload,
     event_type: &str,
     raw_payload: &serde_json::Value,
     source: &str,
