@@ -24,13 +24,13 @@ fn setup() -> (AppState, Arc<Mutex<Store>>, TempDir, Arc<HookIngestionState>) {
 /// Returns the rewind session_id.
 fn create_hook_session(
     state: &AppState,
-    claude_session_id: &str,
+    external_session_id: &str,
     transcript_path: &str,
 ) -> String {
     let mut session = Session::new("test-session");
     session.source = SessionSource::Hooks;
     session.metadata = serde_json::json!({
-        "claude_session_id": claude_session_id,
+        "external_session_id": external_session_id,
         "transcript_path": transcript_path,
     });
 
@@ -45,7 +45,7 @@ fn create_hook_session(
     }
 
     state.hooks.sessions.insert(
-        claude_session_id.to_string(),
+        external_session_id.to_string(),
         rewind_web::hooks::HookSessionState {
             session_id: rewind_session_id.clone(),
             timeline_id,
@@ -365,4 +365,38 @@ async fn test_sync_thinking_preview() {
     assert_eq!(text_block["text"], "Here is my conclusion.");
     let thinking_block = content.iter().find(|b| b["type"] == "thinking").unwrap();
     assert_eq!(thinking_block["thinking"], "Internal reasoning about the problem...");
+}
+
+#[test]
+fn test_rehydrate_old_claude_session_id_key() {
+    let (state, store, _tmp, hooks) = setup();
+
+    // Simulate a session written with the old "claude_session_id" metadata key
+    // (from before the rename to "external_session_id")
+    let mut session = Session::new("old-format-session");
+    session.source = SessionSource::Hooks;
+    session.metadata = serde_json::json!({
+        "claude_session_id": "old-sess-abc",
+        "hook_source": "claude-code",
+    });
+    let timeline = Timeline::new_root(&session.id);
+    {
+        let s = store.lock().unwrap();
+        s.create_session(&session).unwrap();
+        s.create_timeline(&timeline).unwrap();
+    }
+
+    // Rehydrate — should pick up the old key via fallback
+    {
+        let s = store.lock().unwrap();
+        hooks.rehydrate_from_store(&s);
+    }
+
+    // The session should be found by its external session ID
+    assert!(
+        hooks.sessions.contains_key("old-sess-abc"),
+        "rehydrate should find sessions with old claude_session_id metadata key"
+    );
+    let sess_state = hooks.sessions.get("old-sess-abc").unwrap();
+    assert_eq!(sess_state.session_id, session.id);
 }

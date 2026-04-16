@@ -94,13 +94,16 @@ impl HookIngestionState {
                 continue;
             }
 
-            let claude_session_id = match session.metadata.get("claude_session_id").and_then(|v| v.as_str()) {
+            let external_session_id = match session.metadata
+                .get("external_session_id")
+                .or_else(|| session.metadata.get("claude_session_id"))
+                .and_then(|v| v.as_str())
+            {
                 Some(id) => id.to_string(),
                 None => continue,
             };
 
-            // Already rehydrated (shouldn't happen but be safe)
-            if self.sessions.contains_key(&claude_session_id) {
+            if self.sessions.contains_key(&external_session_id) {
                 continue;
             }
 
@@ -120,7 +123,7 @@ impl HookIngestionState {
             };
 
             self.sessions.insert(
-                claude_session_id,
+                external_session_id,
                 HookSessionState {
                     session_id: session.id.clone(),
                     timeline_id,
@@ -276,13 +279,11 @@ fn process_envelope(state: &AppState, envelope: HookEventEnvelope) -> anyhow::Re
 /// Ensure a session exists in both the store and in-memory state.
 /// If the session doesn't exist yet (e.g. a non-SessionStart event arrived first),
 /// create it with partial=true metadata.
-fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
+fn ensure_session(state: &AppState, external_session_id: &str, cwd: Option<&str>, transcript_path: Option<&str>, hook_source: Option<&str>, partial: bool) -> anyhow::Result<()> {
     // Fast path: session already exists in memory
-    if state.hooks.sessions.contains_key(claude_session_id) {
-        // Backfill transcript_path and hook_source if missing.
-        // Only acquire the store lock when there's something that could be backfilled.
+    if state.hooks.sessions.contains_key(external_session_id) {
         if (transcript_path.is_some() || hook_source.is_some())
-            && let Some(sess_state) = state.hooks.sessions.get(claude_session_id)
+            && let Some(sess_state) = state.hooks.sessions.get(external_session_id)
             && let Ok(store) = state.store.lock()
             && let Ok(Some(session)) = store.get_session(&sess_state.session_id)
         {
@@ -297,17 +298,17 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
                     meta["hook_source"] = serde_json::json!(src);
                 }
                 let _ = store.update_session_metadata(&sess_state.session_id, &meta);
-                tracing::info!("Backfilled metadata for session {}", &claude_session_id[..8.min(claude_session_id.len())]);
+                tracing::info!("Backfilled metadata for session {}", &external_session_id[..8.min(external_session_id.len())]);
             }
         }
         return Ok(());
     }
 
-    tracing::debug!("Hook session {} not found, creating...", &claude_session_id[..8.min(claude_session_id.len())]);
+    tracing::debug!("Hook session {} not found, creating...", &external_session_id[..8.min(external_session_id.len())]);
 
     // Slow path: need to create session.
     // Use a dedicated per-process mutex to serialize session creation and prevent
-    // concurrent requests from both creating sessions for the same claude_session_id.
+    // concurrent requests from both creating sessions for the same external_session_id.
     use std::sync::OnceLock;
     static SESSION_CREATE_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     let _guard = SESSION_CREATE_LOCK
@@ -315,13 +316,12 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
         .lock()
         .map_err(|e| anyhow::anyhow!("Session creation lock poisoned: {e}"))?;
 
-    // Double-check after acquiring lock (another thread may have created it)
-    if state.hooks.sessions.contains_key(claude_session_id) {
-        tracing::debug!("Hook session {} created by another thread", &claude_session_id[..8.min(claude_session_id.len())]);
+    if state.hooks.sessions.contains_key(external_session_id) {
+        tracing::debug!("Hook session {} created by another thread", &external_session_id[..8.min(external_session_id.len())]);
         return Ok(());
     }
 
-    tracing::info!("Creating hook session for {} (partial={})", &claude_session_id[..8.min(claude_session_id.len())], partial);
+    tracing::info!("Creating hook session for {} (partial={})", &external_session_id[..8.min(external_session_id.len())], partial);
 
     let display_name = if let Some(src) = hook_source.filter(|s| *s != "claude-code") {
         // Find hook_source as a path segment anywhere in cwd, use everything after it
@@ -342,12 +342,12 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
             .unwrap_or("session")
             .to_string()
     };
-    let short_id = &claude_session_id[..std::cmp::min(8, claude_session_id.len())];
+    let short_id = &external_session_id[..std::cmp::min(8, external_session_id.len())];
     let session_name = format!("{} ({})", display_name, short_id);
 
     let mut session = Session::new(&session_name);
     session.source = SessionSource::Hooks;
-    let mut meta = serde_json::json!({"claude_session_id": claude_session_id});
+    let mut meta = serde_json::json!({"external_session_id": external_session_id});
     if partial {
         meta["partial"] = serde_json::json!(true);
     }
@@ -375,7 +375,7 @@ fn ensure_session(state: &AppState, claude_session_id: &str, cwd: Option<&str>, 
 
     // Insert into DashMap AFTER successful store operations
     state.hooks.sessions.insert(
-        claude_session_id.to_string(),
+        external_session_id.to_string(),
         HookSessionState {
             session_id: rewind_session_id,
             timeline_id,
