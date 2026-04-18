@@ -92,7 +92,7 @@ impl<'a> ReplayEngine<'a> {
             }).collect();
 
             inherited.extend(own_spans);
-            inherited.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+            inherited.sort_by_key(|a| a.started_at);
             Ok(inherited)
         } else {
             self.store.get_spans_by_timeline(timeline_id)
