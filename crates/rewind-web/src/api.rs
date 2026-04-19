@@ -936,10 +936,10 @@ async fn record_llm_call(
             .ok_or_else(|| (StatusCode::NOT_FOUND, "No root timeline".to_string()))?,
     };
 
-    if let Some(ref cid) = body.client_step_id {
-        if let Ok(Some(existing)) = store.get_step(cid) {
-            return Ok((StatusCode::OK, Json(RecordStepResponse { step_number: existing.step_number })));
-        }
+    if let Some(ref cid) = body.client_step_id
+        && let Ok(Some(existing)) = store.get_step(cid)
+    {
+        return Ok((StatusCode::OK, Json(RecordStepResponse { step_number: existing.step_number })));
     }
 
     let step_number = store.next_step_number(&session.id, &timeline_id)
@@ -1013,10 +1013,10 @@ async fn record_tool_call(
             .ok_or_else(|| (StatusCode::NOT_FOUND, "No root timeline".to_string()))?,
     };
 
-    if let Some(ref cid) = body.client_step_id {
-        if let Ok(Some(existing)) = store.get_step(cid) {
-            return Ok((StatusCode::OK, Json(RecordStepResponse { step_number: existing.step_number })));
-        }
+    if let Some(ref cid) = body.client_step_id
+        && let Ok(Some(existing)) = store.get_step(cid)
+    {
+        return Ok((StatusCode::OK, Json(RecordStepResponse { step_number: existing.step_number })));
     }
 
     let step_number = store.next_step_number(&session.id, &timeline_id)
