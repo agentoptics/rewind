@@ -947,13 +947,15 @@ async fn record_llm_call(
         step.id = cid.clone();
     }
 
-    store.create_step(&step).map_err(|e| {
-        if e.to_string().contains("UNIQUE constraint") {
-            (StatusCode::OK, "duplicate".to_string())
-        } else {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+    match store.create_step(&step) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("UNIQUE constraint") => {
+            return Ok((StatusCode::OK, Json(RecordStepResponse { step_number })));
         }
-    })?;
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")));
+        }
+    }
 
     let total_tokens = step.tokens_in + step.tokens_out;
     let _ = store.update_session_stats(&session.id, step_number, total_tokens);
@@ -1017,13 +1019,15 @@ async fn record_tool_call(
         step.id = cid.clone();
     }
 
-    store.create_step(&step).map_err(|e| {
-        if e.to_string().contains("UNIQUE constraint") {
-            (StatusCode::OK, "duplicate".to_string())
-        } else {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+    match store.create_step(&step) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("UNIQUE constraint") => {
+            return Ok((StatusCode::OK, Json(RecordStepResponse { step_number })));
         }
-    })?;
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")));
+        }
+    }
 
     let _ = store.update_session_stats(&session.id, step_number, 0);
 

@@ -250,7 +250,7 @@ async fn test_idempotent_record_with_client_step_id() {
     assert_eq!(s1, StatusCode::CREATED);
     assert_eq!(b1["step_number"].as_u64().unwrap(), 1);
 
-    let (s2, _b2) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+    let (s2, b2) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
         "client_step_id": step_id,
         "request_body": {},
         "response_body": {"content": "hello"},
@@ -258,6 +258,7 @@ async fn test_idempotent_record_with_client_step_id() {
         "duration_ms": 100
     })).await;
     assert_eq!(s2, StatusCode::OK, "duplicate should return 200, not 201");
+    assert!(b2["step_number"].is_number(), "duplicate should return JSON with step_number, got: {b2}");
 }
 
 // ── Fork ───────────────────────────────────────────────────
