@@ -1,0 +1,538 @@
+"""
+Explicit Recording API client — wire-format-agnostic recording, replay, and fork.
+
+Works with any LLM provider (OpenAI, Anthropic, Salesforce LLM Gateway, Ollama, etc.)
+without monkey-patching. The agent explicitly calls record/replay functions.
+
+Thread-safe via contextvars. Error-resilient — recording failures never crash the agent.
+
+Usage:
+    import rewind_agent
+    from rewind_agent.explicit import ExplicitClient
+
+    client = ExplicitClient("http://127.0.0.1:4800")
+
+    with client.session("my-agent"):
+        # Before each LLM call:
+        cached = client.get_replayed_response(request)
+        if cached is not None:
+            response = cached
+        else:
+            response = call_my_llm(request)
+            client.record_llm_call(request, response, model="gpt-4o", duration_ms=500)
+
+    # Or use the tool decorator:
+    @client.cached_tool("get_pods")
+    def get_pods(cluster: str) -> str:
+        return k8s_api.list_pods(cluster)
+"""
+
+import asyncio
+import contextvars
+import functools
+import inspect
+import json
+import logging
+import time
+import urllib.error
+import urllib.request
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, Callable
+
+logger = logging.getLogger("rewind.explicit")
+
+_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "rewind_session_id", default=None
+)
+_timeline_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "rewind_timeline_id", default=None
+)
+_replay_context_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "rewind_replay_context_id", default=None
+)
+
+_TIMEOUT = 2.0
+
+
+class ExplicitClient:
+    """Wire-format-agnostic recording client for the Rewind explicit API."""
+
+    def __init__(self, base_url: str = "http://127.0.0.1:4800"):
+        self.base_url = base_url.rstrip("/")
+        self._enabled = True
+
+    def _post(self, path: str, body: dict) -> dict | None:
+        if not self._enabled:
+            return None
+        url = f"{self.base_url}/api{path}"
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            logger.debug("Rewind POST %s failed: %s", path, e)
+            return None
+
+    def _delete(self, path: str) -> dict | None:
+        if not self._enabled:
+            return None
+        url = f"{self.base_url}/api{path}"
+        req = urllib.request.Request(url, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            logger.debug("Rewind DELETE %s failed: %s", path, e)
+            return None
+
+    def _get(self, path: str) -> dict | list | None:
+        if not self._enabled:
+            return None
+        url = f"{self.base_url}/api{path}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            logger.debug("Rewind GET %s failed: %s", path, e)
+            return None
+
+    # ── Session lifecycle ──────────────────────────────────────
+
+    @contextmanager
+    def session(self, name: str, *, thread_id: str | None = None,
+                metadata: dict | None = None):
+        """Context manager for recording sessions. Thread/async-safe via contextvars."""
+        result = self._post("/sessions/start", {
+            "name": name,
+            **({"thread_id": thread_id} if thread_id else {}),
+            **({"metadata": metadata} if metadata else {}),
+        })
+        if result is None:
+            yield
+            return
+
+        sid = result["session_id"]
+        tid = result["root_timeline_id"]
+        tok_sid = _session_id.set(sid)
+        tok_tid = _timeline_id.set(tid)
+        try:
+            yield
+        except Exception:
+            self._post(f"/sessions/{sid}/end", {"status": "errored"})
+            raise
+        else:
+            self._post(f"/sessions/{sid}/end", {"status": "completed"})
+        finally:
+            _session_id.reset(tok_sid)
+            _timeline_id.reset(tok_tid)
+
+    @asynccontextmanager
+    async def session_async(self, name: str, *, thread_id: str | None = None,
+                            metadata: dict | None = None):
+        """Async context manager for recording sessions."""
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: self._post("/sessions/start", {
+                "name": name,
+                **({"thread_id": thread_id} if thread_id else {}),
+                **({"metadata": metadata} if metadata else {}),
+            })
+        )
+        if result is None:
+            yield
+            return
+
+        sid = result["session_id"]
+        tid = result["root_timeline_id"]
+        tok_sid = _session_id.set(sid)
+        tok_tid = _timeline_id.set(tid)
+        try:
+            yield
+        except Exception:
+            await loop.run_in_executor(
+                None, lambda: self._post(f"/sessions/{sid}/end", {"status": "errored"})
+            )
+            raise
+        else:
+            await loop.run_in_executor(
+                None, lambda: self._post(f"/sessions/{sid}/end", {"status": "completed"})
+            )
+        finally:
+            _session_id.reset(tok_sid)
+            _timeline_id.reset(tok_tid)
+
+    # ── LLM call recording ────────────────────────────────────
+
+    def record_llm_call(
+        self, request: Any, response: Any, *, model: str, duration_ms: int,
+        tokens_in: int = 0, tokens_out: int = 0, client_step_id: str | None = None,
+    ) -> int | None:
+        """Record an LLM call. Returns the step number, or None if recording fails."""
+        sid = _session_id.get()
+        if sid is None:
+            return None
+        body: dict[str, Any] = {
+            "request_body": request,
+            "response_body": response,
+            "model": model,
+            "duration_ms": duration_ms,
+        }
+        if tokens_in:
+            body["tokens_in"] = tokens_in
+        if tokens_out:
+            body["tokens_out"] = tokens_out
+        if client_step_id:
+            body["client_step_id"] = client_step_id
+        tid = _timeline_id.get()
+        if tid:
+            body["timeline_id"] = tid
+        result = self._post(f"/sessions/{sid}/llm-calls", body)
+        return result["step_number"] if result else None
+
+    async def record_llm_call_async(
+        self, request: Any, response: Any, *, model: str, duration_ms: int,
+        tokens_in: int = 0, tokens_out: int = 0, client_step_id: str | None = None,
+    ) -> int | None:
+        """Async variant — runs HTTP in a thread executor to avoid blocking the event loop."""
+        sid = _session_id.get()
+        if sid is None:
+            return None
+        body: dict[str, Any] = {
+            "request_body": request,
+            "response_body": response,
+            "model": model,
+            "duration_ms": duration_ms,
+        }
+        if tokens_in:
+            body["tokens_in"] = tokens_in
+        if tokens_out:
+            body["tokens_out"] = tokens_out
+        if client_step_id:
+            body["client_step_id"] = client_step_id
+        tid = _timeline_id.get()
+        if tid:
+            body["timeline_id"] = tid
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: self._post(f"/sessions/{sid}/llm-calls", body)
+        )
+        return result["step_number"] if result else None
+
+    # ── Tool call recording ───────────────────────────────────
+
+    def record_tool_call(
+        self, tool_name: str, request: Any, response: Any, *,
+        duration_ms: int, error: str | None = None, client_step_id: str | None = None,
+    ) -> int | None:
+        """Record a tool call. Returns the step number, or None if recording fails."""
+        sid = _session_id.get()
+        if sid is None:
+            return None
+        body: dict[str, Any] = {
+            "tool_name": tool_name,
+            "request_body": request,
+            "response_body": response,
+            "duration_ms": duration_ms,
+        }
+        if error:
+            body["error"] = error
+        if client_step_id:
+            body["client_step_id"] = client_step_id
+        tid = _timeline_id.get()
+        if tid:
+            body["timeline_id"] = tid
+        result = self._post(f"/sessions/{sid}/tool-calls", body)
+        return result["step_number"] if result else None
+
+    async def record_tool_call_async(
+        self, tool_name: str, request: Any, response: Any, *,
+        duration_ms: int, error: str | None = None, client_step_id: str | None = None,
+    ) -> int | None:
+        """Async variant."""
+        sid = _session_id.get()
+        if sid is None:
+            return None
+        body: dict[str, Any] = {
+            "tool_name": tool_name,
+            "request_body": request,
+            "response_body": response,
+            "duration_ms": duration_ms,
+        }
+        if error:
+            body["error"] = error
+        if client_step_id:
+            body["client_step_id"] = client_step_id
+        tid = _timeline_id.get()
+        if tid:
+            body["timeline_id"] = tid
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: self._post(f"/sessions/{sid}/tool-calls", body)
+        )
+        return result["step_number"] if result else None
+
+    # ── Replay ────────────────────────────────────────────────
+
+    def get_replayed_response(self, request: Any = None) -> dict | None:
+        """Check if a cached LLM response exists for replay. Returns response_body or None."""
+        sid = _session_id.get()
+        ctx_id = _replay_context_id.get()
+        if sid is None or ctx_id is None:
+            return None
+        body: dict[str, Any] = {"replay_context_id": ctx_id}
+        if request is not None:
+            body["request_body"] = request
+        result = self._post(f"/sessions/{sid}/llm-calls/replay-lookup", body)
+        if result and result.get("hit"):
+            return result.get("response_body")
+        return None
+
+    async def get_replayed_response_async(self, request: Any = None) -> dict | None:
+        """Async variant."""
+        sid = _session_id.get()
+        ctx_id = _replay_context_id.get()
+        if sid is None or ctx_id is None:
+            return None
+        body: dict[str, Any] = {"replay_context_id": ctx_id}
+        if request is not None:
+            body["request_body"] = request
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: self._post(f"/sessions/{sid}/llm-calls/replay-lookup", body)
+        )
+        if result and result.get("hit"):
+            return result.get("response_body")
+        return None
+
+    def get_replayed_tool_response(
+        self, tool_name: str, request: Any = None
+    ) -> dict | None:
+        """Check if a cached tool response exists for replay."""
+        sid = _session_id.get()
+        ctx_id = _replay_context_id.get()
+        if sid is None or ctx_id is None:
+            return None
+        body: dict[str, Any] = {"replay_context_id": ctx_id}
+        if tool_name:
+            body["tool_name"] = tool_name
+        if request is not None:
+            body["request_body"] = request
+        result = self._post(f"/sessions/{sid}/tool-calls/replay-lookup", body)
+        if result and result.get("hit"):
+            return result.get("response_body")
+        return None
+
+    async def get_replayed_tool_response_async(
+        self, tool_name: str, request: Any = None
+    ) -> dict | None:
+        """Async variant."""
+        sid = _session_id.get()
+        ctx_id = _replay_context_id.get()
+        if sid is None or ctx_id is None:
+            return None
+        body: dict[str, Any] = {"replay_context_id": ctx_id}
+        if tool_name:
+            body["tool_name"] = tool_name
+        if request is not None:
+            body["request_body"] = request
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: self._post(f"/sessions/{sid}/tool-calls/replay-lookup", body)
+        )
+        if result and result.get("hit"):
+            return result.get("response_body")
+        return None
+
+    # ── Replay context management ─────────────────────────────
+
+    def start_replay(
+        self, session_id: str, *, from_step: int = 0,
+        timeline_id: str | None = None,
+    ) -> str | None:
+        """Create a replay context. Returns the replay_context_id."""
+        if timeline_id is None:
+            sess = self._get(f"/sessions/{session_id}")
+            if sess and "timelines" in sess:
+                root = next((t for t in sess["timelines"] if t.get("parent_timeline_id") is None), None)
+                timeline_id = root["id"] if root else None
+            if timeline_id is None:
+                timelines = self._get(f"/sessions/{session_id}/timelines")
+                if timelines:
+                    root = next((t for t in timelines if t.get("parent_timeline_id") is None), None)
+                    timeline_id = root["id"] if root else None
+        if timeline_id is None:
+            logger.warning("Could not resolve timeline for session %s", session_id)
+            return None
+        result = self._post("/replay-contexts", {
+            "session_id": session_id,
+            "from_step": from_step,
+            "fork_timeline_id": timeline_id,
+        })
+        if result:
+            ctx_id = result["replay_context_id"]
+            _replay_context_id.set(ctx_id)
+            _session_id.set(session_id)
+            return ctx_id
+        return None
+
+    def stop_replay(self) -> None:
+        """Release the current replay context."""
+        ctx_id = _replay_context_id.get()
+        if ctx_id:
+            self._delete(f"/replay-contexts/{ctx_id}")
+            _replay_context_id.set(None)
+
+    def replay_from_iteration(
+        self, session_id: str, iteration: int,
+        *, timeline_id: str | None = None,
+    ) -> str | None:
+        """Start replay from the Nth LLM call (1-indexed).
+
+        Iteration N = the Nth step where step_type == "llm_call".
+        """
+        tid = timeline_id
+        if tid is None:
+            timelines = self._get(f"/sessions/{session_id}/timelines")
+            if timelines:
+                root = next((t for t in timelines if t.get("parent_timeline_id") is None), None)
+                tid = root["id"] if root else None
+        if tid is None:
+            return None
+
+        steps = self._get(f"/sessions/{session_id}/steps?timeline={tid}")
+        if not steps:
+            return None
+
+        llm_steps = [s for s in steps if s.get("step_type") == "llm_call"]
+        if iteration < 1 or iteration > len(llm_steps):
+            logger.warning("Iteration %d out of range (1-%d)", iteration, len(llm_steps))
+            return None
+
+        from_step = llm_steps[iteration - 1]["step_number"] - 1
+        return self.start_replay(session_id, from_step=from_step, timeline_id=tid)
+
+    # ── Fork ──────────────────────────────────────────────────
+
+    def fork(self, session_id: str, *, at_step: int, label: str,
+             timeline_id: str | None = None) -> str | None:
+        """Fork a session at a specific step. Returns the fork_timeline_id."""
+        body: dict[str, Any] = {"at_step": at_step, "label": label}
+        if timeline_id:
+            body["timeline_id"] = timeline_id
+        result = self._post(f"/sessions/{session_id}/fork", body)
+        return result["fork_timeline_id"] if result else None
+
+    # ── Cached tool decorator ─────────────────────────────────
+
+    def cached_tool(self, name: str | None = None):
+        """Decorator that caches tool results during replay.
+
+        During recording: executes the function and records input/output.
+        During replay: returns cached output if available, otherwise executes live.
+
+        Usage:
+            @client.cached_tool("get_pods")
+            def get_pods(cluster: str) -> str:
+                return k8s_api.list_pods(cluster)
+
+            @client.cached_tool("search")
+            async def search(query: str) -> str:
+                return await api.search(query)
+        """
+        def decorator(func: Callable) -> Callable:
+            tool_name = name or func.__name__
+
+            if inspect.iscoroutinefunction(func):
+                @functools.wraps(func)
+                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    request_data = _serialize_args(args, kwargs)
+                    cached = await self.get_replayed_tool_response_async(
+                        tool_name, request_data
+                    )
+                    if cached is not None:
+                        return cached
+
+                    start = time.monotonic()
+                    error_msg = None
+                    try:
+                        result = await func(*args, **kwargs)
+                    except Exception as e:
+                        error_msg = str(e)
+                        raise
+                    finally:
+                        elapsed_ms = int((time.monotonic() - start) * 1000)
+                        response_data = (
+                            {"error": error_msg} if error_msg
+                            else _serialize_result(result)
+                        )
+                        await self.record_tool_call_async(
+                            tool_name, request_data, response_data,
+                            duration_ms=elapsed_ms,
+                            error=error_msg,
+                        )
+                    return result
+                return async_wrapper
+            else:
+                @functools.wraps(func)
+                def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    request_data = _serialize_args(args, kwargs)
+                    cached = self.get_replayed_tool_response(tool_name, request_data)
+                    if cached is not None:
+                        return cached
+
+                    start = time.monotonic()
+                    error_msg = None
+                    try:
+                        result = func(*args, **kwargs)
+                    except Exception as e:
+                        error_msg = str(e)
+                        raise
+                    finally:
+                        elapsed_ms = int((time.monotonic() - start) * 1000)
+                        response_data = (
+                            {"error": error_msg} if error_msg
+                            else _serialize_result(result)
+                        )
+                        self.record_tool_call(
+                            tool_name, request_data, response_data,
+                            duration_ms=elapsed_ms,
+                            error=error_msg,
+                        )
+                    return result
+                return sync_wrapper
+
+        return decorator
+
+
+def _serialize_args(args: tuple, kwargs: dict) -> dict:
+    """Convert function args to a JSON-serializable dict."""
+    result: dict[str, Any] = {}
+    if args:
+        result["args"] = [_safe_json(a) for a in args]
+    if kwargs:
+        result["kwargs"] = {k: _safe_json(v) for k, v in kwargs.items()}
+    return result
+
+
+def _serialize_result(result: Any) -> Any:
+    """Convert a function result to a JSON-serializable value."""
+    return _safe_json(result)
+
+
+def _safe_json(val: Any) -> Any:
+    """Make a value JSON-serializable."""
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_safe_json(v) for v in val]
+    if isinstance(val, dict):
+        return {str(k): _safe_json(v) for k, v in val.items()}
+    try:
+        json.dumps(val)
+        return val
+    except (TypeError, ValueError):
+        return str(val)
