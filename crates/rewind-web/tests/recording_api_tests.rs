@@ -721,3 +721,250 @@ async fn test_source_label_stored_in_metadata() {
     assert_eq!(session.source, rewind_store::SessionSource::Api);
     assert_eq!(session.metadata["source_label"].as_str().unwrap(), "ray-agent");
 }
+
+// ── Edge Cases ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_record_llm_on_nonexistent_session() {
+    let (app, _store, _tmp) = setup();
+
+    let (status, _) = post_json(&app, "/api/sessions/nonexistent-id/llm-calls", json!({
+        "request_body": {},
+        "response_body": {},
+        "model": "gpt-4o",
+        "duration_ms": 100
+    })).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_record_tool_on_nonexistent_session() {
+    let (app, _store, _tmp) = setup();
+
+    let (status, _) = post_json(&app, "/api/sessions/nonexistent-id/tool-calls", json!({
+        "tool_name": "test",
+        "request_body": {},
+        "response_body": {},
+        "duration_ms": 100
+    })).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_record_with_explicit_timeline_id() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+    let tid = start["root_timeline_id"].as_str().unwrap();
+
+    let (status, body) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+        "timeline_id": tid,
+        "request_body": {},
+        "response_body": {"content": "explicit timeline"},
+        "model": "gpt-4o",
+        "duration_ms": 100
+    })).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["step_number"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_fork_at_step_zero_rejected() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+        "request_body": {},
+        "response_body": {},
+        "model": "gpt-4o",
+        "duration_ms": 100
+    })).await;
+
+    let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/fork"), json!({
+        "at_step": 0,
+        "label": "bad"
+    })).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "fork at step 0 should be rejected");
+}
+
+#[tokio::test]
+async fn test_replay_context_nonexistent_session() {
+    let (app, _store, _tmp) = setup();
+
+    let (status, _) = post_json(&app, "/api/replay-contexts", json!({
+        "session_id": "nonexistent",
+        "from_step": 0,
+        "fork_timeline_id": "nonexistent-tl"
+    })).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_replay_lookup_wrong_session() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, s1) = post_json(&app, "/api/sessions/start", json!({"name": "session-1"})).await;
+    let sid1 = s1["session_id"].as_str().unwrap();
+    let tid1 = s1["root_timeline_id"].as_str().unwrap();
+
+    let (_, s2) = post_json(&app, "/api/sessions/start", json!({"name": "session-2"})).await;
+    let sid2 = s2["session_id"].as_str().unwrap();
+
+    post_json(&app, &format!("/api/sessions/{sid1}/llm-calls"), json!({
+        "request_body": {}, "response_body": {}, "model": "gpt-4o", "duration_ms": 100
+    })).await;
+
+    let (_, ctx) = post_json(&app, "/api/replay-contexts", json!({
+        "session_id": sid1,
+        "from_step": 0,
+        "fork_timeline_id": tid1
+    })).await;
+    let ctx_id = ctx["replay_context_id"].as_str().unwrap();
+
+    let (status, _) = post_json(&app, &format!("/api/sessions/{sid2}/llm-calls/replay-lookup"), json!({
+        "replay_context_id": ctx_id
+    })).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "context belongs to session-1, not session-2");
+}
+
+#[tokio::test]
+async fn test_replay_lookup_nonexistent_context() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls/replay-lookup"), json!({
+        "replay_context_id": "nonexistent-ctx"
+    })).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_delete_nonexistent_replay_context() {
+    let (app, _store, _tmp) = setup();
+
+    let (status, body) = delete_json(&app, "/api/replay-contexts/nonexistent-id").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["released"].as_bool().unwrap(), false, "should report not found");
+}
+
+#[tokio::test]
+async fn test_end_session_errored_status() {
+    let (app, store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "errored"})).await;
+
+    let s = store.lock().unwrap();
+    let session = s.get_session(sid).unwrap().unwrap();
+    assert_eq!(session.status, SessionStatus::Failed);
+}
+
+#[tokio::test]
+async fn test_end_session_failed_status() {
+    let (app, store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "failed"})).await;
+
+    let s = store.lock().unwrap();
+    let session = s.get_session(sid).unwrap().unwrap();
+    assert_eq!(session.status, SessionStatus::Failed);
+}
+
+#[tokio::test]
+async fn test_end_session_unknown_status_maps_to_completed() {
+    let (app, store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/end"), json!({
+        "status": "banana"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let s = store.lock().unwrap();
+    let session = s.get_session(sid).unwrap().unwrap();
+    assert_eq!(session.status, SessionStatus::Completed, "unknown status should map to Completed");
+}
+
+#[tokio::test]
+async fn test_tool_idempotency_with_client_step_id() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    let step_id = uuid::Uuid::new_v4().to_string();
+
+    let (s1, b1) = post_json(&app, &format!("/api/sessions/{sid}/tool-calls"), json!({
+        "client_step_id": step_id,
+        "tool_name": "get_pods",
+        "request_body": {"cluster": "x"},
+        "response_body": {"pods": []},
+        "duration_ms": 100
+    })).await;
+    assert_eq!(s1, StatusCode::CREATED);
+    assert_eq!(b1["step_number"].as_u64().unwrap(), 1);
+
+    let (s2, b2) = post_json(&app, &format!("/api/sessions/{sid}/tool-calls"), json!({
+        "client_step_id": step_id,
+        "tool_name": "get_pods",
+        "request_body": {"cluster": "x"},
+        "response_body": {"pods": []},
+        "duration_ms": 100
+    })).await;
+    assert_eq!(s2, StatusCode::OK, "duplicate tool call should return 200");
+    assert_eq!(b2["step_number"].as_u64().unwrap(), 1, "should return original step_number");
+}
+
+#[tokio::test]
+async fn test_start_session_with_metadata_preserved() {
+    let (app, store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({
+        "name": "test",
+        "metadata": {"question": "how is mulesoft?", "cluster": "dev1"}
+    })).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    let s = store.lock().unwrap();
+    let session = s.get_session(sid).unwrap().unwrap();
+    assert_eq!(session.metadata["question"].as_str().unwrap(), "how is mulesoft?");
+    assert_eq!(session.metadata["cluster"].as_str().unwrap(), "dev1");
+}
+
+#[tokio::test]
+async fn test_source_label_with_metadata_both_preserved() {
+    let (app, store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({
+        "name": "test",
+        "source": "ray-agent",
+        "metadata": {"env": "dev1"}
+    })).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    let s = store.lock().unwrap();
+    let session = s.get_session(sid).unwrap().unwrap();
+    assert_eq!(session.metadata["env"].as_str().unwrap(), "dev1");
+    assert_eq!(session.metadata["source_label"].as_str().unwrap(), "ray-agent",
+        "source_label should be added on top of provided metadata");
+}
