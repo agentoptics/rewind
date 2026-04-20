@@ -363,5 +363,92 @@ class TestAsyncSession(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestEnsureSession(unittest.TestCase):
+    """Tests for ensure_session (one session per conversation)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), MockRewindHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.client = ExplicitClient(f"http://127.0.0.1:{cls.port}")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        _reset_mock()
+        _session_id.set(None)
+        _timeline_id.set(None)
+        self.client._session_cache.clear()
+
+    def test_ensure_session_creates_on_first_call(self):
+        self.client.ensure_session("conv-1", name="test-agent")
+        sid = _session_id.get()
+        self.assertIsNotNone(sid)
+        self.assertIn("conv-1", self.client._session_cache)
+
+    def test_ensure_session_reuses_on_second_call(self):
+        self.client.ensure_session("conv-1")
+        sid1 = _session_id.get()
+
+        _session_id.set(None)
+        self.client.ensure_session("conv-1")
+        sid2 = _session_id.get()
+
+        self.assertEqual(sid1, sid2, "second call should reuse same session")
+        self.assertEqual(len(MockRewindHandler.sessions), 1, "only one session created on server")
+
+    def test_ensure_session_different_conversations(self):
+        self.client.ensure_session("conv-1")
+        sid1 = _session_id.get()
+
+        self.client.ensure_session("conv-2")
+        sid2 = _session_id.get()
+
+        self.assertNotEqual(sid1, sid2, "different conversations should get different sessions")
+        self.assertEqual(len(self.client._session_cache), 2)
+
+    def test_ensure_session_sets_contextvars(self):
+        self.client.ensure_session("conv-1")
+        self.assertIsNotNone(_session_id.get())
+        self.assertIsNotNone(_timeline_id.get())
+
+    def test_clear_session_resets_contextvars(self):
+        self.client.ensure_session("conv-1")
+        self.assertIsNotNone(_session_id.get())
+
+        self.client.clear_session()
+        self.assertIsNone(_session_id.get())
+        self.assertIsNone(_timeline_id.get())
+
+    def test_cache_eviction(self):
+        import rewind_agent.explicit as mod
+        old_ttl = mod._SESSION_CACHE_TTL
+        mod._SESSION_CACHE_TTL = 0  # expire immediately
+
+        self.client.ensure_session("conv-old")
+        self.assertIn("conv-old", self.client._session_cache)
+
+        import time
+        time.sleep(0.01)
+        self.client.ensure_session("conv-new")
+        self.assertNotIn("conv-old", self.client._session_cache, "stale entry should be evicted")
+        self.assertIn("conv-new", self.client._session_cache)
+
+        mod._SESSION_CACHE_TTL = old_ttl
+
+    def test_ensure_session_then_record(self):
+        self.client.ensure_session("conv-1")
+        step = self.client.record_llm_call(
+            {"msg": "hi"}, {"content": "hello"},
+            model="gpt-4o", duration_ms=100,
+        )
+        self.assertEqual(step, 1)
+        self.assertEqual(len(MockRewindHandler.recorded_steps), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
