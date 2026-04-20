@@ -548,29 +548,38 @@ async fn test_llm_gateway_format_preview() {
     assert!(preview.contains("Mulesoft cluster is healthy"), "LLM Gateway format should produce a useful preview, got: {preview}");
 }
 
-// ── Status Guard ───────────────────────────────────────────
+// ── Status Guard (auto-reopen Completed, reject Failed) ───
 
 #[tokio::test]
-async fn test_record_on_ended_session_rejected() {
-    let (app, _store, _tmp) = setup();
+async fn test_auto_reopen_completed_session_for_llm() {
+    let (app, store, _tmp) = setup();
 
     let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
     let sid = start["session_id"].as_str().unwrap();
 
-    post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "completed"})).await;
-
-    let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
-        "request_body": {},
-        "response_body": {},
-        "model": "gpt-4o",
-        "duration_ms": 100
+    post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+        "request_body": {}, "response_body": {"content": "step1"},
+        "model": "gpt-4o", "duration_ms": 100
     })).await;
 
-    assert_eq!(status, StatusCode::CONFLICT, "recording on ended session should be rejected");
+    post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "completed"})).await;
+
+    // Recording on completed session should auto-reopen and succeed
+    let (status, body) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+        "request_body": {}, "response_body": {"content": "step2"},
+        "model": "gpt-4o", "duration_ms": 100
+    })).await;
+
+    assert_eq!(status, StatusCode::CREATED, "completed session should auto-reopen");
+    assert_eq!(body["step_number"].as_u64().unwrap(), 2, "step numbering should continue");
+
+    let s = store.lock().unwrap();
+    let session = s.get_session(sid).unwrap().unwrap();
+    assert_eq!(session.status, SessionStatus::Recording, "session should be back to Recording");
 }
 
 #[tokio::test]
-async fn test_record_tool_on_ended_session_rejected() {
+async fn test_auto_reopen_completed_session_for_tool() {
     let (app, _store, _tmp) = setup();
 
     let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
@@ -579,13 +588,45 @@ async fn test_record_tool_on_ended_session_rejected() {
     post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "completed"})).await;
 
     let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/tool-calls"), json!({
-        "tool_name": "test",
-        "request_body": {},
-        "response_body": {},
+        "tool_name": "test", "request_body": {}, "response_body": {},
         "duration_ms": 100
     })).await;
 
-    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(status, StatusCode::CREATED, "completed session should auto-reopen for tools too");
+}
+
+#[tokio::test]
+async fn test_record_on_failed_session_rejected() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "errored"})).await;
+
+    let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+        "request_body": {}, "response_body": {},
+        "model": "gpt-4o", "duration_ms": 100
+    })).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "recording on failed session should be rejected");
+}
+
+#[tokio::test]
+async fn test_record_tool_on_failed_session_rejected() {
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+
+    post_json(&app, &format!("/api/sessions/{sid}/end"), json!({"status": "failed"})).await;
+
+    let (status, _) = post_json(&app, &format!("/api/sessions/{sid}/tool-calls"), json!({
+        "tool_name": "test", "request_body": {}, "response_body": {},
+        "duration_ms": 100
+    })).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "recording on failed session should be rejected");
 }
 
 // ── Idempotency (corrected) ────────────────────────────────
