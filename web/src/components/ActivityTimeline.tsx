@@ -78,7 +78,7 @@ export function buildLanes(
   steps: StepResponse[],
   session: Session,
 ): Lane[] {
-  const isHookSession = session.source === 'hooks'
+  const isHookSession = session.source === 'hooks' || session.source === 'api'
 
   if (spans.length > 0) {
     const agentEntries = flattenAgentSpans(spans, false)
