@@ -54,12 +54,16 @@ _replay_context_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _TIMEOUT = 2.0
 
 
+_SESSION_CACHE_TTL = 7200  # 2 hours
+
+
 class ExplicitClient:
     """Wire-format-agnostic recording client for the Rewind explicit API."""
 
     def __init__(self, base_url: str = "http://127.0.0.1:4800"):
         self.base_url = base_url.rstrip("/")
         self._enabled = True
+        self._session_cache: dict[str, tuple[str, str, float]] = {}
 
     def _post(self, path: str, body: dict) -> dict | None:
         if not self._enabled:
@@ -164,6 +168,52 @@ class ExplicitClient:
         finally:
             _session_id.reset(tok_sid)
             _timeline_id.reset(tok_tid)
+
+    # ── Long-lived sessions (one per conversation) ─────────────
+
+    def ensure_session(self, conversation_id: str, *, name: str | None = None,
+                       metadata: dict | None = None) -> None:
+        """Create or reuse a Rewind session for this conversation.
+
+        First call for a conversation_id creates a new session and caches the mapping.
+        Subsequent calls reuse the cached session. Sets contextvars internally.
+        Cache entries evict after 2 hours of inactivity.
+        """
+        now = time.monotonic()
+        self._evict_stale_sessions(now)
+
+        if conversation_id in self._session_cache:
+            sid, tid, _ = self._session_cache[conversation_id]
+            self._session_cache[conversation_id] = (sid, tid, now)
+            _session_id.set(sid)
+            _timeline_id.set(tid)
+            return
+
+        session_name = name or f"session-{conversation_id[:8]}"
+        result = self._post("/sessions/start", {
+            "name": session_name,
+            **({"metadata": metadata} if metadata else {}),
+        })
+        if result is None:
+            return
+
+        sid = result["session_id"]
+        tid = result["root_timeline_id"]
+        self._session_cache[conversation_id] = (sid, tid, now)
+        _session_id.set(sid)
+        _timeline_id.set(tid)
+
+    def clear_session(self) -> None:
+        """Reset session contextvars. Call after processing a request if needed."""
+        _session_id.set(None)
+        _timeline_id.set(None)
+
+    def _evict_stale_sessions(self, now: float) -> None:
+        """Remove cache entries older than _SESSION_CACHE_TTL."""
+        stale = [k for k, (_, _, ts) in self._session_cache.items()
+                 if now - ts > _SESSION_CACHE_TTL]
+        for k in stale:
+            del self._session_cache[k]
 
     # ── LLM call recording ────────────────────────────────────
 

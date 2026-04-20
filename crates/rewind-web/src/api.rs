@@ -922,10 +922,15 @@ async fn record_llm_call(
     let session = resolve_session(&store, &id)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
 
-    if session.status != rewind_store::SessionStatus::Recording {
-        return Err((StatusCode::CONFLICT, format!(
-            "Session is '{}', not recording", session.status.as_str()
-        )));
+    match session.status {
+        rewind_store::SessionStatus::Recording => {}
+        rewind_store::SessionStatus::Completed => {
+            store.update_session_status(&session.id, rewind_store::SessionStatus::Recording)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+        }
+        status => return Err((StatusCode::CONFLICT, format!(
+            "Session is '{}', cannot record", status.as_str()
+        ))),
     }
 
     let timeline_id = match body.timeline_id {
@@ -999,10 +1004,15 @@ async fn record_tool_call(
     let session = resolve_session(&store, &id)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
 
-    if session.status != rewind_store::SessionStatus::Recording {
-        return Err((StatusCode::CONFLICT, format!(
-            "Session is '{}', not recording", session.status.as_str()
-        )));
+    match session.status {
+        rewind_store::SessionStatus::Recording => {}
+        rewind_store::SessionStatus::Completed => {
+            store.update_session_status(&session.id, rewind_store::SessionStatus::Recording)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+        }
+        status => return Err((StatusCode::CONFLICT, format!(
+            "Session is '{}', cannot record", status.as_str()
+        ))),
     }
 
     let timeline_id = match body.timeline_id {
