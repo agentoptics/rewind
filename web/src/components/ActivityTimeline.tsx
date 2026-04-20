@@ -78,8 +78,6 @@ export function buildLanes(
   steps: StepResponse[],
   session: Session,
 ): Lane[] {
-  const isHookSession = session.source === 'hooks'
-
   if (spans.length > 0) {
     const agentEntries = flattenAgentSpans(spans, false)
     if (agentEntries.length === 0 && steps.length === 0) return []
@@ -116,50 +114,41 @@ export function buildLanes(
 
   if (steps.length === 0) return []
 
-  if (isHookSession) {
-    const groups: Record<string, StepResponse[]> = {}
-    const order: string[] = []
+  // Group steps by type: LLM calls, prompts, and each tool in its own lane.
+  // This applies to all spanless sessions (hooks, api, direct, otel_import).
+  const groups: Record<string, StepResponse[]> = {}
+  const order: string[] = []
 
-    for (const step of steps) {
-      let key: string
-      if (step.step_type === 'llm_call') key = 'LLM Calls'
-      else if (step.step_type === 'user_prompt') key = 'Prompts'
-      else if (step.tool_name) key = step.tool_name
-      else key = step.step_type_label || 'Other'
+  for (const step of steps) {
+    let key: string
+    if (step.step_type === 'llm_call') key = 'LLM Calls'
+    else if (step.step_type === 'user_prompt') key = 'Prompts'
+    else if (step.tool_name) key = step.tool_name
+    else key = step.step_type_label || 'Other'
 
-      if (!groups[key]) {
-        groups[key] = []
-        order.push(key)
-      }
-      groups[key].push(step)
+    if (!groups[key]) {
+      groups[key] = []
+      order.push(key)
     }
-
-    const priorityOrder = ['LLM Calls', 'Prompts']
-    const sorted = [
-      ...priorityOrder.filter(k => groups[k]),
-      ...order.filter(k => !priorityOrder.includes(k)),
-    ]
-
-    return sorted.map((key, i) => ({
-      id: `lane-${key}`,
-      label: key,
-      isSubLane: !['LLM Calls', 'Prompts'].includes(key),
-      steps: groups[key],
-      color: key === 'LLM Calls' ? 'bg-purple-500'
-        : key === 'Prompts' ? 'bg-cyan-500'
-        : getToolColor(key),
-      positionMode: 'step_number' as const,
-    }))
+    groups[key].push(step)
   }
 
-  return [{
-    id: 'main',
-    label: 'Main',
-    isSubLane: false,
-    steps: [...steps].sort((a, b) => a.step_number - b.step_number),
-    color: LANE_COLORS[0],
-    positionMode: 'created_at',
-  }]
+  const priorityOrder = ['LLM Calls', 'Prompts']
+  const sorted = [
+    ...priorityOrder.filter(k => groups[k]),
+    ...order.filter(k => !priorityOrder.includes(k)),
+  ]
+
+  return sorted.map((key, i) => ({
+    id: `lane-${key}`,
+    label: key,
+    isSubLane: !['LLM Calls', 'Prompts'].includes(key),
+    steps: groups[key],
+    color: key === 'LLM Calls' ? 'bg-purple-500'
+      : key === 'Prompts' ? 'bg-cyan-500'
+      : getToolColor(key),
+    positionMode: 'step_number' as const,
+  }))
 }
 
 // --- Viewport state (zoom/pan) ---
