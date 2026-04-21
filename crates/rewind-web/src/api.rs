@@ -688,12 +688,13 @@ async fn export_otel(
             "No endpoint provided. Pass 'endpoint' in request body or set REWIND_OTEL_ENDPOINT.".to_string(),
         ));
     }
-    if !export_endpoint.starts_with("http://") && !export_endpoint.starts_with("https://") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Endpoint must start with http:// or https://".to_string(),
-        ));
-    }
+
+    // SSRF guard: reject endpoints that resolve to private/reserved IP ranges
+    // (RFC 1918, link-local, loopback, cloud metadata, etc.) before we open any
+    // outbound connection. See docs/security-audit.md §CRITICAL-01.
+    crate::url_guard::validate_export_endpoint(&export_endpoint)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Extract session data synchronously (Store is not Send)
     let data = {
