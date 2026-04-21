@@ -1992,6 +1992,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "mime_guess",
+ "percent-encoding",
  "rand",
  "reqwest",
  "rewind-assert",

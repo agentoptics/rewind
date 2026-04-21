@@ -25,6 +25,7 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 subtle = "2"
 rand = "0.9"
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

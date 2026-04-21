@@ -198,7 +198,12 @@ fn extract_token(req: &Request<axum::body::Body>) -> Option<String> {
     {
         for pair in q.split('&') {
             if let Some(v) = pair.strip_prefix("token=") {
-                let decoded = percent_decode(v);
+                // RFC 3986 percent-decoding only — do NOT translate `+` to space
+                // (that's application/x-www-form-urlencoded, not query-string
+                // semantics for a token that may legitimately contain `+`).
+                let decoded = percent_encoding::percent_decode_str(v)
+                    .decode_utf8_lossy()
+                    .into_owned();
                 if !decoded.is_empty() {
                     return Some(decoded);
                 }
@@ -207,40 +212,6 @@ fn extract_token(req: &Request<axum::body::Body>) -> Option<String> {
     }
 
     None
-}
-
-/// Minimal percent-decoder for query-param token values. Handles `%XX` and `+`.
-fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                match (hi, lo) {
-                    (Some(h), Some(l)) => {
-                        out.push(((h << 4) | l) as u8 as char);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i] as char);
-                        i += 1;
-                    }
-                }
-            }
-            b => {
-                out.push(b as char);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

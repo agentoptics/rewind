@@ -62,13 +62,24 @@ async fn run_allows_loopback_bind_without_token() {
     let store = Store::open(tmp.path()).unwrap();
     let server = WebServer::new_standalone(store);
 
-    // Loopback + no token: should bind, run, and serve /_rewind/health.
+    // Loopback + no token: should bind, run, and serve both the health probe
+    // AND the normally-protected routes without requiring a token (backward-
+    // compat claim). Probing only /_rewind/health isn't enough because that
+    // route is open regardless of auth config.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
     tokio::spawn(async move { let _ = server.run(addr).await; });
     assert_server_alive(addr).await;
+
+    let (status, _) = http_get(addr, "/api/sessions", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "loopback + no token must leave /api/sessions open (backward compat)"
+    );
+
     // Hold the tempdir for the test duration.
     drop(tmp);
 }
@@ -294,6 +305,38 @@ async fn ws_upgrade_rejects_wrong_token() {
     let (addr, _tmp) = spawn_server_with_token(Some("secret".into())).await;
     let status = ws_upgrade_status(addr, "/api/ws?token=wrong").await;
     assert_eq!(status, 401, "WS upgrade with wrong ?token= should be 401");
+}
+
+/// RFC 3986 percent-decoding: `+` is a literal `+` in a URI query string (it is
+/// only a space in `application/x-www-form-urlencoded` bodies). A token that
+/// contains `+` must round-trip through the query parameter unchanged.
+#[tokio::test]
+async fn ws_upgrade_accepts_token_with_literal_plus() {
+    let token = "abc+def+ghi";
+    let (addr, _tmp) = spawn_server_with_token(Some(token.into())).await;
+    // Raw `+` in the query string — not percent-encoded.
+    let status = ws_upgrade_status(addr, &format!("/api/ws?token={token}")).await;
+    assert_eq!(
+        status, 101,
+        "WS upgrade with raw `+` in token must succeed (RFC 3986 query semantics)"
+    );
+}
+
+/// Percent-escaped characters at the very end of the query string must decode
+/// correctly. Earlier hand-rolled decoder had an off-by-one that dropped a
+/// trailing `%XX`.
+#[tokio::test]
+async fn ws_upgrade_accepts_token_with_trailing_percent_escape() {
+    // Token ends with a literal `/`, which must be percent-encoded to `%2F` in
+    // the URL. If the decoder's bounds check is off by one, this becomes
+    // "abc%2F" literal (wrong) instead of "abc/" (correct) and auth fails.
+    let token = "abc/";
+    let (addr, _tmp) = spawn_server_with_token(Some(token.into())).await;
+    let status = ws_upgrade_status(addr, "/api/ws?token=abc%2F").await;
+    assert_eq!(
+        status, 101,
+        "WS upgrade with trailing percent-escape must decode correctly"
+    );
 }
 
 /// Send a minimal WebSocket upgrade GET and return the numeric status code.
