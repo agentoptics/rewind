@@ -16,14 +16,17 @@
 //! the common case of an attacker directly targeting `169.254.169.254` or
 //! `localhost`.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Reject an endpoint URL if it's malformed, non-HTTP(S), or resolves to any
 /// non-public-unicast IP.
 ///
 /// Returns the same URL on success so callers can chain. Returns a
 /// user-facing error string on failure — safe to put in an HTTP response.
-pub fn validate_export_endpoint(url: &str) -> Result<&str, String> {
+///
+/// This is an **async** function because DNS resolution uses `tokio::net::lookup_host`
+/// to avoid blocking the tokio worker thread.
+pub async fn validate_export_endpoint(url: &str) -> Result<(), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("Endpoint must start with http:// or https://".to_string());
     }
@@ -35,14 +38,24 @@ pub fn validate_export_endpoint(url: &str) -> Result<&str, String> {
     // resolution entirely, so we validate the literal directly.
     if let Ok(ip) = host.parse::<IpAddr>() {
         reject_if_blocked(ip)?;
-        return Ok(url);
+        return Ok(());
     }
 
-    // Resolve the hostname. Reject if any resolved IP is blocked — callers
-    // shouldn't be talking to names that round-robin between public and
-    // internal hosts.
-    let addrs: Vec<_> = (host.as_str(), port)
-        .to_socket_addrs()
+    // Reject hosts that look like numeric IPs but don't parse as IpAddr.
+    // These are non-standard forms (octal like 0177.0.0.1, hex like 0x7f000001,
+    // decimal like 2130706433) that may be interpreted differently by the platform
+    // getaddrinfo and the downstream HTTP client — a parser-differential SSRF bypass.
+    if looks_like_numeric_ip(&host) {
+        return Err(format!(
+            "Endpoint host '{host}' looks like a non-standard IP literal (rejected for SSRF safety)"
+        ));
+    }
+
+    // Resolve the hostname (async to avoid blocking the tokio worker thread).
+    // Reject if any resolved IP is blocked — callers shouldn't be talking to
+    // names that round-robin between public and internal hosts.
+    let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+        .await
         .map_err(|e| format!("Failed to resolve endpoint host '{host}': {e}"))?
         .collect();
 
@@ -54,7 +67,14 @@ pub fn validate_export_endpoint(url: &str) -> Result<&str, String> {
         reject_if_blocked(addr.ip())?;
     }
 
-    Ok(url)
+    Ok(())
+}
+
+/// True if a host string looks like a numeric IP but didn't parse as `IpAddr`.
+/// Catches octal (0177.0.0.1), hex (0x7f000001), and decimal (2130706433) forms.
+fn looks_like_numeric_ip(host: &str) -> bool {
+    let h = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X")).unwrap_or(host);
+    !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b'x' || b == b'X')
 }
 
 fn reject_if_blocked(ip: IpAddr) -> Result<(), String> {
@@ -98,6 +118,8 @@ fn is_blocked_v6(ip: Ipv6Addr) -> bool {
         || is_v4_mapped(ip)            // ::ffff:0:0/96 — check the embedded v4
         || is_v4_compatible_deprecated(ip) // ::/96 (deprecated but dangerous)
         || is_documentation_v6(ip)     // 2001:db8::/32
+        || is_teredo(ip)              // 2001:0000::/32 — embeds routable v4
+        || is_6to4(ip)                // 2002::/16 — encodes destination v4
 }
 
 fn is_shared_address_space(ip: Ipv4Addr) -> bool {
@@ -148,6 +170,19 @@ fn is_v4_compatible_deprecated(ip: Ipv6Addr) -> bool {
     false
 }
 
+fn is_teredo(ip: Ipv6Addr) -> bool {
+    // 2001:0000::/32 — Teredo tunneling embeds a routable IPv4 that a relay
+    // will connect to. Different from 2001:0db8::/32 (documentation).
+    let s = ip.segments();
+    s[0] == 0x2001 && s[1] == 0x0000
+}
+
+fn is_6to4(ip: Ipv6Addr) -> bool {
+    // 2002::/16 — encodes the destination IPv4 directly in bits 16-47.
+    // An attacker can embed 127.0.0.1 as 2002:7f00:0001::.
+    ip.segments()[0] == 0x2002
+}
+
 fn is_documentation_v6(ip: Ipv6Addr) -> bool {
     // 2001:db8::/32
     let segs = ip.segments();
@@ -163,6 +198,13 @@ fn parse_host_port(url: &str) -> Option<(String, u16)> {
     let (authority, _) = rest.split_once('/').unwrap_or((rest, ""));
     let authority = authority.split('?').next().unwrap_or(authority);
     let authority = authority.split('#').next().unwrap_or(authority);
+
+    // Reject backslash, percent-encoding, and control chars in the authority.
+    // These create parser-differential SSRF bypasses: the guard and the
+    // downstream HTTP client may disagree on what host they're connecting to.
+    if authority.bytes().any(|b| b == b'\\' || b == b'%' || b < 0x20) {
+        return None;
+    }
 
     // Strip userinfo@ if present (rare but legal)
     let authority = match authority.rsplit_once('@') {
@@ -343,47 +385,153 @@ mod tests {
         assert!(parse_host_port("https://:8080").is_none());
     }
 
-    // ── End-to-end ──
+    // ── Teredo / 6to4 transition mechanisms ──
 
     #[test]
-    fn e2e_rejects_aws_metadata_literal() {
+    fn blocks_teredo() {
+        // 2001:0000:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx — embeds a routable v4.
+        assert!(blocked("2001:0000:4136:e378:8000:63bf:3fff:fdd2"));
+        assert!(blocked("2001:0:4136:e378:8000:63bf:3fff:fdd2"));
+    }
+
+    #[test]
+    fn blocks_6to4() {
+        // 2002:7f00:0001:: embeds 127.0.0.1 directly.
+        assert!(blocked("2002:7f00:0001::"));
+        // 2002:a9fe:a9fe:: embeds 169.254.169.254.
+        assert!(blocked("2002:a9fe:a9fe::"));
+    }
+
+    // ── Numeric IP bypass ──
+
+    #[test]
+    fn rejects_octal_ip_form() {
+        assert!(looks_like_numeric_ip("0177.0.0.1"));
+    }
+
+    #[test]
+    fn rejects_hex_ip_form() {
+        assert!(looks_like_numeric_ip("0x7f000001"));
+    }
+
+    #[test]
+    fn rejects_decimal_ip_form() {
+        assert!(looks_like_numeric_ip("2130706433"));
+    }
+
+    #[test]
+    fn allows_real_hostname() {
+        assert!(!looks_like_numeric_ip("example.com"));
+        assert!(!looks_like_numeric_ip("otel-collector.internal"));
+    }
+
+    // ── Authority sanitization ──
+
+    #[test]
+    fn rejects_backslash_in_authority() {
+        assert!(parse_host_port(r"http://evil.com\@127.0.0.1/").is_none());
+    }
+
+    #[test]
+    fn rejects_percent_in_authority() {
+        assert!(parse_host_port("http://evil.com%5C@127.0.0.1/").is_none());
+    }
+
+    #[test]
+    fn rejects_control_chars_in_authority() {
+        assert!(parse_host_port("http://evil.com\x00@127.0.0.1/").is_none());
+        assert!(parse_host_port("http://evil.com\t@127.0.0.1/").is_none());
+    }
+
+    // ── End-to-end (async) ──
+
+    #[tokio::test]
+    async fn e2e_rejects_aws_metadata_literal() {
         let err = validate_export_endpoint("http://169.254.169.254/latest/meta-data/")
+            .await
             .expect_err("should reject AWS metadata");
         assert!(err.contains("169.254.169.254"), "error should name the IP: {err}");
         assert!(err.contains("SSRF"), "error should mention SSRF: {err}");
     }
 
-    #[test]
-    fn e2e_rejects_loopback() {
-        assert!(validate_export_endpoint("http://127.0.0.1:9000").is_err());
-        assert!(validate_export_endpoint("http://localhost:9000").is_err());
-        assert!(validate_export_endpoint("http://[::1]:9000").is_err());
+    #[tokio::test]
+    async fn e2e_rejects_loopback() {
+        assert!(validate_export_endpoint("http://127.0.0.1:9000").await.is_err());
+        assert!(validate_export_endpoint("http://[::1]:9000").await.is_err());
     }
 
-    #[test]
-    fn e2e_rejects_non_http_scheme() {
-        let err = validate_export_endpoint("ftp://example.com").unwrap_err();
+    #[tokio::test]
+    async fn e2e_rejects_non_http_scheme() {
+        let err = validate_export_endpoint("ftp://example.com").await.unwrap_err();
         assert!(err.contains("http://"), "error should mention scheme requirement: {err}");
     }
 
-    #[test]
-    fn e2e_rejects_rfc1918() {
-        assert!(validate_export_endpoint("http://10.0.0.1:4318/v1/traces").is_err());
-        assert!(validate_export_endpoint("https://192.168.1.1").is_err());
-        assert!(validate_export_endpoint("http://172.16.5.5:4317").is_err());
+    #[tokio::test]
+    async fn e2e_rejects_rfc1918() {
+        assert!(validate_export_endpoint("http://10.0.0.1:4318/v1/traces").await.is_err());
+        assert!(validate_export_endpoint("https://192.168.1.1").await.is_err());
+        assert!(validate_export_endpoint("http://172.16.5.5:4317").await.is_err());
     }
 
-    #[test]
-    fn e2e_rejects_malformed() {
-        assert!(validate_export_endpoint("http://").is_err());
-        assert!(validate_export_endpoint("not-a-url").is_err());
+    #[tokio::test]
+    async fn e2e_rejects_malformed() {
+        assert!(validate_export_endpoint("http://").await.is_err());
+        assert!(validate_export_endpoint("not-a-url").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn e2e_rejects_octal_ip_bypass() {
+        assert!(
+            validate_export_endpoint("http://0177.0.0.1:4318").await.is_err(),
+            "octal 0177.0.0.1 must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_rejects_hex_ip_bypass() {
+        assert!(
+            validate_export_endpoint("http://0x7f000001:4318").await.is_err(),
+            "hex 0x7f000001 must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_rejects_decimal_ip_bypass() {
+        assert!(
+            validate_export_endpoint("http://2130706433:4318").await.is_err(),
+            "decimal 2130706433 must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_rejects_teredo_v6() {
+        assert!(
+            validate_export_endpoint("http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]:4318").await.is_err(),
+            "Teredo address must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_rejects_6to4_v6() {
+        assert!(
+            validate_export_endpoint("http://[2002:7f00:0001::]:4318").await.is_err(),
+            "6to4 address encoding 127.0.0.1 must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_rejects_backslash_bypass() {
+        assert!(
+            validate_export_endpoint(r"http://evil.com\@127.0.0.1/v1/traces").await.is_err(),
+            "backslash in authority must be rejected"
+        );
     }
 
     // Live DNS test: accepts a public hostname. Marked #[ignore] because CI
     // runs in sandboxes that may block DNS or the wider internet.
-    #[test]
+    #[tokio::test]
     #[ignore]
-    fn e2e_allows_public_host() {
-        validate_export_endpoint("https://example.com").unwrap();
+    async fn e2e_allows_public_host() {
+        validate_export_endpoint("https://example.com").await.unwrap();
     }
 }

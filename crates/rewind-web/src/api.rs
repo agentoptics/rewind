@@ -693,6 +693,7 @@ async fn export_otel(
     // (RFC 1918, link-local, loopback, cloud metadata, etc.) before we open any
     // outbound connection. See docs/security-audit.md §CRITICAL-01.
     crate::url_guard::validate_export_endpoint(&export_endpoint)
+        .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Extract session data synchronously (Store is not Send)
