@@ -443,7 +443,11 @@ async fn test_export_otel_returns_501_when_unconfigured() {
 
 #[tokio::test]
 async fn test_export_otel_returns_404_for_missing_session() {
-    // Setup with otel_config present
+    // Setup with a *public* otel_config endpoint so the SSRF validator passes
+    // and the handler reaches the session-lookup code path. Uses a TEST-NET
+    // address (192.0.2.x is RFC 5737 documentation space — would be blocked
+    // by the SSRF validator, so use a real-looking public IP).
+    // Picked 1.1.1.1 because it's universally public-unicast and routable.
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let store = Arc::new(Mutex::new(store));
@@ -453,7 +457,7 @@ async fn test_export_otel_returns_404_for_missing_session() {
         event_tx,
         hooks: Arc::new(HookIngestionState::new()),
         otel_config: Some(rewind_web::OtelConfig {
-            endpoint: "http://127.0.0.1:1".to_string(),
+            endpoint: "http://1.1.1.1:4318".to_string(),
             protocol: rewind_otel::export::Protocol::Http,
             headers: vec![],
         }),
@@ -467,6 +471,92 @@ async fn test_export_otel_returns_404_for_missing_session() {
         json!({}),
     ).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// SSRF guard: endpoints resolving to loopback/private IPs must be rejected
+/// with 400 BEFORE any outbound connection attempt (and before session lookup).
+/// See docs/security-audit.md §CRITICAL-01.
+#[tokio::test]
+async fn test_export_otel_rejects_loopback_endpoint() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let (event_tx, _) = tokio::sync::broadcast::channel::<StoreEvent>(16);
+    let state = AppState {
+        store: store.clone(),
+        event_tx,
+        hooks: Arc::new(HookIngestionState::new()),
+        otel_config: None,
+        auth_token: None,
+    };
+    let app = Router::new().nest("/api", rewind_web::api_routes(state));
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/api/sessions/any/export/otel",
+        json!({"endpoint": "http://127.0.0.1:4318/v1/traces"}),
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // (Body content is a plain error string, not JSON — verified via
+    // unit tests in `crate::url_guard::tests`.)
+}
+
+/// SSRF guard: AWS/GCP/Azure metadata IP must be rejected.
+#[tokio::test]
+async fn test_export_otel_rejects_cloud_metadata_endpoint() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let (event_tx, _) = tokio::sync::broadcast::channel::<StoreEvent>(16);
+    let state = AppState {
+        store: store.clone(),
+        event_tx,
+        hooks: Arc::new(HookIngestionState::new()),
+        otel_config: None,
+        auth_token: None,
+    };
+    let app = Router::new().nest("/api", rewind_web::api_routes(state));
+
+    let (status, _) = post_json(
+        app,
+        "/api/sessions/any/export/otel",
+        json!({"endpoint": "http://169.254.169.254/latest/meta-data/"}),
+    ).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// SSRF guard: RFC 1918 private range rejection.
+#[tokio::test]
+async fn test_export_otel_rejects_rfc1918_endpoint() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    let (event_tx, _) = tokio::sync::broadcast::channel::<StoreEvent>(16);
+    let state = AppState {
+        store: store.clone(),
+        event_tx,
+        hooks: Arc::new(HookIngestionState::new()),
+        otel_config: None,
+        auth_token: None,
+    };
+    let app = Router::new().nest("/api", rewind_web::api_routes(state));
+
+    for endpoint in [
+        "http://10.0.0.1:4318",
+        "http://192.168.1.1:4318",
+        "http://172.16.5.5:4318",
+    ] {
+        let (status, _) = post_json(
+            app.clone(),
+            "/api/sessions/any/export/otel",
+            json!({"endpoint": endpoint}),
+        ).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "RFC 1918 endpoint {endpoint} should be rejected"
+        );
+    }
 }
 
 // ── tool_name in API responses ──────────────────────────

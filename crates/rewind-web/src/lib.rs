@@ -6,6 +6,7 @@ pub mod otlp_ingest;
 mod polling;
 mod spa;
 pub mod transcript;
+pub mod url_guard;
 mod ws;
 
 use anyhow::Result;
