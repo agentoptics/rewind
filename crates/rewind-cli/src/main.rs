@@ -198,6 +198,15 @@ enum Commands {
         /// Host/IP to bind to (use 0.0.0.0 for container/K8s deployments)
         #[arg(long, default_value = "127.0.0.1", env = "REWIND_BIND_HOST")]
         host: std::net::IpAddr,
+
+        /// Bearer token required for API/WS access. Also: REWIND_AUTH_TOKEN env var,
+        /// or auto-generated at ~/.rewind/auth_token on first non-loopback start.
+        #[arg(long, env = "REWIND_AUTH_TOKEN")]
+        auth_token: Option<String>,
+
+        /// Disable authentication entirely. Dangerous on non-loopback binds.
+        #[arg(long)]
+        no_auth: bool,
     },
 
     /// Evaluation system — datasets, evaluators, experiments, comparisons
@@ -707,7 +716,7 @@ async fn main() -> Result<()> {
             EvalAction::Show { experiment } => cmd_eval_show(experiment),
             EvalAction::Score { session, evaluator, timeline, compare_timelines, expected, json, force } => cmd_eval_score(session, evaluator, timeline, compare_timelines, expected, json, force),
         },
-        Commands::Web { port, host } => cmd_web(port, host).await,
+        Commands::Web { port, host, auth_token, no_auth } => cmd_web(port, host, auth_token, no_auth).await,
         Commands::Query { sql, tables } => cmd_query(sql, tables),
         Commands::Hooks { action } => match action {
             HooksAction::Install { port } => cmd_hooks_install(port).await,
@@ -775,11 +784,74 @@ async fn cmd_record(name: String, port: u16, upstream: String, replay: bool, web
     }
 }
 
-async fn cmd_web(port: u16, host: std::net::IpAddr) -> Result<()> {
+async fn cmd_web(
+    port: u16,
+    host: std::net::IpAddr,
+    auth_token: Option<String>,
+    no_auth: bool,
+) -> Result<()> {
     let store = Store::open_default()?;
-    let web_server = WebServer::new_standalone(store);
     let addr = SocketAddr::new(host, port);
+
+    let token = resolve_web_auth_token(auth_token, no_auth, addr)?;
+    let web_server = WebServer::new_standalone(store)
+        .with_auth_token(token)
+        .with_auth_disabled(no_auth);
     web_server.run(addr).await
+}
+
+/// Resolve the auth token for the web server, handling the `--no-auth` escape hatch
+/// and auto-generating on non-loopback binds. Prints a startup banner to stderr.
+fn resolve_web_auth_token(
+    cli_flag: Option<String>,
+    no_auth: bool,
+    addr: SocketAddr,
+) -> Result<Option<String>> {
+    if no_auth {
+        if !addr.ip().is_loopback() {
+            eprintln!(
+                "\x1b[33m⚠ Authentication DISABLED on non-loopback address {} — exposing the Rewind API with no access control.\x1b[0m",
+                addr
+            );
+        }
+        return Ok(None);
+    }
+
+    let is_loopback = addr.ip().is_loopback();
+
+    // On loopback, only attach a token if the user explicitly provided one
+    // (via --auth-token or REWIND_AUTH_TOKEN). Avoids forcing local dev users
+    // to read the generated token file on every request.
+    if is_loopback {
+        if let Some(tok) = cli_flag.filter(|t| !t.is_empty()) {
+            eprintln!("⏪ Auth enabled (token prefix: {}…)", &tok[..8.min(tok.len())]);
+            return Ok(Some(tok));
+        }
+        return Ok(None);
+    }
+
+    // Non-loopback: resolve or generate a token.
+    let data_dir = rewind_store::dirs_path();
+    let (token, source) = rewind_web::auth::resolve_or_generate_token(cli_flag, &data_dir)?;
+
+    match source {
+        rewind_web::auth::TokenSource::Generated(ref path) => {
+            eprintln!();
+            eprintln!("\x1b[36;1m⏪ Rewind auth token generated\x1b[0m");
+            eprintln!("  token:  \x1b[33m{}\x1b[0m", token);
+            eprintln!("  stored: {} (chmod 0600)", path.display());
+            eprintln!("  use:    Authorization: Bearer <token>");
+            eprintln!();
+        }
+        _ => {
+            eprintln!(
+                "⏪ Auth enabled (token prefix: {}…)",
+                &token[..8.min(token.len())]
+            );
+        }
+    }
+
+    Ok(Some(token))
 }
 
 async fn cmd_replay(session_ref: String, from_step: u32, upstream: String, port: u16, label: String) -> Result<()> {

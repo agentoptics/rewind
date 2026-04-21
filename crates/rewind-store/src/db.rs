@@ -1692,7 +1692,8 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
 }
 
-fn dirs_path() -> PathBuf {
+/// Resolve the Rewind data directory, honoring `REWIND_DATA` then `$HOME/.rewind`.
+pub fn dirs_path() -> PathBuf {
     if let Ok(data_dir) = std::env::var("REWIND_DATA") {
         return PathBuf::from(data_dir);
     }
