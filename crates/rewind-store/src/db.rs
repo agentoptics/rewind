@@ -1633,21 +1633,29 @@ impl Store {
 
     /// Execute a read-only SQL query and return column names + rows as strings.
     /// Rejects any statement that is not a SELECT (prevents mutations).
+    /// Execute a read-only SQL query. Only SELECT and WITH are allowed.
+    /// Rejects mutations even when disguised as CTEs (`WITH x AS (...) DELETE`).
+    /// See docs/security-audit.md §HIGH-02.
     pub fn query_raw(&self, sql: &str) -> Result<QueryResult> {
         let trimmed = sql.trim_start();
         let first_word = trimmed.split_whitespace().next().unwrap_or("");
         if !first_word.eq_ignore_ascii_case("SELECT")
             && !first_word.eq_ignore_ascii_case("WITH")
-            && !first_word.eq_ignore_ascii_case("EXPLAIN")
-            && !first_word.eq_ignore_ascii_case("PRAGMA")
         {
             anyhow::bail!(
-                "Only SELECT, WITH, EXPLAIN, and PRAGMA queries are allowed. Got: '{}'",
+                "Only SELECT and WITH queries are allowed. Got: '{}'. \
+                 Use pragma_table_info() for schema introspection.",
                 first_word
             );
         }
 
         let mut stmt = self.conn.prepare(sql)?;
+
+        // Defense-in-depth: SQLite's own read-only classifier catches
+        // `WITH x AS (...) DELETE/UPDATE/INSERT` which passes the first-word check.
+        if !stmt.readonly() {
+            anyhow::bail!("Query is not read-only (detected mutation via CTE or subquery)");
+        }
         let col_count = stmt.column_count();
         let columns: Vec<String> = (0..col_count)
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
@@ -1683,6 +1691,46 @@ impl Store {
             .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Safe wrapper around `PRAGMA table_info(table_name)`.
+    /// Returns columns as (cid, name, type, notnull, dflt_value, pk).
+    /// The table name is validated against `list_tables()` to prevent injection.
+    pub fn pragma_table_info(&self, table_name: &str) -> Result<QueryResult> {
+        let valid_tables = self.list_tables()?;
+        if !valid_tables.iter().any(|t| t == table_name) {
+            anyhow::bail!("Unknown table: '{}'", table_name);
+        }
+
+        // Safe: table_name is validated against sqlite_master output above.
+        let sql = format!("PRAGMA table_info({})", table_name);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let col_count = stmt.column_count();
+        let columns: Vec<String> = (0..col_count)
+            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
+            .collect();
+
+        let rows = stmt.query_map([], |row| {
+            let mut values = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let val: rusqlite::types::Value = row.get(i)?;
+                let s = match val {
+                    rusqlite::types::Value::Null => "NULL".to_string(),
+                    rusqlite::types::Value::Integer(n) => n.to_string(),
+                    rusqlite::types::Value::Real(f) => format!("{:.2}", f),
+                    rusqlite::types::Value::Text(s) => s,
+                    rusqlite::types::Value::Blob(b) => format!("<blob {}B>", b.len()),
+                };
+                values.push(s);
+            }
+            Ok(values)
+        })?;
+
+        let data: Vec<Vec<String>> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(QueryResult { columns, rows: data })
     }
 }
 

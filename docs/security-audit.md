@@ -61,7 +61,8 @@
 **Fix progress (2026-04-21):**
 - ✅ **CRITICAL-02** fixed in [PR #133](https://github.com/agentoptics/rewind/pull/133): non-loopback binds now fail-closed unless an auth token is configured; Bearer-token middleware on API/WS/OTLP routes; constant-time comparison; token auto-gen at `~/.rewind/auth_token`; UI wired up for Bearer + WS `?token=` (scoped to `/api/ws` only).
 - ✅ **MEDIUM-09** fixed (WS path) in PR #133: the WebSocket `?token=` fallback is the closing of the WS-CSRF vector on authenticated deployments; loopback-no-token is unchanged (documented, acceptable per threat model).
-- ✅ **CRITICAL-01** fixed in PR #134 (*this PR*): SSRF guard rejects endpoints resolving to private / loopback / link-local / unique-local-v6 / multicast / documentation / benchmarking / shared-address-space / v4-mapped-v6 ranges before any outbound connection is made. Unit tests cover 23 IP-range categories; integration tests cover the live `POST /api/sessions/{id}/export/otel` path returning 400 for loopback, cloud metadata, and RFC 1918 targets. One known limitation: DNS rebinding between validation and `opentelemetry-otlp`'s connection-time re-resolution — documented inline in `crates/rewind-web/src/url_guard.rs`, requires upstream API changes to fully close.
+- ✅ **CRITICAL-01** fixed in [PR #134](https://github.com/agentoptics/rewind/pull/134): SSRF guard rejects endpoints resolving to private / loopback / link-local / unique-local-v6 / multicast / documentation / benchmarking / shared-address-space / v4-mapped-v6 / Teredo / 6to4 ranges. Also rejects non-standard numeric IP forms (octal, hex, decimal) and authority-level parser-differential attacks (backslash, percent-encoding, control chars). Async DNS resolution. DNS rebinding documented as residual risk.
+- ✅ **HIGH-01, HIGH-02, HIGH-06, MEDIUM-06, MEDIUM-08** fixed in PR #135: blob redaction pipeline (request bodies stripped of sensitive JSON keys, response bodies stripped of secret patterns via regex), hop-by-hop header denylist, `query_raw` locked to SELECT/WITH only, safe `pragma_table_info()` replacement.
 
 ---
 
@@ -175,6 +176,7 @@ The `--host` flag / `REWIND_BIND_HOST` env var allows binding to `0.0.0.0`, expl
 
 ### HIGH-01: Proxy Forwards Authorization Headers to Attacker-Controlled Upstream
 
+**Status:** ✅ **Fixed in PR #135** — hop-by-hop header denylist (transfer-encoding, te, trailer, upgrade, proxy-authorization, proxy-connection, keep-alive, expect) applied before upstream forwarding. Request blobs are redacted via `redact::redact_request_body` before blob store write (strips api_key, authorization, x-api-key, token, password, secret, credentials, etc.).
 **Severity:** High
 **Affected component:** `crates/rewind-proxy/src/lib.rs:387-394`
 **OWASP:** A07:2021 Identification and Authentication Failures
@@ -210,6 +212,7 @@ for (key, value) in parts.headers.iter() {
 
 ### HIGH-02: `query_raw` Allows State-Mutating PRAGMAs
 
+**Status:** ✅ **Fixed in PR #135** — `PRAGMA` and `EXPLAIN` removed from the `query_raw` allowlist; only `SELECT` and `WITH` are now permitted. A new `pragma_table_info()` method validates the table name against `sqlite_master` before constructing the query, replacing the unsafe `format!` pattern in the CLI.
 **Severity:** High
 **Affected component:** `crates/rewind-store/src/db.rs:1636-1677`
 **OWASP:** A03:2021 Injection
@@ -323,6 +326,7 @@ When enabled, a network attacker can MITM the connection to the LLM API, interce
 
 ### HIGH-06: Proxy Records Upstream Response Bodies Verbatim
 
+**Status:** ✅ **Fixed in PR #135** — response blobs are run through `redact::redact_secrets` before blob store write. Regex-based redaction catches OpenAI keys (sk-...), AWS access key IDs (AKIA...), Bearer tokens, and long hex tokens (40+ chars). Applied in both buffered and streaming response paths.
 **Severity:** High
 **Affected component:** `crates/rewind-proxy/src/lib.rs:452-516` (`handle_buffered_response`), `crates/rewind-proxy/src/lib.rs:520-639` (`handle_streaming_response`)
 **OWASP:** A02:2021 Cryptographic Failures
@@ -463,6 +467,7 @@ No rate limiting exists on any endpoint. The only resource constraint is the 10M
 
 ### MEDIUM-06: Recorded Blobs Contain LLM API Keys in Plaintext
 
+**Status:** ✅ **Fixed in PR #135** — request bodies redacted via `redact::redact_request_body` (strips sensitive JSON keys), response bodies via `redact::redact_secrets` (regex patterns for common secret shapes). Both applied before `blobs.put`.
 **Severity:** Medium
 **Affected component:** `crates/rewind-proxy/src/lib.rs:387-394`
 **OWASP:** A02:2021 Cryptographic Failures
@@ -499,6 +504,7 @@ The concern is pattern fragility: the HTML template is built via string concaten
 
 ### MEDIUM-08: Proxy Forwards Hop-by-Hop Headers
 
+**Status:** ✅ **Fixed in PR #135** — `redact::HOP_BY_HOP_HEADERS` denylist applied in the proxy header-forwarding loop. All 8 RFC 7230 §6.1 hop-by-hop headers are now stripped before upstream forwarding.
 **Severity:** Medium
 **Affected component:** `crates/rewind-proxy/src/lib.rs:387-394`
 
@@ -744,8 +750,7 @@ Reordered per peer review — fail-closed auth first, then SSRF, then redaction,
 |---|----------------|-----------|--------|--------|
 | **1** | Fail closed on non-loopback bind without `--auth-token`. Generate default token on first run. Apply to HTTP + WebSocket + OTLP ingest routes. | CRITICAL-02, MEDIUM-09 (WS) | Medium | ✅ Shipped (PR #133) |
 | **2** | Deny private/link-local/loopback in `export/otel` endpoint resolver | CRITICAL-01 | Small | ✅ Shipped (PR #134) |
-| **3** | Strip `Authorization`/`x-api-key` before blob write; add hop-by-hop header denylist; run regex redactor over request AND response blobs | HIGH-01, HIGH-06, MEDIUM-06, MEDIUM-08 | Medium | ⏳ Next |
-| **4** | Remove `PRAGMA` from `query_raw` allowlist; eliminate `format!` construction of SQL | HIGH-02 | Small | ⏳ Planned |
+| **3+4** | Blob redaction (request + response), hop-by-hop header denylist, `query_raw` lockdown, `pragma_table_info()` | HIGH-01, HIGH-02, HIGH-06, MEDIUM-06, MEDIUM-08 | Medium | ✅ Shipped (PR #135) |
 | **5** | `chmod 0700 ~/.rewind/` and `0600` on files in `Store::open()`; add owner check on `REWIND_DATA` path | HIGH-03, LOW-07 | Small | ⏳ Planned |
 
 ### Next Tier (P2 — ship after the above)
