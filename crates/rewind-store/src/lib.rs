@@ -4,5 +4,5 @@ pub mod blobs;
 pub mod pricing;
 pub mod export;
 
-pub use db::{Store, QueryResult};
+pub use db::{dirs_path, Store, QueryResult};
 pub use models::*;

@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod eval_api;
 pub mod hooks;
 pub mod otlp_ingest;
@@ -80,11 +81,17 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<StoreEvent>,
     pub hooks: Arc<HookIngestionState>,
     pub otel_config: Option<OtelConfig>,
+    /// Bearer token required for protected routes. `None` disables auth (loopback default).
+    /// See `auth::resolve_or_generate_token` and `docs/security-audit.md` §CRITICAL-02.
+    pub auth_token: Option<String>,
 }
 
 pub struct WebServer {
     state: AppState,
     dev_mode: bool,
+    /// Operator explicitly disabled auth via `--no-auth`. Skips the fail-closed
+    /// check on non-loopback bind. See `docs/security-audit.md` §CRITICAL-02.
+    auth_disabled: bool,
 }
 
 impl WebServer {
@@ -96,8 +103,10 @@ impl WebServer {
                 event_tx,
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
+                auth_token: None,
             },
             dev_mode: false,
+            auth_disabled: false,
         }
     }
 
@@ -110,8 +119,10 @@ impl WebServer {
                 event_tx,
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
+                auth_token: None,
             },
             dev_mode: false,
+            auth_disabled: false,
         }
     }
 
@@ -120,11 +131,36 @@ impl WebServer {
         self
     }
 
+    /// Set the bearer token. `None` leaves auth unconfigured (loopback default).
+    pub fn with_auth_token(mut self, token: Option<String>) -> Self {
+        self.state.auth_token = token;
+        self
+    }
+
+    /// Explicitly disable auth. Overrides the fail-closed check on non-loopback
+    /// bind. Use only when auth is provided by an upstream layer (e.g. a sidecar).
+    pub fn with_auth_disabled(mut self, disabled: bool) -> Self {
+        self.auth_disabled = disabled;
+        self
+    }
+
     pub fn state(&self) -> AppState {
         self.state.clone()
     }
 
     pub async fn run(self, addr: SocketAddr) -> Result<()> {
+        // Fail-closed: refuse to start on a non-loopback bind without an auth token.
+        // `with_auth_disabled(true)` is the explicit opt-out. See docs/security-audit.md §CRITICAL-02.
+        if !addr.ip().is_loopback() && self.state.auth_token.is_none() && !self.auth_disabled {
+            anyhow::bail!(
+                "Refusing to bind to non-loopback address {} without an auth token.\n\
+                 Provide one via --auth-token, REWIND_AUTH_TOKEN, or accept the \
+                 auto-generated token at ~/.rewind/auth_token (delete the file to regenerate).\n\
+                 Use --no-auth to explicitly disable authentication (dangerous).",
+                addr
+            );
+        }
+
         let poll_store = self.state.store.clone();
         let poll_tx = self.state.event_tx.clone();
 
@@ -298,13 +334,24 @@ impl WebServer {
 
         let otlp_routes = otlp_ingest::routes(self.state.clone());
 
-        let app = Router::new()
-            .route("/_rewind/health", axum::routing::get(rewind_health))
+        // Compose protected routes (state-bearing APIs, WS, OTLP ingest) and
+        // attach auth middleware at this layer. `/_rewind/health` and the SPA
+        // static fallback remain open so liveness probes and the UI shell can
+        // load without a token.
+        let protected = Router::new()
             .merge(otlp_routes)
             .nest("/api", api_routes)
             .nest("/api/eval", eval_routes)
             .nest("/api/hooks", hook_routes)
-            .merge(ws_route);
+            .merge(ws_route)
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                auth::auth_middleware,
+            ));
+
+        let app = Router::new()
+            .route("/_rewind/health", axum::routing::get(rewind_health))
+            .merge(protected);
 
         if self.dev_mode {
             app
