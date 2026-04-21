@@ -1,3 +1,5 @@
+pub mod redact;
+
 /// Re-export pricing from rewind-store for backwards compatibility.
 pub use rewind_store::pricing;
 
@@ -285,8 +287,9 @@ async fn handle_request(
         .unwrap_or_else(|| "unknown".to_string());
 
     let request_hash = {
+        let redacted = redact::redact_request_body(&body_bytes);
         let store = state.store.lock().unwrap();
-        store.blobs.put(&body_bytes).unwrap_or_default()
+        store.blobs.put(&redacted).unwrap_or_default()
     };
 
     let streaming = is_stream_request(&body_bytes);
@@ -385,11 +388,16 @@ async fn handle_request(
     );
 
     for (key, value) in parts.headers.iter() {
-        if key == "host" || key == "connection" || key == "content-length" {
+        let name = key.as_str();
+        if name == "host" || name == "connection" || name == "content-length" {
+            continue;
+        }
+        // RFC 7230 §6.1: proxies must not forward hop-by-hop headers.
+        if redact::is_hop_by_hop(name) {
             continue;
         }
         if let Ok(v) = value.to_str() {
-            upstream_req = upstream_req.header(key.as_str(), v);
+            upstream_req = upstream_req.header(name, v);
         }
     }
 
@@ -464,8 +472,9 @@ async fn handle_buffered_response(
     let (tokens_in, tokens_out) = extract_usage(&resp_bytes);
 
     let response_hash = {
+        let redacted = redact::redact_secrets(&resp_bytes);
         let store = state.store.lock().unwrap();
-        store.blobs.put(&resp_bytes).unwrap_or_default()
+        store.blobs.put(&redacted).unwrap_or_default()
     };
 
     let step_status = if status.is_success() { StepStatus::Success } else { StepStatus::Error };
@@ -601,8 +610,9 @@ async fn handle_streaming_response(
         let resp_bytes = serde_json::to_vec(&synthetic_response).unwrap_or_default();
 
         let response_hash = {
+            let redacted = redact::redact_secrets(&resp_bytes);
             let s = store.lock().unwrap();
-            s.blobs.put(&resp_bytes).unwrap_or_default()
+            s.blobs.put(&redacted).unwrap_or_default()
         };
 
         // Also store raw SSE for forensics

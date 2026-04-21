@@ -1587,7 +1587,7 @@ fn cmd_query(sql: Option<String>, tables: bool) -> Result<()> {
         for name in &table_names {
             println!("  {}", name.white().bold());
             // Show column info via PRAGMA
-            let result = store.query_raw(&format!("PRAGMA table_info({})", name))?;
+            let result = store.pragma_table_info(name)?;
             for row in &result.rows {
                 // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
                 let col_name = row.get(1).map(|s| s.as_str()).unwrap_or("?");

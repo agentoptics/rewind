@@ -1917,6 +1917,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "once_cell",
+ "regex",
  "reqwest",
  "rewind-store",
  "serde",
