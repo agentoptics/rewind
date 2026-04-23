@@ -19,6 +19,20 @@ export interface Timeline {
   label: string
 }
 
+export interface ForkResponse {
+  fork_timeline_id: string
+}
+
+export interface CreateReplayContextResponse {
+  replay_context_id: string
+  parent_steps_count: number
+  fork_at_step: number
+}
+
+export interface DeleteReplayContextResponse {
+  released: boolean
+}
+
 export interface SessionDetail {
   session: Session
   timelines: Timeline[]

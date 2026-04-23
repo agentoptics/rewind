@@ -2,6 +2,7 @@ import type {
   Session, SessionDetail, StepResponse, StepDetail,
   Baseline, BaselineDetail, CacheStats, Snapshot,
   Timeline, TimelineDiff,
+  ForkResponse, CreateReplayContextResponse, DeleteReplayContextResponse,
   EvalDataset, DatasetExample, EvalExperiment,
   ExperimentResultDetail, ExperimentComparisonView,
   SpanResponse,
@@ -64,6 +65,15 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+async function del<T>(path: string): Promise<T> {
+  const res = await request(path, { method: 'DELETE' })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`API error ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
 export const api = {
   health: () => get<{ status: string; version: string }>('/health'),
   sessions: () => get<Session[]>('/sessions'),
@@ -98,4 +108,12 @@ export const api = {
   // OTel Export
   exportOtel: (sessionId: string, opts: { include_content?: boolean; timeline_id?: string | null; all_timelines?: boolean } = {}) =>
     post<{ spans_exported: number; trace_id: string }>(`/sessions/${sessionId}/export/otel`, opts),
+
+  // Fork / Replay
+  forkSession: (sessionId: string, body: { at_step: number; label: string; timeline_id?: string }) =>
+    post<ForkResponse>(`/sessions/${sessionId}/fork`, body),
+  createReplayContext: (body: { session_id: string; from_step: number; fork_timeline_id: string }) =>
+    post<CreateReplayContextResponse>('/replay-contexts', body),
+  deleteReplayContext: (id: string) =>
+    del<DeleteReplayContextResponse>(`/replay-contexts/${id}`),
 }

@@ -134,6 +134,58 @@ describe('api.snapshots', () => {
   })
 })
 
+describe('api.forkSession', () => {
+  it('POSTs to /api/sessions/:id/fork with body', async () => {
+    mockFetch.mockResolvedValue(mockJsonResponse({ fork_timeline_id: 'tl-123' }))
+    const res = await api.forkSession('sess1', { at_step: 5, label: 'fork-at-5' })
+    expect(mockFetch).toHaveBeenCalledWith('/api/sessions/sess1/fork', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ at_step: 5, label: 'fork-at-5' }),
+    })
+    expect(res).toEqual({ fork_timeline_id: 'tl-123' })
+  })
+
+  it('includes optional timeline_id when provided', async () => {
+    mockFetch.mockResolvedValue(mockJsonResponse({ fork_timeline_id: 'tl-456' }))
+    await api.forkSession('sess1', { at_step: 3, label: 'f', timeline_id: 'parent-tl' })
+    expect(mockFetch).toHaveBeenCalledWith('/api/sessions/sess1/fork', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ at_step: 3, label: 'f', timeline_id: 'parent-tl' }),
+    })
+  })
+})
+
+describe('api.createReplayContext', () => {
+  it('POSTs to /api/replay-contexts', async () => {
+    mockFetch.mockResolvedValue(mockJsonResponse({
+      replay_context_id: 'rc-1', parent_steps_count: 5, fork_at_step: 5,
+    }))
+    const res = await api.createReplayContext({
+      session_id: 'sess1', from_step: 5, fork_timeline_id: 'tl-123',
+    })
+    expect(mockFetch).toHaveBeenCalledWith('/api/replay-contexts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess1', from_step: 5, fork_timeline_id: 'tl-123' }),
+    })
+    expect(res).toEqual({ replay_context_id: 'rc-1', parent_steps_count: 5, fork_at_step: 5 })
+  })
+})
+
+describe('api.deleteReplayContext', () => {
+  it('DELETEs /api/replay-contexts/:id', async () => {
+    mockFetch.mockResolvedValue(mockJsonResponse({ released: true }))
+    const res = await api.deleteReplayContext('rc-1')
+    expect(mockFetch).toHaveBeenCalledWith('/api/replay-contexts/rc-1', {
+      method: 'DELETE',
+      headers: {},
+    })
+    expect(res).toEqual({ released: true })
+  })
+})
+
 describe('error handling', () => {
   it('throws on non-OK response', async () => {
     mockFetch.mockResolvedValue(mockJsonResponse('Not found', 404))
