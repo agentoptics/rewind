@@ -6,32 +6,26 @@ import { useState, useEffect } from 'react'
 import { ArrowLeft, Equal, Diff, ArrowLeftRight } from 'lucide-react'
 import type { Timeline, TimelineDiff, StepDiffEntry } from '@/types/api'
 
-// Picks a sensible default left/right pair for the diff view.
-//  - If a fork is currently selected, diff it against its parent (most useful case).
-//  - Otherwise, fall back to root vs. the first fork we find.
-//  - Returns null when no sensible pair can be chosen (e.g. only one timeline).
-// NOTE: relies on DiffView being unmounted when the view changes (see App.tsx).
-// If a future routing change keeps DiffView mounted across navigations, this
-// auto-pick will only fire once per mount and won't re-pick on subsequent visits.
-export function pickDefaultDiffPair(
-  timelines: Timeline[],
-  selectedTimelineId: string | null,
-): { leftId: string; rightId: string } | null {
-  if (timelines.length < 2) return null
-  const active = selectedTimelineId
-    ? timelines.find(t => t.id === selectedTimelineId)
-    : null
-  if (active?.parent_timeline_id) {
-    return { leftId: active.parent_timeline_id, rightId: active.id }
+// Reads left/right timeline IDs from the URL hash, if any.
+// Hash shape: `#/diff/{sessionId}/{leftId}/{rightId}` — set by TimelineSelector's
+// "Diff against parent" button. Returns null when the hash is a session/step
+// hash or otherwise doesn't carry diff IDs.
+export function parseDiffHash(hash: string): { leftId: string; rightId: string } | null {
+  const parts = hash.replace(/^#\/?/, '').split('/')
+  if (parts[0] !== 'diff') return null
+  const leftRaw = parts[2]
+  const rightRaw = parts[3]
+  if (!leftRaw || !rightRaw) return null
+  // Mirror TimelineSelector's encodeURIComponent on write.
+  try {
+    return { leftId: decodeURIComponent(leftRaw), rightId: decodeURIComponent(rightRaw) }
+  } catch {
+    return null
   }
-  const root = timelines.find(t => !t.parent_timeline_id)
-  const fork = timelines.find(t => t.parent_timeline_id)
-  if (root && fork) return { leftId: root.id, rightId: fork.id }
-  return null
 }
 
 export function DiffView({ sessionId }: { sessionId: string }) {
-  const { setView, selectedTimelineId } = useStore()
+  const { setView } = useStore()
   const [leftId, setLeftId] = useState<string>('')
   const [rightId, setRightId] = useState<string>('')
   const [selectedDiffStep, setSelectedDiffStep] = useState<number | null>(null)
@@ -49,15 +43,31 @@ export function DiffView({ sessionId }: { sessionId: string }) {
     enabled: canDiff,
   })
 
+  // Reads the hash once on mount (guarded by `!leftId`). We intentionally do
+  // NOT register a `hashchange` listener — App.tsx unmounts DiffView when the
+  // user navigates away, so each arrival gets a fresh mount and re-reads the
+  // hash. If a future routing change keeps DiffView mounted across view
+  // transitions, add a `hashchange` listener here to react to URL updates.
   useEffect(() => {
     if (timelines.length >= 2 && !leftId) {
-      const picked = pickDefaultDiffPair(timelines, selectedTimelineId)
-      if (picked) {
-        setLeftId(picked.leftId)
-        setRightId(picked.rightId)
+      // URL hash takes precedence — lets TimelineSelector pre-select
+      // `left=parent, right=active` for a one-click "Diff against parent",
+      // and keeps diff URLs shareable/bookmarkable.
+      const fromHash = parseDiffHash(window.location.hash)
+      if (fromHash
+          && timelines.some(t => t.id === fromHash.leftId)
+          && timelines.some(t => t.id === fromHash.rightId)) {
+        setLeftId(fromHash.leftId)
+        setRightId(fromHash.rightId)
+        return
       }
+      // Fallback: root vs. first fork.
+      const root = timelines.find(t => !t.parent_timeline_id)
+      const fork = timelines.find(t => t.parent_timeline_id)
+      if (root) setLeftId(root.id)
+      if (fork) setRightId(fork.id)
     }
-  }, [timelines, leftId, selectedTimelineId])
+  }, [timelines, leftId])
 
   return (
     <div className="flex flex-col h-full">
