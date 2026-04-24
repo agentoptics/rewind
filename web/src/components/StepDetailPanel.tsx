@@ -2,15 +2,16 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { cn, formatDuration, formatTokens } from '@/lib/utils'
 import { useState } from 'react'
-import { MessageSquare, FileJson, FileOutput, AlertTriangle, GitBranch } from 'lucide-react'
+import { MessageSquare, FileJson, FileOutput, AlertTriangle, GitBranch, Play } from 'lucide-react'
 import { JsonTree } from './JsonTree'
 import { ForkReplayModal } from './ForkReplayModal'
 
 type Tab = 'context' | 'request' | 'response'
+type ModalMode = 'fork' | 'replay' | null
 
 export function StepDetailPanel({ stepId }: { stepId: string }) {
   const [tab, setTab] = useState<Tab | null>(null)
-  const [forkOpen, setForkOpen] = useState(false)
+  const [modalMode, setModalMode] = useState<ModalMode>(null)
 
   const { data: step, isLoading } = useQuery({
     queryKey: ['step-detail', stepId],
@@ -40,13 +41,22 @@ export function StepDetailPanel({ stepId }: { stepId: string }) {
           )}
           {step.model && <span className="text-xs bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded font-mono">{step.model}</span>}
           <StatusPill status={step.status} />
-          <button
-            onClick={() => setForkOpen(true)}
-            title={`Fork a new timeline inheriting steps 1–${step.step_number}`}
-            className="ml-auto flex items-center gap-1 text-[11px] text-amber-400 hover:text-amber-300 border border-amber-900/50 hover:border-amber-700 bg-amber-950/20 hover:bg-amber-950/40 px-2 py-0.5 rounded-md transition-colors"
-          >
-            <GitBranch size={11} /> Fork from here
-          </button>
+          <div className="ml-auto flex items-center gap-1.5">
+            <button
+              onClick={() => setModalMode('fork')}
+              title={`Fork a new timeline inheriting steps 1–${step.step_number}`}
+              className="flex items-center gap-1 text-[11px] text-amber-400 hover:text-amber-300 border border-amber-900/50 hover:border-amber-700 bg-amber-950/20 hover:bg-amber-950/40 px-2 py-0.5 rounded-md transition-colors"
+            >
+              <GitBranch size={11} /> Fork from here
+            </button>
+            <button
+              onClick={() => setModalMode('replay')}
+              title={`Set up a replay from step ${step.step_number}: cached replay for steps 1–${step.step_number}, live upstream after`}
+              className="flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 border border-cyan-900/50 hover:border-cyan-700 bg-cyan-950/20 hover:bg-cyan-950/40 px-2 py-0.5 rounded-md transition-colors"
+            >
+              <Play size={11} /> Set up replay…
+            </button>
+          </div>
         </div>
         <div className="flex items-center gap-4 text-xs text-neutral-500">
           <span>{formatDuration(step.duration_ms)}</span>
@@ -77,9 +87,9 @@ export function StepDetailPanel({ stepId }: { stepId: string }) {
       </div>
 
       <ForkReplayModal
-        isOpen={forkOpen}
-        onClose={() => setForkOpen(false)}
-        mode="fork"
+        isOpen={modalMode !== null}
+        onClose={() => setModalMode(null)}
+        mode={modalMode ?? 'fork'}
         sessionId={step.session_id}
         timelineId={step.timeline_id}
         atStep={step.step_number}
