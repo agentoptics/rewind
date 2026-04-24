@@ -81,13 +81,13 @@ export function ReplaySetupModal({ isOpen, onClose, sessionId, timelineId, atSte
   const effectiveLabel = label.trim() || defaultLabel
   const labelIsValid = LABEL_REGEX.test(effectiveLabel)
   const shortSessionId = sessionId.slice(0, 8)
-  // Pre-instructions, the fork hasn't been created yet — preview command uses the label.
-  // Post-fork, we pin to --fork-id so the CLI reuses the timeline the web UI is watching
-  // (issue #140: without --fork-id the CLI would create a second fork and live steps
-  // would stream into that one while the UI showed an empty first fork).
+  // --fork-id pins the CLI to the fork the UI is watching (issue #140).
+  // `replayCommand` is only rendered inside the `instructions` phase, which
+  // only appears after `forkedTimelineId` is set — so the fallback empty
+  // string below is just a non-null placeholder, never displayed.
   const replayCommand = forkedTimelineId
     ? `rewind replay ${shortSessionId} --from ${atStep} --fork-id ${forkedTimelineId}`
-    : `rewind replay ${shortSessionId} --from ${atStep} --label ${effectiveLabel}`
+    : ''
   const submitDisabled = status === 'submitting' || !labelIsValid
 
   const handleSubmit = async () => {

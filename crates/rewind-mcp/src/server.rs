@@ -572,7 +572,7 @@ impl RewindMcp {
                 "upstream": params.upstream,
             },
             "instructions": format!(
-                "Fork created. To start the replay proxy, run:\n  rewind replay {} --from {} --fork-id {} --port {} --upstream {}",
+                "Fork created. To start the replay proxy, run (requires rewind >= 0.12.16 for --fork-id):\n  rewind replay {} --from {} --fork-id {} --port {} --upstream {}",
                 &sess.id[..8.min(sess.id.len())], params.from_step, fork.id, params.port, params.upstream
             ),
             "message": format!(
