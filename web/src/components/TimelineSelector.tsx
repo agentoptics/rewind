@@ -1,6 +1,6 @@
 import { useStore } from '@/hooks/use-store'
 import { cn } from '@/lib/utils'
-import { GitBranch, GitCommit } from 'lucide-react'
+import { GitBranch, GitCommit, ArrowLeftRight } from 'lucide-react'
 import type { Timeline } from '@/types/api'
 
 interface TimelineSelectorProps {
@@ -8,15 +8,16 @@ interface TimelineSelectorProps {
 }
 
 export function TimelineSelector({ timelines }: TimelineSelectorProps) {
-  const { selectedTimelineId, selectTimeline } = useStore()
+  const { selectedTimelineId, selectTimeline, setView } = useStore()
   const root = timelines.find(t => !t.parent_timeline_id)
   const activeId = selectedTimelineId || root?.id
+  const activeTimeline = timelines.find(t => t.id === activeId)
+  const hasParent = !!activeTimeline?.parent_timeline_id
 
   return (
     <div className="flex items-center gap-2 px-4 py-2 border-b border-neutral-800 bg-neutral-950/50 overflow-x-auto scrollbar-thin">
       <GitBranch size={14} className="text-neutral-500 shrink-0" />
       {timelines.map((t) => {
-        const isRoot = !t.parent_timeline_id
         const isActive = t.id === activeId
 
         return (
@@ -38,6 +39,15 @@ export function TimelineSelector({ timelines }: TimelineSelectorProps) {
           </button>
         )
       })}
+      {hasParent && (
+        <button
+          onClick={() => setView('diff')}
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-amber-400 hover:text-amber-300 border border-amber-900/50 hover:border-amber-700 bg-amber-950/20 hover:bg-amber-950/40 transition-colors shrink-0 ml-auto"
+          title="Diff this fork against its parent timeline"
+        >
+          <ArrowLeftRight size={11} /> Diff against parent
+        </button>
+      )}
     </div>
   )
 }

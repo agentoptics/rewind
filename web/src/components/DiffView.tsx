@@ -7,7 +7,7 @@ import { ArrowLeft, Equal, Diff, ArrowLeftRight } from 'lucide-react'
 import type { Timeline, TimelineDiff, StepDiffEntry } from '@/types/api'
 
 export function DiffView({ sessionId }: { sessionId: string }) {
-  const { setView } = useStore()
+  const { setView, selectedTimelineId } = useStore()
   const [leftId, setLeftId] = useState<string>('')
   const [rightId, setRightId] = useState<string>('')
   const [selectedDiffStep, setSelectedDiffStep] = useState<number | null>(null)
@@ -27,12 +27,20 @@ export function DiffView({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     if (timelines.length >= 2 && !leftId) {
-      const root = timelines.find(t => !t.parent_timeline_id)
-      const fork = timelines.find(t => t.parent_timeline_id)
-      if (root) setLeftId(root.id)
-      if (fork) setRightId(fork.id)
+      const active = selectedTimelineId
+        ? timelines.find(t => t.id === selectedTimelineId)
+        : null
+      if (active?.parent_timeline_id) {
+        setLeftId(active.parent_timeline_id)
+        setRightId(active.id)
+      } else {
+        const root = timelines.find(t => !t.parent_timeline_id)
+        const fork = timelines.find(t => t.parent_timeline_id)
+        if (root) setLeftId(root.id)
+        if (fork) setRightId(fork.id)
+      }
     }
-  }, [timelines, leftId])
+  }, [timelines, leftId, selectedTimelineId])
 
   return (
     <div className="flex flex-col h-full">
