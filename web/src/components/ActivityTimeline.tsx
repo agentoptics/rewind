@@ -666,21 +666,26 @@ export function ActivityTimeline({
                           )}
                         </button>
                         {(onFork || onReplay) && (
-                          <div className="hidden group-hover:flex absolute -top-5 right-0 z-30 gap-0.5">
+                          // Overlay sits INSIDE the bar wrapper (within lane bounds) so it
+                          // isn't clipped by `overflow-hidden` on the bar-area and swim-lane
+                          // containers. `group-focus-within` reveals it for keyboard users.
+                          <div className="hidden group-hover:flex group-focus-within:flex absolute top-0 right-0 z-30 gap-0.5">
                             {onFork && (
                               <button
-                                onClick={(e) => { e.stopPropagation(); onFork(step) }}
+                                onClick={() => onFork(step)}
+                                aria-label={`Fork from step ${step.step_number}`}
                                 title={`Fork from step ${step.step_number}`}
-                                className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] bg-amber-950/90 text-amber-300 border border-amber-800/60 hover:bg-amber-900/90 transition-colors"
+                                className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] bg-amber-950/95 text-amber-300 border border-amber-800/60 hover:bg-amber-900/95 focus:outline-none focus:ring-1 focus:ring-amber-500 transition-colors"
                               >
                                 <GitBranch size={9} />
                               </button>
                             )}
                             {onReplay && (
                               <button
-                                onClick={(e) => { e.stopPropagation(); onReplay(step) }}
+                                onClick={() => onReplay(step)}
+                                aria-label={`Set up replay from step ${step.step_number}`}
                                 title={`Set up replay from step ${step.step_number}`}
-                                className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] bg-cyan-950/90 text-cyan-300 border border-cyan-800/60 hover:bg-cyan-900/90 transition-colors"
+                                className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] bg-cyan-950/95 text-cyan-300 border border-cyan-800/60 hover:bg-cyan-900/95 focus:outline-none focus:ring-1 focus:ring-cyan-500 transition-colors"
                               >
                                 <Play size={9} />
                               </button>

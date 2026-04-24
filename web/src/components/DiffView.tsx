@@ -6,6 +6,30 @@ import { useState, useEffect } from 'react'
 import { ArrowLeft, Equal, Diff, ArrowLeftRight } from 'lucide-react'
 import type { Timeline, TimelineDiff, StepDiffEntry } from '@/types/api'
 
+// Picks a sensible default left/right pair for the diff view.
+//  - If a fork is currently selected, diff it against its parent (most useful case).
+//  - Otherwise, fall back to root vs. the first fork we find.
+//  - Returns null when no sensible pair can be chosen (e.g. only one timeline).
+// NOTE: relies on DiffView being unmounted when the view changes (see App.tsx).
+// If a future routing change keeps DiffView mounted across navigations, this
+// auto-pick will only fire once per mount and won't re-pick on subsequent visits.
+export function pickDefaultDiffPair(
+  timelines: Timeline[],
+  selectedTimelineId: string | null,
+): { leftId: string; rightId: string } | null {
+  if (timelines.length < 2) return null
+  const active = selectedTimelineId
+    ? timelines.find(t => t.id === selectedTimelineId)
+    : null
+  if (active?.parent_timeline_id) {
+    return { leftId: active.parent_timeline_id, rightId: active.id }
+  }
+  const root = timelines.find(t => !t.parent_timeline_id)
+  const fork = timelines.find(t => t.parent_timeline_id)
+  if (root && fork) return { leftId: root.id, rightId: fork.id }
+  return null
+}
+
 export function DiffView({ sessionId }: { sessionId: string }) {
   const { setView, selectedTimelineId } = useStore()
   const [leftId, setLeftId] = useState<string>('')
@@ -27,17 +51,10 @@ export function DiffView({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     if (timelines.length >= 2 && !leftId) {
-      const active = selectedTimelineId
-        ? timelines.find(t => t.id === selectedTimelineId)
-        : null
-      if (active?.parent_timeline_id) {
-        setLeftId(active.parent_timeline_id)
-        setRightId(active.id)
-      } else {
-        const root = timelines.find(t => !t.parent_timeline_id)
-        const fork = timelines.find(t => t.parent_timeline_id)
-        if (root) setLeftId(root.id)
-        if (fork) setRightId(fork.id)
+      const picked = pickDefaultDiffPair(timelines, selectedTimelineId)
+      if (picked) {
+        setLeftId(picked.leftId)
+        setRightId(picked.rightId)
       }
     }
   }, [timelines, leftId, selectedTimelineId])
