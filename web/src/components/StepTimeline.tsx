@@ -3,7 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { cn, formatDuration, formatTokens } from '@/lib/utils'
 import {
   CheckCircle2, XCircle, Loader2, Brain, Wrench, ClipboardList,
-  Eye, Pencil, FileText, Terminal, Search, Bot, Globe, ListTodo, Plug, MessageSquare, Zap,
+  Eye, Pencil, FileText, Terminal, Search, Bot, Globe, ListTodo, Plug, MessageSquare, Zap, GitBranch,
 } from 'lucide-react'
 import type { StepResponse } from '@/types/api'
 
@@ -12,9 +12,10 @@ interface StepTimelineProps {
   selectedStepId: string | null
   onSelectStep: (id: string | null) => void
   autoFollow?: boolean
+  onFork?: (step: StepResponse) => void
 }
 
-export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow }: StepTimelineProps) {
+export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow, onFork }: StepTimelineProps) {
   const parentRef = useRef<HTMLDivElement>(null)
 
   const virtualizer = useVirtualizer({
@@ -42,6 +43,7 @@ export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow }
               key={virtualItem.key}
               data-index={virtualItem.index}
               ref={virtualizer.measureElement}
+              className="group relative"
               style={{
                 position: 'absolute',
                 top: 0,
@@ -81,6 +83,16 @@ export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow }
                   )}
                 </div>
               </button>
+              {onFork && (
+                <button
+                  onClick={() => onFork(step)}
+                  title={`Fork from step #${step.step_number}`}
+                  aria-label={`Fork from step ${step.step_number}`}
+                  className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 focus:opacity-100 flex items-center gap-1 text-[10px] text-amber-400 hover:text-amber-300 bg-neutral-900 border border-amber-900/60 hover:border-amber-700 px-1.5 py-0.5 rounded transition-opacity"
+                >
+                  <GitBranch size={10} /> Fork
+                </button>
+              )}
             </div>
           )
         })}

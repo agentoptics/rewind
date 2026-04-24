@@ -2,13 +2,15 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { cn, formatDuration, formatTokens } from '@/lib/utils'
 import { useState } from 'react'
-import { MessageSquare, FileJson, FileOutput, AlertTriangle } from 'lucide-react'
+import { MessageSquare, FileJson, FileOutput, AlertTriangle, GitBranch } from 'lucide-react'
 import { JsonTree } from './JsonTree'
+import { ForkReplayModal } from './ForkReplayModal'
 
 type Tab = 'context' | 'request' | 'response'
 
 export function StepDetailPanel({ stepId }: { stepId: string }) {
   const [tab, setTab] = useState<Tab | null>(null)
+  const [forkOpen, setForkOpen] = useState(false)
 
   const { data: step, isLoading } = useQuery({
     queryKey: ['step-detail', stepId],
@@ -38,6 +40,13 @@ export function StepDetailPanel({ stepId }: { stepId: string }) {
           )}
           {step.model && <span className="text-xs bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded font-mono">{step.model}</span>}
           <StatusPill status={step.status} />
+          <button
+            onClick={() => setForkOpen(true)}
+            title={`Fork a new timeline inheriting steps 1–${step.step_number}`}
+            className="ml-auto flex items-center gap-1 text-[11px] text-amber-400 hover:text-amber-300 border border-amber-900/50 hover:border-amber-700 bg-amber-950/20 hover:bg-amber-950/40 px-2 py-0.5 rounded-md transition-colors"
+          >
+            <GitBranch size={11} /> Fork from here
+          </button>
         </div>
         <div className="flex items-center gap-4 text-xs text-neutral-500">
           <span>{formatDuration(step.duration_ms)}</span>
@@ -66,6 +75,15 @@ export function StepDetailPanel({ stepId }: { stepId: string }) {
         {activeTab === 'request' && <JsonView data={step.request_body} label="Request" />}
         {activeTab === 'response' && <JsonView data={step.response_body} label="Response" />}
       </div>
+
+      <ForkReplayModal
+        isOpen={forkOpen}
+        onClose={() => setForkOpen(false)}
+        mode="fork"
+        sessionId={step.session_id}
+        timelineId={step.timeline_id}
+        atStep={step.step_number}
+      />
     </div>
   )
 }

@@ -10,6 +10,7 @@ import { formatTokens, formatDuration, cn } from '@/lib/utils'
 import { Radio, Clock, Layers, Zap, GitBranch, Bot, Plug, Upload, BarChart3, List } from 'lucide-react'
 import { useCallback, useState } from 'react'
 import { ExportOtelModal } from './ExportOtelModal'
+import { ForkReplayModal } from './ForkReplayModal'
 import { ActivityTimeline } from './ActivityTimeline'
 import type { StepResponse } from '@/types/api'
 
@@ -18,6 +19,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const queryClient = useQueryClient()
   const [autoFollow, setAutoFollow] = useState(true)
   const [exportOpen, setExportOpen] = useState(false)
+  const [forkAtStep, setForkAtStep] = useState<number | null>(null)
   const [viewMode, setViewMode] = useState<'timeline' | 'list'>('timeline')
 
   const { data: detail, isLoading: detailLoading } = useQuery({
@@ -42,6 +44,10 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const isLive = session?.status === 'Recording'
 
   const onStep = useCallback((step: StepResponse) => {
+    // The WS broadcasts every step in the session regardless of timeline
+    // (see crates/rewind-web/src/ws.rs filter by session_id only). Drop events
+    // for other timelines so forks don't pollute the currently-viewed list.
+    if (step.timeline_id !== timelineId) return
     queryClient.setQueryData<StepResponse[]>(['steps', sessionId, timelineId], (old) =>
       old ? [...old, step] : [step]
     )
@@ -215,6 +221,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                 selectedStepId={selectedStepId}
                 onSelectStep={selectStep}
                 autoFollow={autoFollow && isLive}
+                onFork={(step) => setForkAtStep(step.step_number)}
               />
             )}
           </div>
@@ -236,6 +243,16 @@ export function SessionView({ sessionId }: { sessionId: string }) {
         onClose={() => setExportOpen(false)}
         sessionId={sessionId}
         timelines={detail?.timelines ?? []}
+      />
+
+      {/* Fork Modal (Phase 1: fork only) */}
+      <ForkReplayModal
+        isOpen={forkAtStep !== null}
+        onClose={() => setForkAtStep(null)}
+        mode="fork"
+        sessionId={sessionId}
+        timelineId={timelineId}
+        atStep={forkAtStep}
       />
     </div>
   )
