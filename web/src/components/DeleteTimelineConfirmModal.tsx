@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { useStore } from '@/hooks/use-store'
@@ -19,20 +19,32 @@ interface Props {
 }
 
 // Destructive — hard-deletes a fork plus its steps, spans, replay contexts,
-// and scores. Server-side invariants (no children, no baselines) are mapped
-// to a 409 response; we surface the message so the user sees *why* the
-// delete was blocked, not just "it failed".
+// scores, and step counters. Server-side invariants (no children, no
+// baselines, no active replay) are mapped to a 409 response; we surface
+// the message so the user sees *why* the delete was blocked.
 export function DeleteTimelineConfirmModal({ isOpen, onClose, sessionId, timeline }: Props) {
   const queryClient = useQueryClient()
   const selectTimeline = useStore((s) => s.selectTimeline)
   const selectedTimelineId = useStore((s) => s.selectedTimelineId)
   const [status, setStatus] = useState<Status>('idle')
   const [error, setError] = useState('')
+  const cancelBtnRef = useRef<HTMLButtonElement | null>(null)
+  // Element focused before the modal opened — we return focus here on close
+  // so keyboard users aren't dropped onto <body>.
+  const previousFocusRef = useRef<HTMLElement | null>(null)
 
   useEffect(() => {
     if (isOpen) {
       setStatus('idle')
       setError('')
+      // Capture the active element so we can restore focus on close.
+      previousFocusRef.current = document.activeElement as HTMLElement | null
+      // Initial focus on Cancel (safer default than the destructive button
+      // for a confirm dialog — users who hit Enter don't accidentally delete).
+      cancelBtnRef.current?.focus()
+    } else if (previousFocusRef.current) {
+      previousFocusRef.current.focus()
+      previousFocusRef.current = null
     }
   }, [isOpen, timeline?.id])
 
@@ -59,6 +71,12 @@ export function DeleteTimelineConfirmModal({ isOpen, onClose, sessionId, timelin
       if (selectedTimelineId === timeline.id) {
         selectTimeline(timeline.parent_timeline_id)
       }
+      // Drop cached data for the deleted timeline — the data is gone, not
+      // stale, so removeQueries (not invalidateQueries). Invalidate the
+      // session- and timelines-level caches so other views pick up the
+      // deletion on their next fetch.
+      queryClient.removeQueries({ queryKey: ['steps', sessionId, timeline.id] })
+      queryClient.removeQueries({ queryKey: ['spans', sessionId, timeline.id] })
       await queryClient.invalidateQueries({ queryKey: ['session', sessionId] })
       await queryClient.invalidateQueries({ queryKey: ['timelines', sessionId] })
       onClose()
@@ -117,6 +135,7 @@ export function DeleteTimelineConfirmModal({ isOpen, onClose, sessionId, timelin
 
         <div className="flex justify-end gap-2 px-5 py-3 border-t border-neutral-800">
           <button
+            ref={cancelBtnRef}
             onClick={close}
             disabled={status === 'submitting'}
             className="px-3 py-1.5 rounded-lg text-xs text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200 transition-colors disabled:opacity-50"

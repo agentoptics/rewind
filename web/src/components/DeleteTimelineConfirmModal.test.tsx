@@ -14,7 +14,8 @@ function wrap(ui: React.ReactElement) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
-  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>)
+  const result = render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>)
+  return { ...result, client }
 }
 
 function makeTimeline(overrides: Partial<Timeline> = {}): Timeline {
@@ -150,5 +151,88 @@ describe('DeleteTimelineConfirmModal', () => {
 
     await waitFor(() => expect(screen.getByText(/child fork/i)).toBeInTheDocument())
     expect(onClose).not.toHaveBeenCalled()
+  })
+})
+
+describe('DeleteTimelineConfirmModal — review fixes (PR #146)', () => {
+  it('removes cached steps and spans for the deleted timeline', async () => {
+    // santa review Important-2: the data is gone, not stale. Use
+    // removeQueries so cached step/span lists don't linger.
+    const deleteMock = vi.mocked(api.deleteTimeline)
+    deleteMock.mockResolvedValue({ deleted: true })
+
+    const { client } = wrap(
+      <DeleteTimelineConfirmModal
+        isOpen={true}
+        onClose={() => {}}
+        sessionId="s-1"
+        timeline={makeTimeline({ id: 'fork-a' })}
+      />,
+    )
+    // Prime the caches with something identifiable.
+    client.setQueryData(['steps', 's-1', 'fork-a'], [{ id: 'step-1' }])
+    client.setQueryData(['spans', 's-1', 'fork-a'], [{ id: 'span-1' }])
+    client.setQueryData(['steps', 's-1', 'other-timeline'], [{ id: 'keep-me' }])
+
+    fireEvent.click(screen.getByRole('button', { name: /delete fork/i }))
+    await waitFor(() => expect(deleteMock).toHaveBeenCalled())
+
+    // Deleted fork's caches are gone.
+    expect(client.getQueryData(['steps', 's-1', 'fork-a'])).toBeUndefined()
+    expect(client.getQueryData(['spans', 's-1', 'fork-a'])).toBeUndefined()
+    // Other timeline's cache is untouched.
+    expect(client.getQueryData(['steps', 's-1', 'other-timeline'])).toEqual([{ id: 'keep-me' }])
+  })
+
+  it('focuses the Cancel button on open (safer default for a destructive dialog)', () => {
+    wrap(
+      <DeleteTimelineConfirmModal
+        isOpen={true}
+        onClose={() => {}}
+        sessionId="s-1"
+        timeline={makeTimeline()}
+      />,
+    )
+    const cancel = screen.getByRole('button', { name: /^cancel$/i })
+    expect(cancel).toHaveFocus()
+  })
+
+  it('returns focus to the element that opened the modal on close', () => {
+    // Arrange a focused trigger, open the modal, close it — focus should
+    // land back on the trigger. santa review Important-3.
+    const trigger = document.createElement('button')
+    trigger.textContent = 'open'
+    document.body.appendChild(trigger)
+    trigger.focus()
+    expect(document.activeElement).toBe(trigger)
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <DeleteTimelineConfirmModal
+          isOpen={true}
+          onClose={() => {}}
+          sessionId="s-1"
+          timeline={makeTimeline()}
+        />
+      </QueryClientProvider>,
+    )
+    // Modal grabbed focus for Cancel.
+    expect(document.activeElement).not.toBe(trigger)
+
+    // Flip isOpen → false on the same mount; the useEffect should restore focus.
+    rerender(
+      <QueryClientProvider client={client}>
+        <DeleteTimelineConfirmModal
+          isOpen={false}
+          onClose={() => {}}
+          sessionId="s-1"
+          timeline={makeTimeline()}
+        />
+      </QueryClientProvider>,
+    )
+    expect(document.activeElement).toBe(trigger)
+
+    document.body.removeChild(trigger)
   })
 })

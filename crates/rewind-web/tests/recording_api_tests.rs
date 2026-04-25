@@ -456,6 +456,53 @@ async fn test_delete_unknown_timeline_returns_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn test_delete_rejects_session_prefix_and_latest() {
+    // Destructive endpoint must require the full session ID — prefix-match
+    // and the "latest" shortcut are accepted by other endpoints but are
+    // footguns here. See santa review Important-5 on PR #146.
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+    let prefix = &sid[..8];
+
+    let (s_prefix, _) = delete_raw(&app, &format!("/api/sessions/{prefix}/timelines/some-tid")).await;
+    assert_eq!(s_prefix, StatusCode::BAD_REQUEST);
+
+    let (s_latest, _) = delete_raw(&app, "/api/sessions/latest/timelines/some-tid").await;
+    assert_eq!(s_latest, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_delete_fork_with_active_replay_context_returns_409() {
+    // santa review Important-6 on PR #146.
+    let (app, _store, _tmp) = setup();
+
+    let (_, start) = post_json(&app, "/api/sessions/start", json!({"name": "test"})).await;
+    let sid = start["session_id"].as_str().unwrap();
+    for _ in 0..3 {
+        post_json(&app, &format!("/api/sessions/{sid}/llm-calls"), json!({
+            "request_body": {}, "response_body": {}, "model": "gpt-4o", "duration_ms": 100,
+        })).await;
+    }
+
+    let (_, fork) = post_json(&app, &format!("/api/sessions/{sid}/fork"), json!({
+        "at_step": 2, "label": "in-use"
+    })).await;
+    let fork_id = fork["fork_timeline_id"].as_str().unwrap();
+
+    post_json(&app, "/api/replay-contexts", json!({
+        "session_id": sid,
+        "from_step": 2,
+        "fork_timeline_id": fork_id,
+    })).await;
+
+    let (status, msg) = delete_raw(&app, &format!("/api/sessions/{sid}/timelines/{fork_id}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("active replay context"), "got: {msg}");
+}
+
 // ── Replay Context ─────────────────────────────────────────
 
 #[tokio::test]

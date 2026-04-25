@@ -1294,39 +1294,49 @@ struct DeleteTimelineResponse {
 
 /// DELETE /api/sessions/{session_id}/timelines/{timeline_id}
 ///
-/// Hard-deletes a fork timeline plus its steps, spans, replay contexts, and
-/// scores. See issue #143. The engine enforces invariants up-front:
-///   * 404 when the timeline isn't in the given session
-///   * 409 when deleting would violate an invariant (root / has children /
-///     baselined) — the response body describes which invariant
+/// Hard-deletes a fork timeline plus its steps, spans, replay contexts,
+/// scores, and step counters. See issue #143.
+///
+/// Unlike most mutation endpoints, this one **requires a full session ID**
+/// — prefix-match and `"latest"` shortcuts are rejected with 400. Losing a
+/// fork to the wrong session via a 2-char prefix would be a bad day.
+///
+/// Status mapping is variant-driven (no string matching on error text):
+///   * `NotFound` → 404
+///   * `IsRoot` / `HasChildren` / `HasBaselines` / `HasActiveReplayContext` → 409
+///   * `Internal` (DB / lock) → 500
 async fn delete_timeline_handler(
     State(state): State<AppState>,
     Path((session_id, timeline_id)): Path<(String, String)>,
 ) -> Result<Json<DeleteTimelineResponse>, (StatusCode, String)> {
+    // Require a full UUID — 36 chars, "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+    // A short prefix or the "latest" alias would make a destructive call too
+    // easy to misfire.
+    if session_id.len() != 36 || session_id == "latest" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "DELETE requires the full session ID; prefix and 'latest' are rejected".to_string(),
+        ));
+    }
+
     let store = state.store.lock().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {e}"))
     })?;
 
-    // Resolve the session ref (accepts full id, prefix, or "latest").
-    let session = resolve_session(&store, &session_id)
-        .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
-
+    // We deliberately do NOT call `resolve_session` here — the caller must
+    // provide the canonical id. Existence is established by `delete_fork`'s
+    // own lookup against `timelines WHERE session_id = ?`.
     let engine = ReplayEngine::new(&store);
-    engine.delete_fork(&session.id, &timeline_id).map_err(|e| {
-        let msg = format!("{e}");
-        // The engine uses specific phrases for each invariant so we can map
-        // them to appropriate HTTP semantics without introducing an error enum.
-        let status = if msg.contains("not found") {
-            StatusCode::NOT_FOUND
-        } else if msg.contains("root timeline")
-            || msg.contains("child fork")
-            || msg.contains("baseline")
-        {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+    engine.delete_fork(&session_id, &timeline_id).map_err(|err| {
+        use rewind_replay::DeleteForkError::*;
+        let status = match &err {
+            NotFound(_, _) => StatusCode::NOT_FOUND,
+            IsRoot | HasChildren { .. } | HasBaselines { .. } | HasActiveReplayContext { .. } => {
+                StatusCode::CONFLICT
+            }
+            Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, msg)
+        (status, format!("{err}"))
     })?;
 
     Ok(Json(DeleteTimelineResponse { deleted: true }))
