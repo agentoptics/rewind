@@ -163,6 +163,22 @@ def _build_transport_classes(predicates: Predicates) -> tuple[Any, Any]:
             self._inner = _inner
             super().__init__(*args, **kwargs)
 
+        def close(self) -> None:
+            """Phase 1 (Santa re-review #2): forward close to the wrapped
+            transport. When the user's Client closes (explicitly or via
+            __exit__), all wrapped transports — ours plus the configured
+            httpx default that we wrapped post-init — must release their
+            connection pools / cert verifiers / SSL contexts. Skipping
+            close on _inner leaks those resources for the lifetime of
+            the process.
+            """
+            if self._inner is not None:
+                try:
+                    self._inner.close()
+                except Exception:
+                    pass
+            super().close()
+
         def handle_request(self, request: Any) -> Any:
             req = _build_rewind_request(request, sync=True)
 
@@ -204,6 +220,20 @@ def _build_transport_classes(predicates: Predicates) -> tuple[Any, Any]:
         def __init__(self, *args: Any, _inner: Any = None, **kwargs: Any) -> None:
             self._inner = _inner
             super().__init__(*args, **kwargs)
+
+        async def aclose(self) -> None:
+            """Async counterpart of :meth:`RewindHTTPTransport.close`.
+            Forwards to ``_inner.aclose()`` first (the configured
+            default we wrapped post-init), then super to release our
+            own resources. Without this, AsyncClient.aclose() leaks
+            httpx's connection pool. See Santa re-review #2.
+            """
+            if self._inner is not None:
+                try:
+                    await self._inner.aclose()
+                except Exception:
+                    pass
+            await super().aclose()
 
         async def handle_async_request(self, request: Any) -> Any:
             req = _build_rewind_request(request, sync=False)

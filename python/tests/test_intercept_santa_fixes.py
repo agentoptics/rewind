@@ -1,31 +1,30 @@
-"""Regression tests for Santa review on PR #149.
+"""Regression tests for Santa reviews on PR #149.
 
-Each test below is a directed regression for one of the seven blocking
-findings in the Santa review. They exist to fail loudly if a future
-refactor undoes a fix without thinking about the consequences.
+Two waves of findings, both covered here:
 
-Findings covered:
+**Initial review (NAUGHTY, 7 findings):**
 
-- ``test_strict_match_409_surfaces`` — Santa #4: ExplicitClient must
-  re-raise HTTP 409 strict-match divergence as
-  :class:`RewindReplayDivergenceError` instead of swallowing to None.
-- ``test_httpx_config_preserved_post_init_wrap`` — Santa #5: when the
-  user constructs ``httpx.Client(verify=False, http2=True, ...)``
-  without ``transport=``, the resulting client's transport must
-  preserve those configs (we wrap httpx's configured default rather
-  than replacing it).
-- ``test_streaming_miss_does_not_eager_read_body`` — Santa #2: live
-  streaming responses must pass through without our flow pre-reading
-  the body. Recording fires with placeholder zero-tokens metadata;
-  the stream remains iterable to user code.
-- ``test_body_only_stream_true_detects_streaming`` — Santa #3: a
-  request with ``{"stream": true}`` in the JSON body but no
-  ``Accept: text/event-stream`` header must still route through the
-  streaming path on cache hit (synthetic SSE, not buffered JSON).
-- ``test_install_handles_subset_of_libraries`` — Santa #1 follow-up:
-  install + adapter is_patched assertions must be conditional on
-  what's actually importable, since CI's bare environment has zero of
-  httpx/requests/aiohttp.
+- ``test_strict_match_409_surfaces`` — Santa #4
+- ``test_httpx_config_preserved_post_init_wrap`` — Santa #5
+- ``test_streaming_miss_does_not_eager_read_body`` — Santa #2
+- ``test_body_only_stream_true_detects_streaming`` — Santa #3
+- ``test_install_handles_subset_of_libraries`` — Santa #1 follow-up
+
+**Re-review (NAUGHTY, 4 remaining findings on commit 1f9a2dd):**
+
+- ``test_httpx_buffered_response_via_real_transport`` — Re-review #1:
+  ``_read_response_body_async`` must call ``await resp.aread()``
+  before ``resp.json()`` because real httpx transport responses are
+  NOT auto-read. ``MockTransport`` masked this in initial tests.
+- ``test_httpx_close_propagates_to_inner_transport`` — Re-review #2:
+  ``RewindHTTPTransport.close()`` and async ``aclose()`` must forward
+  to ``self._inner`` so wrapped transports release their connection
+  pools / SSL contexts.
+- ``test_aiohttp_base_url_relative_path_predicate_match`` — Re-review #3:
+  ``session.post("/v1/chat/completions")`` against a
+  ``ClientSession(base_url="https://api.openai.com")`` must resolve
+  to the absolute URL before host-based predicates run. Otherwise
+  the request silently bypasses interception.
 """
 
 from __future__ import annotations
@@ -322,6 +321,317 @@ class TestInstallWithSubsetOfLibraries(unittest.TestCase):
             aiohttp_middleware.is_patched(),
             aiohttp_middleware.AIOHTTP_AVAILABLE,
         )
+
+
+# ── Re-review #1: httpx body materialization on real transport ─────
+
+
+class TestHttpxResponseBodyMaterialization(unittest.TestCase):
+    """Real httpx transport responses don't auto-read the body — calling
+    ``resp.json()`` before ``resp.read()`` raises ``httpx.ResponseNotRead``.
+
+    Our previous mock-based tests passed because ``httpx.MockTransport``
+    + ``httpx.Response(json=…)`` auto-buffers the body. To catch the
+    regression, this test constructs a real ``httpx.Response`` with a
+    ``ByteStream`` (not yet read) and verifies ``_read_response_body_*``
+    calls read/aread before json.
+    """
+
+    def setUp(self) -> None:
+        _flow.reset_client()
+        _savings.reset()
+
+    def tearDown(self) -> None:
+        _flow.reset_client()
+        _savings.reset()
+
+    def test_sync_read_called_before_json_on_unread_response(self) -> None:
+        """``_read_response_body_sync`` must call ``resp.read()`` before
+        ``resp.json()`` so that an unread httpx Response (the shape from
+        a real transport) doesn't raise ResponseNotRead.
+        """
+        body = b'{"choices":[{"message":{"content":"hi"}}]}'
+        # Build a Response with a ByteStream — this is the shape a real
+        # httpx transport returns. .json() on this raises ResponseNotRead
+        # until .read() materializes the body.
+        request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+        resp = httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=httpx.ByteStream(body),
+            request=request,
+        )
+
+        # Sanity check: pre-fix behavior would raise here.
+        # (We don't assert this directly because the fix means it works.)
+        result = _flow._read_response_body_sync(resp)
+        self.assertEqual(result, {"choices": [{"message": {"content": "hi"}}]})
+
+    def test_async_aread_called_before_json_on_unread_response(self) -> None:
+        """Async counterpart — ``_read_response_body_async`` must call
+        ``await resp.aread()`` first."""
+        async def run() -> None:
+            body = b'{"usage":{"prompt_tokens":5,"completion_tokens":2}}'
+            request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+            resp = httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                stream=httpx.ByteStream(body),
+                request=request,
+            )
+            result = await _flow._read_response_body_async(resp)
+            self.assertEqual(
+                result,
+                {"usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+            )
+
+        import asyncio
+        asyncio.run(run())
+
+    def test_buffered_cache_miss_through_real_transport_records_tokens(self) -> None:
+        """End-to-end: a real httpx.AsyncClient making a buffered POST
+        on cache miss should not crash with ResponseNotRead, AND should
+        successfully extract tokens from the response body for
+        record_llm_call.
+        """
+        async def run() -> None:
+            httpx_transport.patch_httpx_clients()
+            try:
+                recorded: list[dict[str, Any]] = []
+
+                # MockTransport with a stream-typed Response (more like
+                # real transport behavior than json=) so the body is NOT
+                # pre-read. Our fix's await resp.aread() is what makes
+                # this work.
+                def upstream_handler(request: httpx.Request) -> httpx.Response:
+                    body = b'{"choices":[{"message":{"content":"buffered"}}],' \
+                           b'"usage":{"prompt_tokens":7,"completion_tokens":4},' \
+                           b'"model":"gpt-4o"}'
+                    return httpx.Response(
+                        200,
+                        headers={"content-type": "application/json"},
+                        stream=httpx.ByteStream(body),
+                        request=request,
+                    )
+
+                with patch.object(
+                    ExplicitClient, "get_replayed_response_async", return_value=None,
+                ), patch.object(
+                    ExplicitClient,
+                    "record_llm_call_async",
+                    side_effect=lambda *a, **kw: (recorded.append(kw), 1)[1],
+                ):
+                    client = httpx.AsyncClient(
+                        transport=httpx.MockTransport(upstream_handler)
+                    )
+                    resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        json={"model": "gpt-4o", "messages": []},
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    # User code can still read the body — our pre-read
+                    # didn't damage the response.
+                    body = await resp.aread()
+                    self.assertIn(b"buffered", body)
+                    await client.aclose()
+
+                # Recording fired with extracted tokens / model.
+                self.assertEqual(len(recorded), 1)
+                kw = recorded[0]
+                self.assertEqual(kw["tokens_in"], 7)
+                self.assertEqual(kw["tokens_out"], 4)
+                self.assertEqual(kw["model"], "gpt-4o")
+            finally:
+                httpx_transport.unpatch_httpx_clients()
+
+        import asyncio
+        asyncio.run(run())
+
+
+# ── Re-review #2: close/aclose forward to _inner ───────────────────
+
+
+class TestHttpxCloseLifecycle(unittest.TestCase):
+    """Wrapped transport must release the underlying configured/user
+    transport when the Client closes. Without this, every wrapped
+    transport leaks for the process lifetime.
+    """
+
+    def setUp(self) -> None:
+        httpx_transport.unpatch_httpx_clients()
+
+    def tearDown(self) -> None:
+        httpx_transport.unpatch_httpx_clients()
+
+    def test_sync_close_propagates_to_inner_transport(self) -> None:
+        httpx_transport.patch_httpx_clients()
+
+        # Spy on close() of a MockTransport. MockTransport.close exists
+        # in modern httpx; if it doesn't, fall back to recording via
+        # an attribute on a custom transport.
+        class _SpyTransport(httpx.MockTransport):  # type: ignore[misc]
+            close_count = 0
+
+            def close(self) -> None:  # type: ignore[override]
+                _SpyTransport.close_count += 1
+                super().close()
+
+        spy = _SpyTransport(lambda req: httpx.Response(200, json={"ok": True}))
+        client = httpx.Client(transport=spy)
+        # Sanity: our wrapper's _inner should be the spy.
+        self.assertIs(client._transport._inner, spy)
+
+        # Closing the client must trigger close on the wrapper, which
+        # must forward to spy.
+        client.close()
+        self.assertGreaterEqual(
+            _SpyTransport.close_count, 1,
+            "RewindHTTPTransport.close did not forward to _inner — "
+            "configured/user transport leaks for the process lifetime",
+        )
+
+    def test_async_aclose_propagates_to_inner_transport(self) -> None:
+        async def run() -> None:
+            httpx_transport.patch_httpx_clients()
+
+            class _AsyncSpyTransport(httpx.MockTransport):  # type: ignore[misc]
+                aclose_count = 0
+
+                async def aclose(self) -> None:  # type: ignore[override]
+                    _AsyncSpyTransport.aclose_count += 1
+                    await super().aclose()
+
+            spy = _AsyncSpyTransport(lambda req: httpx.Response(200, json={"ok": True}))
+            client = httpx.AsyncClient(transport=spy)
+            self.assertIs(client._transport._inner, spy)
+
+            await client.aclose()
+            self.assertGreaterEqual(
+                _AsyncSpyTransport.aclose_count, 1,
+                "RewindAsyncHTTPTransport.aclose did not forward to _inner",
+            )
+
+        import asyncio
+        asyncio.run(run())
+
+
+# ── Re-review #3: aiohttp base_url + relative path resolves ────────
+
+
+class TestAiohttpBaseUrlResolution(unittest.TestCase):
+    """``session.post("/v1/chat/completions")`` against
+    ``ClientSession(base_url="https://api.openai.com")`` must resolve
+    to the absolute URL before host predicates evaluate. Pre-fix:
+    only the path reached the predicate, host check failed silently,
+    request bypassed interception.
+    """
+
+    def test_relative_path_resolves_against_base_url(self) -> None:
+        from rewind_agent.intercept.aiohttp_middleware import _resolve_url
+
+        # Mock-shape session with _base_url attribute.
+        try:
+            from yarl import URL  # type: ignore[import-untyped]
+        except ImportError:
+            self.skipTest("yarl not installed (aiohttp dep) — skipping")
+
+        class _MockSession:
+            _base_url = URL("https://api.openai.com")
+
+        resolved = _resolve_url(_MockSession(), "/v1/chat/completions")
+        self.assertEqual(resolved, "https://api.openai.com/v1/chat/completions")
+
+    def test_absolute_url_passes_through_unchanged(self) -> None:
+        from rewind_agent.intercept.aiohttp_middleware import _resolve_url
+
+        try:
+            from yarl import URL  # type: ignore[import-untyped]
+        except ImportError:
+            self.skipTest("yarl not installed (aiohttp dep) — skipping")
+
+        class _MockSession:
+            _base_url = URL("https://api.openai.com")
+
+        # Even with a base_url set, an absolute URL should pass through.
+        resolved = _resolve_url(
+            _MockSession(),
+            "https://api.anthropic.com/v1/messages",
+        )
+        self.assertEqual(resolved, "https://api.anthropic.com/v1/messages")
+
+    def test_no_base_url_returns_input_unchanged(self) -> None:
+        from rewind_agent.intercept.aiohttp_middleware import _resolve_url
+
+        class _MockSession:
+            _base_url = None
+
+        resolved = _resolve_url(_MockSession(), "/anything")
+        self.assertEqual(resolved, "/anything")
+
+    def test_aiohttp_session_base_url_match_records_via_predicate(self) -> None:
+        """End-to-end: aiohttp session with base_url and a relative
+        POST path matches the default predicate (api.openai.com) and
+        triggers recording.
+        """
+        try:
+            import aiohttp  # noqa: F401
+        except ImportError:
+            self.skipTest("aiohttp not installed — skipping")
+
+        async def run() -> None:
+            aiohttp_middleware.patch_aiohttp_sessions()
+            try:
+                _flow.reset_client()
+                _savings.reset()
+                recorded: list[dict[str, Any]] = []
+
+                # Stub the upstream transport via _ORIGINAL_REQUEST
+                # swap (same pattern as tests/test_intercept_aiohttp.py).
+                async def fake_original(self_, method, url, **kw):  # type: ignore[no-untyped-def]
+                    return aiohttp_middleware._SyntheticClientResponse(
+                        status=200,
+                        headers={"content-type": "application/json"},
+                        body=b'{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":1,"completion_tokens":1},"model":"gpt-4o"}',
+                        url=url,
+                    )
+
+                aiohttp_middleware._ORIGINAL_REQUEST = fake_original
+
+                with patch.object(
+                    ExplicitClient,
+                    "get_replayed_response_async",
+                    return_value=None,
+                ), patch.object(
+                    ExplicitClient,
+                    "record_llm_call_async",
+                    side_effect=lambda *a, **kw: (recorded.append(kw), 1)[1],
+                ):
+                    import aiohttp as _aio
+
+                    async with _aio.ClientSession(
+                        base_url="https://api.openai.com",
+                    ) as session:
+                        resp = await session.post(
+                            "/v1/chat/completions",
+                            json={"model": "gpt-4o", "messages": []},
+                        )
+                        await resp.read()
+
+                # Recording fired = predicate matched the resolved URL.
+                # Pre-fix: only "/v1/chat/completions" reached the
+                # predicate, host check missed, no recording.
+                self.assertEqual(
+                    len(recorded), 1,
+                    "base_url + relative path didn't match the host predicate — "
+                    "request silently bypassed interception",
+                )
+            finally:
+                aiohttp_middleware.unpatch_aiohttp_sessions()
+                _flow.reset_client()
+                _savings.reset()
+
+        import asyncio
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

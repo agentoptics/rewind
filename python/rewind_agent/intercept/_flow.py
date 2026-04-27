@@ -354,23 +354,57 @@ def _handle_tool_sync(
 
 
 def _read_response_body_sync(resp: Any) -> Any:
-    """Try several common shapes to read a response body as JSON.
+    """Read a response body as JSON, materializing the body first if needed.
+
+    Phase 1 (Santa re-review #1): httpx responses returned from the
+    transport layer have NOT yet had their body read — calling
+    ``resp.json()`` directly raises ``httpx.ResponseNotRead``. We must
+    call ``resp.read()`` first to materialize the body bytes. The
+    test suite previously masked this bug because ``httpx.MockTransport``
+    auto-reads the body via ``Response(json=...)`` construction, but
+    real httpx transports (the ones users hit in production) leave
+    the response unread.
 
     Adapter is expected to set ``_rewind_response_body`` on the
-    response when it has one cheaply available (e.g. it already
-    needed to read the body for the live path). When that's not
-    set, fall through to library-native ``json()`` / text accessors.
+    response when it has one cheaply available; that fast path
+    skips the read.
+
+    Order of attempts:
+
+    1. ``resp._rewind_response_body`` (intercept-set, fastest)
+    2. ``resp.read()`` then ``resp.json()`` (httpx pattern)
+    3. ``resp.json()`` directly (libraries that auto-buffer like
+       requests)
+    4. ``resp.text`` string fallback
     """
     cached = getattr(resp, "_rewind_response_body", None)
     if cached is not None:
         return cached
 
+    # Materialize body first if the response supports it. httpx exposes
+    # ``read()``; requests already has ``_content`` populated by the
+    # time we see it; aiohttp (handled in async variant) needs ``read()``
+    # too. Calling read() on an already-read response is idempotent in
+    # all three.
+    read = getattr(resp, "read", None)
+    if callable(read):
+        try:
+            read()
+        except Exception:
+            # If read() fails (network already closed, partial read,
+            # weird custom response), fall through to json()/text and
+            # let those handle it. We never propagate the read failure
+            # because record_llm_call is best-effort.
+            pass
+
     json_method = getattr(resp, "json", None)
     if callable(json_method):
         try:
             return json_method()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except Exception:
+            # Catch broadly — httpx.ResponseNotRead, json.JSONDecodeError,
+            # ValueError on truncated body, etc. Fall through.
+            pass
 
     text = getattr(resp, "text", None)
     if isinstance(text, str):
@@ -516,15 +550,40 @@ async def _handle_tool_async(
 async def _read_response_body_async(resp: Any) -> Any:
     """Async counterpart of :func:`_read_response_body_sync`.
 
-    Tries ``aread()`` / ``await resp.json()`` patterns first, falls
-    back to sync attribute reads for libraries that buffer bodies
-    eagerly (httpx with non-streaming responses).
+    Phase 1 (Santa re-review #1): same body-materialization fix as the
+    sync variant. Real httpx async transport responses don't have their
+    body pre-read; calling ``resp.json()`` raises ``httpx.ResponseNotRead``.
+    We call ``await resp.aread()`` first (httpx) or ``await resp.read()``
+    (aiohttp) before attempting to parse.
     """
     cached = getattr(resp, "_rewind_response_body", None)
     if cached is not None:
         return cached
 
-    # httpx async: response.json() is sync (body already buffered).
+    # httpx async: response has ``aread()``; calling it materializes the
+    # body bytes into resp.content so the subsequent (sync) resp.json()
+    # works. aiohttp ClientResponse: has ``read()`` (which is async!)
+    # that returns the body bytes. The two libraries diverge on whether
+    # the read method is async, so try both signatures.
+    aread = getattr(resp, "aread", None)
+    if callable(aread):
+        try:
+            await aread()
+        except Exception:
+            pass
+    else:
+        # aiohttp ClientResponse uses ``read()`` (async) as the
+        # body-materialization API.
+        read = getattr(resp, "read", None)
+        if callable(read):
+            try:
+                result = read()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                pass
+
+    # httpx async: response.json() is sync (body buffered above).
     # aiohttp: response.json() is async.
     json_method = getattr(resp, "json", None)
     if callable(json_method):
@@ -533,8 +592,9 @@ async def _read_response_body_async(resp: Any) -> Any:
             if hasattr(result, "__await__"):
                 return await result
             return result
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except Exception:
+            # ResponseNotRead, JSONDecodeError, ValueError, etc.
+            pass
 
     text = getattr(resp, "text", None)
     if callable(text):

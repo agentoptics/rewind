@@ -220,7 +220,17 @@ def patch_aiohttp_sessions(predicates: Predicates | None = None) -> None:
         # Build RewindRequest from the call. data / json / params are
         # the typical body-carrying kwargs; we serialize them the same
         # way aiohttp would (via `data=` byte-encoded, `json=` JSON-encoded).
-        url = str(str_or_url)
+        #
+        # Phase 1 (Santa re-review #3): resolve relative URLs against
+        # ClientSession._base_url. Without this,
+        # ``session.post("/v1/chat/completions")`` with
+        # ``ClientSession(base_url="https://api.openai.com")`` would
+        # build a RewindRequest whose URL is just the path. Host-based
+        # predicates (the default) wouldn't match
+        # ``api.openai.com``, so the request bypasses interception.
+        # Replicates the same logic aiohttp's ClientSession._request
+        # uses internally before issuing the request.
+        url = _resolve_url(self, str_or_url)
         method_upper = method.upper()
         body = _extract_body_bytes(kwargs)
         headers = _normalize_headers(kwargs.get("headers"))
@@ -301,6 +311,44 @@ def _get_original_request() -> Any:
 
 
 # ── Helpers ────────────────────────────────────────────────────────
+
+
+def _resolve_url(session: Any, str_or_url: Any) -> str:
+    """Resolve a relative URL against the session's ``_base_url``.
+
+    Phase 1 (Santa re-review #3): aiohttp's
+    ``ClientSession._request`` does this resolution AFTER our patched
+    function runs, so if we just stringify ``str_or_url`` we'd get the
+    bare path for a relative URL. Predicates that match on host (the
+    default) would silently miss those requests.
+
+    Replicates aiohttp's own logic: if the session has a non-None
+    ``_base_url`` and the supplied URL is relative (doesn't start with
+    a scheme), we yarl-join them. Otherwise stringify as-is.
+
+    yarl is a hard dependency of aiohttp, so importing it inside this
+    function is safe — we wouldn't be in this code path without
+    aiohttp being importable.
+    """
+    raw = str(str_or_url)
+    base = getattr(session, "_base_url", None)
+    if base is None:
+        return raw
+    # Schemes that mean "absolute URL — no resolution needed". Includes
+    # ws/wss for parity with aiohttp even though our intercept doesn't
+    # touch WebSocket upgrades (different code path:
+    # ``ClientSession._ws_connect``).
+    if raw.startswith(("http:", "https:", "ws:", "wss:")):
+        return raw
+    try:
+        from yarl import URL  # type: ignore[import-untyped]
+
+        return str(base.join(URL(raw)))
+    except Exception:
+        # Defensive: if yarl join blows up on a malformed URL, fall back
+        # to the bare string. Predicate match will fail (user-facing
+        # bypass), but at least we don't crash.
+        return raw
 
 
 def _extract_body_bytes(kwargs: dict[str, Any]) -> bytes:
