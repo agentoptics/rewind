@@ -360,6 +360,42 @@ impl Store {
         Ok(())
     }
 
+    /// Rotate a runner's auth token. Replaces the encrypted token,
+    /// nonce, hash, and preview atomically. Returns `true` if a row
+    /// was updated, `false` if the id doesn't exist.
+    ///
+    /// **Phase 3 commit 4:** the dashboard's "regenerate token"
+    /// button calls this. The old hash is invalidated immediately
+    /// so any in-flight inbound auth attempts using the old token
+    /// will fail. In-flight outbound dispatches use the new token
+    /// because dispatch signs at dispatch time, not at job-creation
+    /// time.
+    pub fn rotate_runner_token(
+        &self,
+        id: &str,
+        encrypted_token: &[u8],
+        token_nonce: &[u8],
+        auth_token_hash: &str,
+        auth_token_preview: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE runners
+             SET encrypted_token = ?1,
+                 token_nonce = ?2,
+                 auth_token_hash = ?3,
+                 auth_token_preview = ?4
+             WHERE id = ?5",
+            params![
+                encrypted_token,
+                token_nonce,
+                auth_token_hash,
+                auth_token_preview,
+                id
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     fn row_to_runner(row: &rusqlite::Row) -> rusqlite::Result<Runner> {
         Ok(Runner {
             id: row.get(0)?,

@@ -1,9 +1,11 @@
 pub mod api;
 pub mod auth;
+pub mod crypto;
 pub mod eval_api;
 pub mod hooks;
 pub mod otlp_ingest;
 mod polling;
+pub mod runners;
 mod spa;
 pub mod transcript;
 pub mod url_guard;
@@ -85,6 +87,11 @@ pub struct AppState {
     /// Bearer token required for protected routes. `None` disables auth (loopback default).
     /// See `auth::resolve_or_generate_token` and `docs/security-audit.md` §CRITICAL-02.
     pub auth_token: Option<String>,
+    /// AES-256-GCM cipher used to encrypt/decrypt runner auth tokens at rest.
+    /// `None` means `REWIND_RUNNER_SECRET_KEY` was unset at startup; the
+    /// `/api/runners` endpoints return `503` in that case so operators
+    /// see a clear bootstrap error. Phase 3 commit 4. See `crypto.rs`.
+    pub crypto: Option<crypto::CryptoBox>,
 }
 
 pub struct WebServer {
@@ -98,6 +105,14 @@ pub struct WebServer {
 impl WebServer {
     pub fn new(store: Arc<Mutex<Store>>, event_tx: broadcast::Sender<StoreEvent>) -> Self {
         let otel_config = OtelConfig::from_env();
+        let crypto = crypto::CryptoBox::from_env().unwrap_or_else(|e| {
+            // Misconfigured key (set but malformed) is a hard error at
+            // startup so operators see it instead of every /api/runners
+            // call returning 500. Unset key returns Ok(None) and falls
+            // through to None (endpoints will 503 with bootstrap msg).
+            tracing::error!("REWIND_RUNNER_SECRET_KEY is set but malformed: {e}");
+            None
+        });
         WebServer {
             state: AppState {
                 store,
@@ -105,6 +120,7 @@ impl WebServer {
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
                 auth_token: None,
+                crypto,
             },
             dev_mode: false,
             auth_disabled: false,
@@ -114,6 +130,10 @@ impl WebServer {
     pub fn new_standalone(store: Store) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let otel_config = OtelConfig::from_env();
+        let crypto = crypto::CryptoBox::from_env().unwrap_or_else(|e| {
+            tracing::error!("REWIND_RUNNER_SECRET_KEY is set but malformed: {e}");
+            None
+        });
         WebServer {
             state: AppState {
                 store: Arc::new(Mutex::new(store)),
@@ -121,6 +141,7 @@ impl WebServer {
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
                 auth_token: None,
+                crypto,
             },
             dev_mode: false,
             auth_disabled: false,

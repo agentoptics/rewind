@@ -15,6 +15,8 @@ use crate::{AppState, StoreEvent};
 pub fn routes(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        // Phase 3 commit 4: runner registry CRUD.
+        .merge(crate::runners::routes())
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/steps", get(get_session_steps))
