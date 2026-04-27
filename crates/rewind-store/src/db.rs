@@ -646,6 +646,58 @@ impl Store {
         Ok(rows.next().transpose()?)
     }
 
+    // ── Step 0.3 envelope-aware response readers ──────────────────
+    //
+    // These are the canonical helpers for reading a step's response body.
+    // Every display surface (CLI, MCP, TUI, OTel export, web API,
+    // replay-preview) must route through here — direct
+    // `blobs.get(&step.response_blob)` reads bypass envelope unwrapping
+    // and surface the wrapper JSON ({status, headers, body}) instead of
+    // the model response on v0.13+ proxy-recorded data.
+    //
+    // The format discriminator on `Step` decides parse strategy:
+    //   - `FORMAT_NAKED_LEGACY` (= 0): pre-migration step OR explicit-API
+    //     write (which has no HTTP status/headers to capture). Returns
+    //     the raw blob bytes as the body.
+    //   - `FORMAT_ENVELOPE_V1`  (= 1): proxy-recorded with full HTTP
+    //     metadata. Returns the inner body bytes from the envelope.
+    //   - Unknown format: defensive legacy fallback (forward-compat with
+    //     hypothetical envelope-v2 blobs read by an older binary).
+    //
+    // Pre-migration steps have `response_blob_format = 0` via the column
+    // DEFAULT, so legacy data round-trips unchanged through these helpers.
+
+    /// Read a step's response body bytes with envelope unwrap applied.
+    ///
+    /// Returns `None` when the response_blob is empty (the case for
+    /// hook events without a response, or in-flight steps) OR when the
+    /// blob is missing from the content-addressed store. Both cases are
+    /// "no body to display" rather than an error condition, so the
+    /// caller decides whether to omit the field, render an error
+    /// placeholder, or fall through to a different content source.
+    pub fn read_step_response_body(&self, step: &crate::Step) -> Option<Vec<u8>> {
+        if step.response_blob.is_empty() {
+            return None;
+        }
+        let raw = self.blobs.get(&step.response_blob).ok()?;
+        let envelope = crate::ResponseEnvelope::from_blob_bytes(step.response_blob_format, &raw);
+        Some(envelope.body)
+    }
+
+    /// Read a step's response body and parse it as JSON.
+    ///
+    /// Convenience wrapper for the common case where the caller wants
+    /// the parsed model response (OpenAI / Anthropic / etc. JSON shapes).
+    /// Returns `None` if the body is empty, missing, or not valid JSON.
+    /// The "not valid JSON" case is rare in practice — model providers
+    /// always return JSON for chat/completions endpoints — but the
+    /// nullable return preserves the existing call-site error policies
+    /// (`.ok()` chains, `.unwrap_or(serde_json::Value::Null)`, etc.).
+    pub fn read_step_response_json(&self, step: &crate::Step) -> Option<serde_json::Value> {
+        let body = self.read_step_response_body(step)?;
+        serde_json::from_slice(&body).ok()
+    }
+
     // ── Step Counters (Explicit API) ──────────────────────────
 
     // SAFETY: next_step_number uses separate INSERT + SELECT statements.
@@ -2143,6 +2195,175 @@ mod tests {
         // Toggling back to false also works.
         store.set_replay_context_strict_match(&ctx_id_strict, false).unwrap();
         assert!(!store.get_replay_context(&ctx_id_strict).unwrap().unwrap().strict_match);
+    }
+
+    // ── Phase 0 follow-up: envelope-aware response readers ─────────
+    //
+    // These tests are the contract for `read_step_response_body` and
+    // `read_step_response_json`, the canonical helpers that every
+    // display surface (CLI, MCP, TUI, OTel export, web API,
+    // replay-preview) routes through. If these break, every surface
+    // breaks — they're the single source of truth.
+
+    fn seed_step_with_response(
+        store: &Store,
+        step_id: &str,
+        body: &[u8],
+        format: u8,
+    ) -> crate::Step {
+        use crate::Timeline;
+        // Idempotent seed of a session+timeline so multiple tests can
+        // share `test_store()` if needed.
+        if store.get_session("sess-blob").unwrap().is_none() {
+            let session = Session {
+                id: "sess-blob".into(),
+                name: "blob-test".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                status: SessionStatus::Recording,
+                source: SessionSource::Hooks,
+                total_steps: 0,
+                total_tokens: 0,
+                metadata: serde_json::json!({}),
+                thread_id: None,
+                thread_ordinal: None,
+            };
+            store.create_session(&session).unwrap();
+            let timeline = Timeline::new_root(&session.id);
+            store.create_timeline(&timeline).unwrap();
+        }
+        let timeline_id = store.get_timelines("sess-blob").unwrap()[0].id.clone();
+        let blob_hash = store.blobs.put(body).unwrap();
+        let mut step = crate::Step::new_llm_call(&timeline_id, "sess-blob", 1, "gpt-4o");
+        step.id = step_id.to_string();
+        step.response_blob = blob_hash;
+        step.response_blob_format = format;
+        store.create_step(&step).unwrap();
+        step
+    }
+
+    /// Phase 0 contract: legacy blobs (format=0) round-trip as the
+    /// raw bytes. Pre-migration data was always written this way and
+    /// must continue to read identically — that's the whole reason
+    /// `from_blob_bytes(0, ...)` synthesizes a 200/empty-headers
+    /// envelope around the blob bytes instead of failing the unwrap.
+    #[test]
+    fn read_step_response_body_returns_raw_for_legacy_format() {
+        let (store, _dir) = test_store();
+        let raw = br#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let step = seed_step_with_response(&store, "step-legacy", raw, crate::FORMAT_NAKED_LEGACY);
+
+        let body = store.read_step_response_body(&step).unwrap();
+        assert_eq!(body, raw, "legacy format must return raw blob bytes unchanged");
+
+        let json = store.read_step_response_json(&step).unwrap();
+        assert_eq!(
+            json.pointer("/choices/0/message/content").and_then(|v| v.as_str()),
+            Some("hello"),
+            "legacy round-trip preserves the OpenAI response shape",
+        );
+    }
+
+    /// Phase 0 contract: envelope blobs (format=1) unwrap to the inner
+    /// body, NOT the wrapper JSON. The wrapper has shape
+    /// `{status, headers, body}` — surfacing that to a CLI / MCP / TUI
+    /// user is exactly the v0.13 regression that this helper exists
+    /// to prevent.
+    #[test]
+    fn read_step_response_body_unwraps_envelope_format() {
+        let (store, _dir) = test_store();
+
+        let inner_body = br#"{"choices":[{"message":{"content":"unwrapped"}}]}"#;
+        let envelope = crate::ResponseEnvelope {
+            status: 200,
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: inner_body.to_vec(),
+        };
+        let envelope_blob = serde_json::to_vec(&envelope).unwrap();
+        let step = seed_step_with_response(
+            &store,
+            "step-envelope",
+            &envelope_blob,
+            crate::FORMAT_ENVELOPE_V1,
+        );
+
+        let body = store.read_step_response_body(&step).unwrap();
+        assert_eq!(
+            body,
+            inner_body,
+            "envelope unwrap must return ONLY the inner body bytes",
+        );
+
+        let json = store.read_step_response_json(&step).unwrap();
+        assert_eq!(
+            json.pointer("/choices/0/message/content").and_then(|v| v.as_str()),
+            Some("unwrapped"),
+            "envelope round-trip preserves the OpenAI response shape",
+        );
+
+        // Critical regression check: the cached JSON does NOT contain
+        // the wrapper fields. If a future refactor accidentally
+        // returns the parsed envelope instead of the inner body,
+        // these would be present and the assertion fires.
+        assert!(
+            json.get("status").is_none(),
+            "envelope unwrap leaked wrapper 'status' field — display surfaces would break"
+        );
+        assert!(
+            json.get("headers").is_none(),
+            "envelope unwrap leaked wrapper 'headers' field — display surfaces would break"
+        );
+        assert!(
+            json.get("body").is_none(),
+            "envelope unwrap leaked wrapper 'body' field — display surfaces would break"
+        );
+    }
+
+    /// Phase 0 contract: empty response_blob means "no body" — used by
+    /// hook events without a response, in-flight steps, etc. Helpers
+    /// must return None instead of falling into the legacy decoder
+    /// (which would synthesize an envelope around zero bytes).
+    #[test]
+    fn read_step_response_body_returns_none_for_empty_blob() {
+        use crate::Timeline;
+        let (store, _dir) = test_store();
+        let session = Session {
+            id: "sess-empty".into(),
+            name: "empty-test".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            status: SessionStatus::Recording,
+            source: SessionSource::Hooks,
+            total_steps: 0,
+            total_tokens: 0,
+            metadata: serde_json::json!({}),
+            thread_id: None,
+            thread_ordinal: None,
+        };
+        store.create_session(&session).unwrap();
+        let timeline = Timeline::new_root(&session.id);
+        store.create_timeline(&timeline).unwrap();
+        let step = crate::Step::new_llm_call(&timeline.id, &session.id, 1, "gpt-4o");
+        // step.response_blob is "" by default from new_llm_call.
+        assert_eq!(step.response_blob, "");
+        assert!(store.read_step_response_body(&step).is_none());
+        assert!(store.read_step_response_json(&step).is_none());
+    }
+
+    /// Phase 0 contract: unknown format values fall through to the
+    /// legacy decoder rather than panic. A v0.13 binary reading a
+    /// hypothetical v0.14 envelope-v2 blob should degrade gracefully
+    /// (the user sees raw bytes as a "body") instead of crashing.
+    /// Forward-compat is cheap; the helper is a hot path.
+    #[test]
+    fn read_step_response_body_degrades_for_unknown_format() {
+        let (store, _dir) = test_store();
+        let raw = br#"{"some":"future-format-payload"}"#;
+        let step = seed_step_with_response(&store, "step-future", raw, 99);
+
+        // Decodes as if format were 0 — synthetic 200/empty/body=raw.
+        let body = store.read_step_response_body(&step).unwrap();
+        assert_eq!(body, raw, "unknown format degrades to legacy raw-body");
     }
 
     /// Santa review #3: cache_put / cache_get round-trip the format
