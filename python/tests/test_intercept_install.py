@@ -88,7 +88,7 @@ class TestCustomPredicates(unittest.TestCase):
     def test_install_with_custom_predicates_applies_to_httpx(self) -> None:
         # Custom predicate that matches example.com (which the default
         # never would). Verify the custom predicate is what got bound.
-        from unittest.mock import MagicMock, patch as mock_patch
+        from unittest.mock import patch as mock_patch
 
         from rewind_agent.intercept import _flow, _savings
 

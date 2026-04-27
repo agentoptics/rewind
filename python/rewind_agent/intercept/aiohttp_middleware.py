@@ -58,8 +58,12 @@ logger = logging.getLogger(__name__)
 
 # Conditional import — aiohttp is the most-likely-missing of the three
 # library deps because async stacks are less universal than sync.
+# Bare `import aiohttp` would be flagged unused (we only call ClientSession
+# directly, and the patch-target is ``ClientSession._request``); we rely
+# on the from-import for ImportError detection. ``aiohttp`` is also
+# referenced via the `aiohttp.ClientSession._request` attribute path the
+# tests patch, but that's runtime introspection, not a static import use.
 try:
-    import aiohttp
     from aiohttp import ClientSession
     from multidict import CIMultiDict, CIMultiDictProxy
 
