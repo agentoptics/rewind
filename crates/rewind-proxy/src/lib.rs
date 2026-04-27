@@ -376,47 +376,17 @@ async fn handle_request(
             store.cache_get(&request_hash).ok().flatten()
         } {
             // Cache hit! Return recorded response instantly.
-            // Step 0.3: the cached step may be format=0 (legacy) or format=1
-            // (envelope-v1). The replay_cache table doesn't carry the format
-            // column today — peek at the originating step to learn its
-            // format. If we can't find the originating step (cache row outlived
-            // it), fall back to FORMAT_NAKED_LEGACY which always parses safely.
-            let (envelope, format_for_replayed_step) = {
+            // Step 0.3 (Santa review #3): replay_cache now carries
+            // response_blob_format directly. Pre-v0.13 cache rows decode as
+            // 0 (legacy naked body) via the column DEFAULT, so legacy data
+            // round-trips unchanged. No JSON-shape sniff heuristic needed.
+            let envelope = {
                 let store = state.store.lock().unwrap();
                 let raw = store.blobs.get(&cached.response_blob).unwrap_or_default();
-                // The replay_cache row is keyed by request_hash, not step_id;
-                // all we have to discover format is the blob bytes themselves
-                // and an optimistic FORMAT_ENVELOPE_V1 try (the reader falls
-                // back to legacy on parse failure, which is correct for any
-                // pre-migration cached entry).
-                let env = rewind_store::ResponseEnvelope::from_blob_bytes(
-                    rewind_store::FORMAT_ENVELOPE_V1,
+                rewind_store::ResponseEnvelope::from_blob_bytes(
+                    cached.response_blob_format,
                     &raw,
-                );
-                // Heuristic: if the parsed envelope's body is non-empty AND
-                // the original blob doesn't trivially decode as a "raw" JSON
-                // body of equal bytes, treat as envelope-v1. Else legacy.
-                // Cheaper: just check whether the blob *looks* like an envelope
-                // JSON — must contain `"status":` near the start.
-                let format = if raw.len() > 12 && raw[0] == b'{'
-                    && std::str::from_utf8(&raw[..raw.len().min(64)])
-                        .ok()
-                        .map(|s| s.contains("\"status\":") && s.contains("\"headers\":") && s.contains("\"body\":"))
-                        .unwrap_or(false)
-                {
-                    rewind_store::FORMAT_ENVELOPE_V1
-                } else {
-                    rewind_store::FORMAT_NAKED_LEGACY
-                };
-                let env = if format == rewind_store::FORMAT_NAKED_LEGACY {
-                    rewind_store::ResponseEnvelope::from_blob_bytes(
-                        rewind_store::FORMAT_NAKED_LEGACY,
-                        &raw,
-                    )
-                } else {
-                    env
-                };
-                (env, format)
+                )
             };
 
             // Record as a replayed step
@@ -427,7 +397,7 @@ async fn handle_request(
             step.tokens_out = cached.tokens_out;
             step.request_blob = request_hash.clone();
             step.response_blob = cached.response_blob.clone();
-            step.response_blob_format = format_for_replayed_step;
+            step.response_blob_format = cached.response_blob_format;
             step.request_hash = Some(request_canonical_hash.clone());
 
             {
@@ -611,10 +581,20 @@ async fn handle_buffered_response(
         let _ = store.update_session_stats(&state.session_id, step_number, tokens_in + tokens_out);
     }
 
-    // Populate Instant Replay cache on success
+    // Populate Instant Replay cache on success.
+    // Step 0.3 (Santa review #3): forward step.response_blob_format so
+    // cache hits unwrap with the correct discriminator. New live writes
+    // are FORMAT_ENVELOPE_V1; cache row inherits.
     if state.instant_replay && step.status == StepStatus::Success && tokens_in > 0 {
         let store = state.store.lock().unwrap();
-        let _ = store.cache_put(&request_hash, &response_hash, &model, tokens_in, tokens_out);
+        let _ = store.cache_put(
+            &request_hash,
+            &response_hash,
+            step.response_blob_format,
+            &model,
+            tokens_in,
+            tokens_out,
+        );
     }
 
     tracing::info!(

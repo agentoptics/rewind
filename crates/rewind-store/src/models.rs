@@ -126,6 +126,30 @@ pub struct Step {
     pub response_blob_format: u8,
 }
 
+/// Step 0.1: row shape of the `replay_contexts` table.
+///
+/// Replaces the 5-tuple return type from `Store::get_replay_context` that
+/// clippy flagged as `type_complexity`. Named fields also make the call
+/// site self-documenting.
+#[derive(Debug, Clone)]
+pub struct ReplayContextRow {
+    pub session_id: String,
+    pub timeline_id: String,
+    /// Step number the replay forks at. `current_step` advances within
+    /// `[from_step, total_steps]`.
+    pub from_step: u32,
+    /// Number of replay-lookup calls served so far for this context.
+    /// Advanced by `Store::advance_replay_context` on the success path;
+    /// peeked by `Store::peek_next_replay_step` for pre-validation
+    /// lookups so a strict-mode 409 doesn't consume an ordinal slot.
+    pub current_step: u32,
+    /// `false` (default) → warn-on-divergence: cache hit returns the
+    /// recorded step plus an `X-Rewind-Cache-Divergent: true` header.
+    /// `true` → divergence escalates to HTTP 409 and the cursor stays put
+    /// so the caller can retry without consuming an ordinal slot.
+    pub strict_match: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StepType {
     LlmCall,
@@ -335,6 +359,12 @@ pub struct CacheEntry {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub hit_count: u64,
+    /// Step 0.3: format discriminator inherited from the originating step.
+    /// Pre-v0.13 cache rows decode as 0 (legacy naked body) via the column
+    /// DEFAULT, preserving back-compat. New `cache_put` calls forward the
+    /// originating step's format so cache hits can be unwrapped consistently
+    /// without sniff heuristics.
+    pub response_blob_format: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -30,7 +30,7 @@ module owns only the reusable detection/emission primitives.
 
 from __future__ import annotations
 
-import json
+import re
 from typing import Iterator, AsyncIterator
 
 from rewind_agent.intercept._request import RewindRequest
@@ -56,6 +56,24 @@ _JSON_CONTENT_TYPES: frozenset[str] = frozenset(
 # pay quadratic deserialization cost for huge prompts; ``stream: true``
 # would always appear within the first 8 KB on any reasonable client.
 _BODY_SNIFF_LIMIT_BYTES = 8 * 1024
+
+# Santa review #6: replace the previous ``json.loads(sniff)`` with a regex.
+# Reasons:
+#   1. Truncation safety — large bodies whose tail extends beyond the sniff
+#      window would fail JSON parsing with a misleading ``JSONDecodeError``,
+#      causing detect_streaming to silently return False even when stream:true
+#      is at the very top of the body.
+#   2. Cost — JSON-decoding a sniff window allocates a parsed object that's
+#      thrown away. The regex examines bytes directly.
+#   3. Whitespace tolerance — handles ``"stream":true``, ``"stream": true``,
+#      ``"stream"  : true`` uniformly without normalizing the body.
+#
+# The negative lookahead ``(?![\w])`` on the value side prevents matching
+# ``"stream": truefoo`` (would never appear in valid JSON, but defensive).
+# The leading boundary on the key side avoids matching nested keys like
+# ``"upstream": ...`` or ``"my_stream"`` substrings — only the canonical
+# ``"stream"`` token matches.
+_STREAM_TRUE_RE = re.compile(rb'(?<![\w_])"stream"\s*:\s*true(?![\w])')
 
 
 def is_json_content(req: RewindRequest) -> bool:
@@ -105,25 +123,15 @@ def detect_streaming(req: RewindRequest) -> bool:
     body = req.body
     if not body:
         return False
-    # Cheap pre-filter: if the literal substring isn't there, no JSON
-    # parse is needed. This is wrong for `"stream":true` with no space
-    # vs `"stream" : true` with surrounding whitespace, but JSON serializers
-    # virtually always emit one of two canonical forms (no-whitespace from
-    # Python's `json.dumps`, comma+space from JS-style serializers). Try
-    # both before paying for a parse.
+    # Truncation-safe regex check (Santa review #6): the sniff window is
+    # capped at 8 KB; previous code did ``json.loads(sniff)`` which would
+    # raise on a window-truncated body and silently miss streaming. The
+    # regex matches the literal ``"stream":true`` token at any whitespace
+    # variant and works on partial bodies. ``"stream"`` always appears
+    # near the top of LLM control-field JSON in practice — a megabyte of
+    # context messages never pushes it past 8 KB.
     sniff = body[:_BODY_SNIFF_LIMIT_BYTES]
-    if b'"stream"' not in sniff:
-        return False
-
-    # Cheap structural test: parse only if the substring is present. Catch
-    # all parse errors — a truncated body during streaming, a non-JSON
-    # body that smelled like one, etc. — and treat as "not streaming"
-    # rather than raise.
-    try:
-        parsed = json.loads(sniff)
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return isinstance(parsed, dict) and parsed.get("stream") is True
+    return bool(_STREAM_TRUE_RE.search(sniff))
 
 
 def synthetic_sse_for_cache_hit(body: bytes) -> bytes:

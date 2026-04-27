@@ -122,31 +122,54 @@ impl ResponseEnvelope {
 /// Strip headers that should not survive a record→replay round-trip.
 ///
 /// Removes:
-/// - Hop-by-hop headers per RFC 7230 §6.1 (transfer-encoding, te, trailer,
-///   upgrade, proxy-authorization, proxy-connection, keep-alive, expect)
-/// - `Set-Cookie` (session-binding; replaying a stale Set-Cookie poisons
-///   the new client)
-/// - `Authorization` (rare on responses but seen in some token-rotation
-///   patterns; we don't want to surface a recorded credential at replay)
+/// - **Hop-by-hop headers per RFC 7230 §6.1** — `Connection` itself,
+///   `Transfer-Encoding`, `TE`, `Trailer`, `Upgrade`, `Proxy-Authorization`,
+///   `Proxy-Connection`, `Keep-Alive`, `Expect`.
+/// - **Headers nominated by the response's `Connection` value** — RFC 7230
+///   §6.1 mandates that any header listed in `Connection` is itself
+///   connection-specific and must be removed at the same hop. Example:
+///   `Connection: close, foo` removes `Connection`, `close` (no-op since
+///   no header is named "close"), and any header named `foo`.
+/// - **`Set-Cookie`** — session-binding; replaying a stale Set-Cookie
+///   poisons the new client.
+/// - **`Authorization`** — rare on responses but seen in some
+///   token-rotation patterns; we don't want to surface a recorded
+///   credential at replay.
+/// - **`x-api-key`** — same rationale as Authorization, common in
+///   API-keyed providers like OpenAI / Anthropic / Azure.
 ///
-/// Header name comparison is case-insensitive. Original casing of remaining
-/// headers is preserved.
+/// Header name comparison is case-insensitive throughout. Original casing
+/// of remaining headers is preserved so consumers that key on
+/// non-canonicalized names (rare but real) still see the original spelling.
 pub fn scrub_response_headers<I, K, V>(headers: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
     V: AsRef<str>,
 {
-    headers
+    // Materialize once so we can do the Connection-nominated lookup before
+    // filtering. The intermediate Vec is necessary because Connection-named
+    // headers might appear before or after the Connection header itself.
+    let materialized: Vec<(String, String)> = headers
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
+        .collect();
+    let nominated = redact::connection_nominated_headers(
+        materialized.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+
+    materialized
         .into_iter()
         .filter(|(k, _v)| {
-            let lower = k.as_ref().to_ascii_lowercase();
+            let lower = k.to_ascii_lowercase();
             if redact::is_hop_by_hop(&lower) {
                 return false;
             }
-            !matches!(lower.as_str(), "set-cookie" | "authorization")
+            if nominated.contains(&lower) {
+                return false;
+            }
+            !matches!(lower.as_str(), "set-cookie" | "authorization" | "x-api-key")
         })
-        .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))
         .collect()
 }
 
@@ -162,7 +185,10 @@ mod bytes_as_base64 {
         // sufficient for our needs. Engine: RFC 4648 §4 (no padding skipping).
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+        // div_ceil-based capacity hint: every 3-byte input chunk produces
+        // 4 base64 chars, partial chunks pad to 4. clippy::manual_div_ceil
+        // flagged `(bytes.len() + 2) / 3 * 4` as a manual reimplementation.
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0];
             let b1 = chunk.get(1).copied().unwrap_or(0);
@@ -263,21 +289,66 @@ mod tests {
         let scrubbed = scrub_response_headers(vec![
             ("Content-Type", "application/json"),
             ("Transfer-Encoding", "chunked"),
-            ("Connection", "keep-alive"), // not hop-by-hop in our list — kept
+            ("Connection", "close"),       // Connection itself is hop-by-hop now
             ("Keep-Alive", "timeout=5"),
         ]);
         let names: Vec<&str> = scrubbed.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"Content-Type"));
         assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("transfer-encoding")));
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("connection")));
         assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("keep-alive")));
     }
 
+    /// Santa review #5: `Connection` value lists additional connection-specific
+    /// headers (RFC 7230 §6.1). Those must be stripped regardless of where
+    /// they appear in the header list (before or after the Connection header
+    /// itself).
     #[test]
-    fn scrub_strips_set_cookie_and_authorization() {
+    fn scrub_strips_connection_nominated_headers() {
+        let scrubbed = scrub_response_headers(vec![
+            ("X-Custom-Trace", "trace-id-123"),
+            ("Connection", "X-Custom-Trace, foo"),
+            ("foo", "bar"),
+            ("Content-Type", "application/json"),
+        ]);
+        let names: Vec<String> = scrubbed
+            .iter()
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        // X-Custom-Trace and foo are nominated by Connection — both stripped.
+        assert!(!names.contains(&"x-custom-trace".to_string()));
+        assert!(!names.contains(&"foo".to_string()));
+        // Connection itself is stripped (it's hop-by-hop).
+        assert!(!names.contains(&"connection".to_string()));
+        // Content-Type unaffected.
+        assert!(names.contains(&"content-type".to_string()));
+    }
+
+    #[test]
+    fn scrub_strips_connection_nominated_when_listed_first() {
+        // Connection appears AFTER the nominated header to verify the
+        // materialize-then-filter ordering doesn't matter.
+        let scrubbed = scrub_response_headers(vec![
+            ("X-Trailer-Foo", "v1"),
+            ("Content-Type", "application/json"),
+            ("Connection", "X-Trailer-Foo"),
+        ]);
+        let names: Vec<String> = scrubbed
+            .iter()
+            .map(|(k, _)| k.to_ascii_lowercase())
+            .collect();
+        assert!(!names.contains(&"x-trailer-foo".to_string()));
+        assert!(!names.contains(&"connection".to_string()));
+        assert!(names.contains(&"content-type".to_string()));
+    }
+
+    #[test]
+    fn scrub_strips_set_cookie_and_authorization_and_xapikey() {
         let scrubbed = scrub_response_headers(vec![
             ("Content-Type", "application/json"),
             ("Set-Cookie", "session=abc; Path=/"),
             ("Authorization", "Bearer xyz"),
+            ("X-Api-Key", "sk-secret"),  // Santa review #5: also strip x-api-key
             ("X-Request-Id", "req-1"),
         ]);
         let names: Vec<String> = scrubbed
@@ -288,6 +359,7 @@ mod tests {
         assert!(names.contains(&"x-request-id".to_string()));
         assert!(!names.contains(&"set-cookie".to_string()));
         assert!(!names.contains(&"authorization".to_string()));
+        assert!(!names.contains(&"x-api-key".to_string()));
     }
 
     #[test]
@@ -296,8 +368,9 @@ mod tests {
             ("AUTHORIZATION", "Bearer x"),
             ("set-cookie", "v=1"),
             ("TRANSFER-ENCODING", "chunked"),
+            ("X-API-KEY", "k1"),
         ]);
-        assert!(scrubbed.is_empty(), "all 3 should be stripped regardless of case");
+        assert!(scrubbed.is_empty(), "all 4 should be stripped regardless of case");
     }
 
     #[test]

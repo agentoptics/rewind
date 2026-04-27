@@ -134,11 +134,11 @@ async fn get_session_steps(
     let with_blobs = query.include_blobs.unwrap_or(0) == 1;
 
     let responses: Vec<StepResponse> = steps.iter().map(|s| {
-        let response_preview = extract_preview(&store, &s.response_blob);
+        let response_preview = extract_preview(&store, &s.response_blob, s.response_blob_format);
         let (req_body, resp_body) = if with_blobs {
             (
-                blob_to_json(&store, &s.request_blob),
-                blob_to_json(&store, &s.response_blob),
+                request_blob_to_json(&store, &s.request_blob),
+                response_blob_to_json(&store, &s.response_blob, s.response_blob_format),
             )
         } else {
             (None, None)
@@ -223,21 +223,16 @@ async fn get_step_detail(
         (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
     })?.ok_or_else(|| (StatusCode::NOT_FOUND, format!("Step not found: {id}")))?;
 
-    let request_body = if !step.request_blob.is_empty() {
-        store.blobs.get(&step.request_blob).ok()
-            .and_then(|data| String::from_utf8(data).ok())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    } else {
-        None
-    };
+    let request_body = request_blob_to_json(&store, &step.request_blob);
 
-    let response_body = if !step.response_blob.is_empty() {
-        store.blobs.get(&step.response_blob).ok()
-            .and_then(|data| String::from_utf8(data).ok())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    } else {
-        None
-    };
+    // Step 0.3 (Santa review #4): unwrap the envelope before JSON-parsing
+    // so the dashboard never surfaces envelope wrapper fields. Pre-v0.13
+    // blobs (response_blob_format=0) round-trip via legacy fallback.
+    let response_body = response_blob_to_json(
+        &store,
+        &step.response_blob,
+        step.response_blob_format,
+    );
 
     let messages = request_body.as_ref().and_then(extract_messages);
 
@@ -469,7 +464,7 @@ fn build_span_response(span: &rewind_store::Span, all_spans: &[rewind_store::Spa
     let span_steps: Vec<StepResponse> = all_steps.iter()
         .filter(|s| s.span_id.as_deref() == Some(&span.id))
         .map(|s| {
-            let response_preview = extract_preview(store, &s.response_blob);
+            let response_preview = extract_preview(store, &s.response_blob, s.response_blob_format);
             StepResponse {
                 id: s.id.clone(),
                 timeline_id: s.timeline_id.clone(),
@@ -597,11 +592,47 @@ fn resolve_timeline_ref(timelines: &[rewind_store::Timeline], reference: &str) -
     anyhow::bail!("Timeline not found: {}", reference)
 }
 
-pub fn extract_preview_from_store(store: &rewind_store::Store, blob_hash: &str) -> String {
-    extract_preview(store, blob_hash)
+/// Public re-export used by ws.rs and other display surfaces.
+///
+/// `response_blob_format` argument is the discriminator from `Step.response_blob_format`.
+/// For request blobs (which never carry envelope structure), pass
+/// `FORMAT_NAKED_LEGACY` (= 0) — the helper falls through to legacy
+/// raw-bytes parsing in that case.
+pub fn extract_preview_from_store(
+    store: &rewind_store::Store,
+    blob_hash: &str,
+    response_blob_format: u8,
+) -> String {
+    extract_preview(store, blob_hash, response_blob_format)
 }
 
-fn blob_to_json(store: &rewind_store::Store, blob_hash: &str) -> Option<serde_json::Value> {
+/// Step 0.3 (Santa review #4): every web API path that surfaces a step's
+/// response body must unwrap the envelope before JSON-parsing. Pre-v0.13
+/// blobs (`format=0`) round-trip unchanged via `ResponseEnvelope::from_blob_bytes`'s
+/// legacy fallback; v0.13+ blobs (`format=1`) get unwrapped to their inner
+/// JSON body so the dashboard / SDK callers don't see envelope wrapper
+/// fields like `{status, headers, body}`.
+fn read_response_blob_unwrapped(
+    store: &rewind_store::Store,
+    blob_hash: &str,
+    format: u8,
+) -> Option<Vec<u8>> {
+    if blob_hash.is_empty() {
+        return None;
+    }
+    let raw = store.blobs.get(blob_hash).ok()?;
+    let envelope = rewind_store::ResponseEnvelope::from_blob_bytes(format, &raw);
+    Some(envelope.body)
+}
+
+/// Read a request blob (or other naked-format blob) as raw bytes parsed as JSON.
+/// Request bodies have no envelope wrapper — they're stored as content-addressed
+/// JSON bytes regardless of step format. Use [`response_blob_to_json`] for
+/// response blobs (which DO need envelope unwrapping post-v0.13).
+fn request_blob_to_json(
+    store: &rewind_store::Store,
+    blob_hash: &str,
+) -> Option<serde_json::Value> {
     if blob_hash.is_empty() {
         return None;
     }
@@ -610,12 +641,32 @@ fn blob_to_json(store: &rewind_store::Store, blob_hash: &str) -> Option<serde_js
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
-fn extract_preview(store: &rewind_store::Store, blob_hash: &str) -> String {
-    if blob_hash.is_empty() {
+/// Step 0.3 (Santa review #4): response-blob counterpart that unwraps
+/// the envelope before JSON-parsing. Callers supply
+/// `step.response_blob_format`; legacy format=0 blobs round-trip via
+/// `ResponseEnvelope::from_blob_bytes`'s synthetic 200/empty-headers
+/// shape, so legacy data parses identically to the previous behavior.
+fn response_blob_to_json(
+    store: &rewind_store::Store,
+    blob_hash: &str,
+    format: u8,
+) -> Option<serde_json::Value> {
+    let body = read_response_blob_unwrapped(store, blob_hash, format)?;
+    serde_json::from_slice(&body).ok()
+}
+
+fn extract_preview(
+    store: &rewind_store::Store,
+    blob_hash: &str,
+    response_blob_format: u8,
+) -> String {
+    let Some(body) = read_response_blob_unwrapped(store, blob_hash, response_blob_format) else {
         return String::new();
-    }
-    store.blobs.get(blob_hash).ok()
-        .and_then(|data| String::from_utf8(data).ok())
+    };
+    let Ok(json_str) = String::from_utf8(body) else {
+        return String::new();
+    };
+    Some(json_str)
         .and_then(|json_str| {
             let val: serde_json::Value = serde_json::from_str(&json_str).ok()?;
             // OpenAI format
@@ -1152,19 +1203,24 @@ async fn do_replay_lookup(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Replay context not found".to_string()))?;
 
-    let (ctx_session_id, ctx_timeline_id, from_step, _current_step, strict_match) = ctx;
-
     let session = resolve_session(&store, session_ref)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("{e}")))?;
 
-    if session.id != ctx_session_id {
+    if session.id != ctx.session_id {
         return Err((StatusCode::BAD_REQUEST, "Replay context belongs to a different session".to_string()));
     }
 
-    let ordinal = store.advance_replay_context(&body.replay_context_id)
+    // Step 0.1 fix (Santa review #2): peek the next ordinal without
+    // committing. We advance the cursor only on the success path (cache hit
+    // served, with or without warn-on-divergence). On strict-match 409 the
+    // cursor stays put so the caller can retry the corrected request without
+    // consuming an ordinal slot — preserves replay-state integrity across
+    // partial failures.
+    let next_ordinal = store.peek_next_replay_step(&body.replay_context_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
-
-    let target_step = from_step + ordinal;
+    let target_step = ctx.from_step + next_ordinal;
+    let ctx_timeline_id = ctx.timeline_id.clone();
+    let strict_match = ctx.strict_match;
 
     // O(1) lookup via idx_steps_timeline index instead of fetching all steps.
     // For forked timelines, check the fork timeline first, then fall back to parent.
@@ -1182,17 +1238,21 @@ async fn do_replay_lookup(
 
     match cached_step {
         Some(ref step) if !step.response_blob.is_empty() => {
-            // Step 0.1: cache content validation. The lookup is ordinal-based
-            // (see advance_replay_context above), so mismatches here mean
-            // the agent's call sequence diverged from the recording — either
-            // the predicate (`is_llm_call`) misclassified an auxiliary call
-            // and shifted the ordinal, or the agent's reasoning path took a
-            // different branch this run.
+            // Step 0.1: cache content validation. The lookup is ordinal-based,
+            // so mismatches here mean the agent's call sequence diverged from
+            // the recording — either the predicate (`is_llm_call`) misclassified
+            // an auxiliary call and shifted the ordinal, or the agent's
+            // reasoning path took a different branch this run.
             //
             // Validation runs only when:
             //   1. Caller supplied request_body (pre-Tier-1 SDKs may omit)
             //   2. Cached step has a request_hash (pre-migration rows are NULL
             //      and treated as "match anything" for backwards compat)
+            //
+            // Cursor advancement (Santa review #2): we peeked above, so the
+            // cursor has NOT moved. Strict 409 returns without advancing —
+            // caller can retry. Warn-on-divergence and exact-match paths
+            // both advance just before constructing the success response.
             let divergent = match (&body.request_body, &step.request_hash) {
                 (Some(req), Some(stored_hash)) => {
                     let body_bytes = serde_json::to_vec(req).unwrap_or_default();
@@ -1204,8 +1264,12 @@ async fn do_replay_lookup(
                                 target_step,
                                 stored_hash = %stored_hash,
                                 incoming_hash = %incoming_hash,
-                                "cache_divergence (strict_match) — returning 409"
+                                "cache_divergence (strict_match) — returning 409, cursor stays at {} for retry",
+                                ctx.current_step,
                             );
+                            // Strict mode: do NOT advance — the caller is
+                            // expected to fix and retry. Returning early
+                            // skips advance_replay_context.
                             return Err((
                                 StatusCode::CONFLICT,
                                 format!(
@@ -1231,6 +1295,11 @@ async fn do_replay_lookup(
                 _ => false,
             };
 
+            // Validation passed (or skipped) — commit the ordinal advance.
+            store
+                .advance_replay_context(&body.replay_context_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
             // Step 0.3: unwrap the response envelope. format=0 (legacy)
             // returns synthetic { status: 200, headers: [], body: bytes },
             // so legacy blobs round-trip as today. format=1 (envelope) returns
@@ -1244,12 +1313,11 @@ async fn do_replay_lookup(
             let resp_json = serde_json::from_slice(&envelope.body)
                 .unwrap_or(serde_json::Value::Null);
 
-            let header_value = if divergent { "true" } else { "false" };
             Ok((
                 StatusCode::OK,
                 [(
                     axum::http::HeaderName::from_static(HEADER_CACHE_DIVERGENT),
-                    axum::http::HeaderValue::from_static(if header_value == "true" { "true" } else { "false" }),
+                    axum::http::HeaderValue::from_static(if divergent { "true" } else { "false" }),
                 )],
                 Json(ReplayLookupResponse {
                     hit: true,
@@ -1261,21 +1329,31 @@ async fn do_replay_lookup(
                 }),
             ))
         }
-        _ => Ok((
-            StatusCode::OK,
-            [(
-                axum::http::HeaderName::from_static(HEADER_CACHE_DIVERGENT),
-                axum::http::HeaderValue::from_static("false"),
-            )],
-            Json(ReplayLookupResponse {
-                hit: false,
-                response_body: None,
-                model: None,
-                step_number: None,
-                active_timeline_id: Some(ctx_timeline_id),
-                divergent: false,
-            }),
-        )),
+        _ => {
+            // Cache miss — still advance so future calls match recorded
+            // step N+1. The agent's call wasn't in the recording (or recording
+            // shorter than replay), but advancing keeps the ordinal aligned
+            // with the agent's call sequence.
+            store
+                .advance_replay_context(&body.replay_context_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+
+            Ok((
+                StatusCode::OK,
+                [(
+                    axum::http::HeaderName::from_static(HEADER_CACHE_DIVERGENT),
+                    axum::http::HeaderValue::from_static("false"),
+                )],
+                Json(ReplayLookupResponse {
+                    hit: false,
+                    response_body: None,
+                    model: None,
+                    step_number: None,
+                    active_timeline_id: Some(ctx_timeline_id),
+                    divergent: false,
+                }),
+            ))
+        }
     }
 }
 
@@ -1332,6 +1410,14 @@ struct CreateReplayContextRequest {
     session_id: String,
     from_step: u32,
     fork_timeline_id: String,
+    /// Step 0.1: opt into strict-mode cache validation. When `true`, any
+    /// content-hash divergence at lookup time returns HTTP 409 instead of
+    /// the cached response. Default is `false` (warn-on-divergence: cached
+    /// step returned with `X-Rewind-Cache-Divergent: true` header). Set to
+    /// `true` for tests and CI flows where the agent's call sequence MUST
+    /// match the recording byte-for-byte.
+    #[serde(default)]
+    strict_match: bool,
 }
 
 #[derive(Serialize)]
@@ -1339,6 +1425,8 @@ struct CreateReplayContextResponse {
     replay_context_id: String,
     parent_steps_count: u32,
     fork_at_step: u32,
+    /// Echoed back so the caller can verify the strict_match flag landed.
+    strict_match: bool,
 }
 
 async fn create_replay_context(
@@ -1370,11 +1458,16 @@ async fn create_replay_context(
     let ctx_id = Uuid::new_v4().to_string();
     store.create_replay_context(&ctx_id, &session.id, &body.fork_timeline_id, body.from_step)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    if body.strict_match {
+        store.set_replay_context_strict_match(&ctx_id, true)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    }
 
     Ok((StatusCode::CREATED, Json(CreateReplayContextResponse {
         replay_context_id: ctx_id,
         parent_steps_count,
         fork_at_step: body.from_step,
+        strict_match: body.strict_match,
     })))
 }
 

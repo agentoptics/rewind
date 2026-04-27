@@ -213,17 +213,62 @@ def test_detect_streaming_skips_body_parse_for_multipart() -> None:
     assert detect_streaming(req) is False
 
 
-def test_detect_streaming_handles_truncated_json_body() -> None:
-    """A streaming upload whose body got partially buffered shouldn't
-    panic detect_streaming. The malformed JSON parse should fall back
-    to "not streaming"."""
+def test_detect_streaming_truncated_body_still_detects_stream_true() -> None:
+    """Santa review #6 regression: previously json.loads(sniff) would raise
+    JSONDecodeError on a truncated body, causing detect_streaming to
+    return False even when stream:true is at the very top of the body.
+    The regex approach matches partial bodies correctly."""
     req = RewindRequest(
         url="x", method="POST",
         headers={"content-type": "application/json"},
-        body=b'{"stream": true, "messages":',  # truncated
+        body=b'{"stream": true, "messages":',  # truncated mid-array
     )
-    # No panic; falls back to false.
-    assert detect_streaming(req) is False
+    assert detect_streaming(req) is True
+
+    # Same with whitespace variants.
+    for body in (
+        b'{"stream":true,"messages":[',                  # no whitespace
+        b'{ "stream" : true , "messages" : [',           # extra whitespace
+        b'{\n  "stream": true,\n  "messages": [',         # newlines
+        b'{"model": "gpt-4o", "stream":true, "msgs":[',  # not the first key
+    ):
+        truncated = RewindRequest(
+            url="x", method="POST",
+            headers={"content-type": "application/json"},
+            body=body,
+        )
+        assert detect_streaming(truncated) is True, f"failed on body: {body!r}"
+
+
+def test_detect_streaming_does_not_match_nested_stream_keys() -> None:
+    """The regex must only match the canonical "stream" key, not similar
+    substrings like "upstream", "my_stream", or "stream_id"."""
+    for body in (
+        b'{"upstream": true}',           # different key
+        b'{"my_stream": true}',          # different key
+        b'{"stream_options": {"...": true}}',  # different key with similar prefix
+        b'{"messages": [{"content": "the stream is true here"}]}',  # in user prompt
+    ):
+        req = RewindRequest(
+            url="x", method="POST",
+            headers={"content-type": "application/json"},
+            body=body,
+        )
+        assert detect_streaming(req) is False, f"false-positive on body: {body!r}"
+
+
+def test_detect_streaming_huge_body_with_stream_at_top() -> None:
+    """A 1 MB body with stream:true at the very top still detects streaming.
+    The 8 KB sniff window doesn't truncate the regex match because the
+    substring is well within the window."""
+    body = b'{"stream": true, "messages": [' + b'{"content": "filler"},' * 50_000 + b']}'
+    assert len(body) > 1_000_000, "test body should exceed 1 MB"
+    req = RewindRequest(
+        url="x", method="POST",
+        headers={"content-type": "application/json"},
+        body=body,
+    )
+    assert detect_streaming(req) is True
 
 
 def test_detect_streaming_substring_pre_filter() -> None:
@@ -247,17 +292,16 @@ def test_detect_streaming_substring_pre_filter() -> None:
 
 
 def test_detect_streaming_respects_sniff_limit() -> None:
-    """`stream: true` past the sniff limit is not detected. This is by
+    """``stream: true`` past the sniff limit is not detected. This is by
     design — real LLM clients put control fields at the top of the JSON,
-    not buried inside megabyte-long context strings."""
+    not buried inside megabyte-long context strings. Conservative miss
+    when the field is actually unreachable in the sniff window."""
     huge_prefix = b'{"messages": [{"content": "' + (b"x" * 10_000) + b'"}],'
     req = RewindRequest(
         url="x", method="POST",
         headers={"content-type": "application/json"},
         body=huge_prefix + b' "stream": true}',
     )
-    # The "stream" literal is past the sniff limit so we don't see it.
-    # Conservative miss is the right call here.
     assert detect_streaming(req) is False
 
 

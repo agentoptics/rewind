@@ -361,6 +361,12 @@ impl Store {
         // "warn-on-divergence" (return cached + X-Rewind-Cache-Divergent header).
         // 1 ⇒ escalate divergence to HTTP 409. See do_replay_lookup.
         let _ = self.conn.execute("ALTER TABLE replay_contexts ADD COLUMN strict_match INTEGER NOT NULL DEFAULT 0", []);
+        // Step 0.3 (Santa review #3): replay_cache needs the format
+        // discriminator too so instant-replay cache hits can unwrap envelope-v1
+        // blobs deterministically — no JSON-shape sniff heuristic. Pre-v0.13
+        // cache rows default to 0 (legacy naked body), matching their write-time
+        // semantics.
+        let _ = self.conn.execute("ALTER TABLE replay_cache ADD COLUMN response_blob_format INTEGER NOT NULL DEFAULT 0", []);
 
         Ok(())
     }
@@ -700,29 +706,43 @@ impl Store {
         Ok(step)
     }
 
-    /// Returns (session_id, timeline_id, from_step, current_step, strict_match).
-    /// strict_match was added in v0.13 (Step 0.1); pre-migration rows return
-    /// `false` via the column DEFAULT 0, which decodes as the warn-on-divergence
-    /// fallback at the lookup layer.
-    pub fn get_replay_context(
-        &self, context_id: &str,
-    ) -> Result<Option<(String, String, u32, u32, bool)>> {
+    /// Row shape returned by [`Self::get_replay_context`].
+    ///
+    /// `strict_match` was added in the v0.13 migration (Step 0.1);
+    /// pre-migration rows decode via column DEFAULT 0 to `false`, which is
+    /// the warn-on-divergence fallback at the lookup layer.
+    pub fn get_replay_context(&self, context_id: &str) -> Result<Option<ReplayContextRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, timeline_id, from_step, current_step, strict_match
              FROM replay_contexts WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![context_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, u32>(2)?,
-                row.get::<_, u32>(3)?,
-                // Use Option<i64> to gracefully handle the (impossible-but-defensive)
+            Ok(ReplayContextRow {
+                session_id: row.get::<_, String>(0)?,
+                timeline_id: row.get::<_, String>(1)?,
+                from_step: row.get::<_, u32>(2)?,
+                current_step: row.get::<_, u32>(3)?,
+                // Option<i64> to gracefully handle the (impossible-but-defensive)
                 // case of a pre-migration row read against a v0.13+ schema.
-                row.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
-            ))
+                strict_match: row.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
+            })
         })?;
         Ok(rows.next().transpose()?)
+    }
+
+    /// Peek the next replay step number without advancing the cursor.
+    ///
+    /// Step 0.1 fix: cursor advancement was previously unconditional, so a
+    /// strict-mode `409` divergence consumed the slot — retrying the agent's
+    /// call would skip ahead to the next ordinal. Now `do_replay_lookup`
+    /// peeks first, validates, and only advances on the success path.
+    pub fn peek_next_replay_step(&self, context_id: &str) -> Result<u32> {
+        let current: u32 = self.conn.query_row(
+            "SELECT current_step FROM replay_contexts WHERE id = ?1",
+            params![context_id],
+            |row| row.get(0),
+        )?;
+        Ok(current + 1)
     }
 
     /// Set the strict_match flag on a replay context. Strict mode escalates
@@ -764,18 +784,40 @@ impl Store {
 
     // ── Instant Replay Cache ──────────────────────────────────
 
-    pub fn cache_put(&self, request_hash: &str, response_blob: &str, model: &str, tokens_in: u64, tokens_out: u64) -> Result<()> {
+    /// Insert (or replace) a replay_cache entry.
+    ///
+    /// `response_blob_format` should match the originating step's format
+    /// (typically `FORMAT_ENVELOPE_V1` for v0.13+ writes). Pre-v0.13
+    /// callers that don't know about format may pass `FORMAT_NAKED_LEGACY`
+    /// (= 0) and the column will round-trip as legacy on read.
+    pub fn cache_put(
+        &self,
+        request_hash: &str,
+        response_blob: &str,
+        response_blob_format: u8,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO replay_cache (request_hash, response_blob, model, tokens_in, tokens_out, hit_count, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![request_hash, response_blob, model, tokens_in, tokens_out, chrono::Utc::now().to_rfc3339()],
+            "INSERT OR REPLACE INTO replay_cache (request_hash, response_blob, response_blob_format, model, tokens_in, tokens_out, hit_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            params![
+                request_hash,
+                response_blob,
+                response_blob_format,
+                model,
+                tokens_in,
+                tokens_out,
+                chrono::Utc::now().to_rfc3339(),
+            ],
         )?;
         Ok(())
     }
 
     pub fn cache_get(&self, request_hash: &str) -> Result<Option<CacheEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT request_hash, response_blob, model, tokens_in, tokens_out, hit_count
+            "SELECT request_hash, response_blob, model, tokens_in, tokens_out, hit_count, response_blob_format
              FROM replay_cache WHERE request_hash = ?1",
         )?;
         let mut rows = stmt.query_map(params![request_hash], |row| {
@@ -786,6 +828,10 @@ impl Store {
                 tokens_in: row.get(3)?,
                 tokens_out: row.get(4)?,
                 hit_count: row.get(5)?,
+                // Defensive Option<u8> read — pre-v0.13 rows return NULL
+                // before the migration runs (immediately after upgrade) and
+                // we want them to read as 0 (legacy naked body).
+                response_blob_format: row.get::<_, Option<u8>>(6)?.unwrap_or(0),
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -2006,5 +2052,131 @@ mod tests {
         assert_eq!(store.get_session("active-c").unwrap().unwrap().status, SessionStatus::Recording);
         // done-d still completed (not double-updated)
         assert_eq!(store.get_session("done-d").unwrap().unwrap().status, SessionStatus::Completed);
+    }
+
+    // ── Step 0 regression tests (Santa review fixes) ────────────────
+
+    /// Helper: create a minimal session + timeline + replay context for
+    /// the cursor / strict-match tests.
+    fn seed_replay_context(store: &Store, strict: bool) -> String {
+        use crate::Timeline;
+        let session = Session {
+            id: "sess-replay".into(),
+            name: "replay-test".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            status: SessionStatus::Recording,
+            source: SessionSource::Hooks,
+            total_steps: 0,
+            total_tokens: 0,
+            metadata: serde_json::json!({}),
+            thread_id: None,
+            thread_ordinal: None,
+        };
+        store.create_session(&session).unwrap();
+        let timeline = Timeline::new_root(&session.id);
+        store.create_timeline(&timeline).unwrap();
+        let ctx_id = "ctx-replay".to_string();
+        store
+            .create_replay_context(&ctx_id, &session.id, &timeline.id, 0)
+            .unwrap();
+        if strict {
+            store.set_replay_context_strict_match(&ctx_id, true).unwrap();
+        }
+        ctx_id
+    }
+
+    /// Santa review #2: peek_next_replay_step must NOT advance the cursor
+    /// — that's the whole reason it exists. Validates the new transactional
+    /// cursor model (peek → validate → advance only on success).
+    #[test]
+    fn peek_replay_step_does_not_advance_cursor() {
+        let (store, _dir) = test_store();
+        let ctx_id = seed_replay_context(&store, false);
+
+        // Initial state: current_step = 0, peek returns 1.
+        assert_eq!(store.peek_next_replay_step(&ctx_id).unwrap(), 1);
+        // Re-peeking returns the same value — no mutation.
+        assert_eq!(store.peek_next_replay_step(&ctx_id).unwrap(), 1);
+        assert_eq!(store.peek_next_replay_step(&ctx_id).unwrap(), 1);
+
+        // Confirm get_replay_context still reports current_step = 0.
+        let ctx = store.get_replay_context(&ctx_id).unwrap().unwrap();
+        assert_eq!(ctx.current_step, 0);
+    }
+
+    /// Santa review #2: advance is what bumps the counter; peek only reads.
+    #[test]
+    fn advance_after_peek_increments_normally() {
+        let (store, _dir) = test_store();
+        let ctx_id = seed_replay_context(&store, false);
+
+        assert_eq!(store.peek_next_replay_step(&ctx_id).unwrap(), 1);
+        assert_eq!(store.advance_replay_context(&ctx_id).unwrap(), 1);
+        assert_eq!(store.peek_next_replay_step(&ctx_id).unwrap(), 2);
+        assert_eq!(store.advance_replay_context(&ctx_id).unwrap(), 2);
+    }
+
+    /// Santa review #2: strict_match flag round-trips through the schema.
+    #[test]
+    fn strict_match_round_trips_via_setter() {
+        let (store, _dir) = test_store();
+
+        // Default-false context.
+        let ctx_id_default = seed_replay_context(&store, false);
+        assert!(!store.get_replay_context(&ctx_id_default).unwrap().unwrap().strict_match);
+
+        // Construct a SECOND context on the same session/timeline so the
+        // FK constraints are satisfied. Cannot use seed_replay_context
+        // here (it'd try to re-insert the session and panic on the unique
+        // primary key); instead, fetch the timeline_id and reuse it.
+        let timelines = store.get_timelines("sess-replay").unwrap();
+        let timeline_id = timelines.first().unwrap().id.clone();
+
+        let ctx_id_strict = "ctx-strict-explicit".to_string();
+        store
+            .create_replay_context(&ctx_id_strict, "sess-replay", &timeline_id, 0)
+            .unwrap();
+        store.set_replay_context_strict_match(&ctx_id_strict, true).unwrap();
+        assert!(store.get_replay_context(&ctx_id_strict).unwrap().unwrap().strict_match);
+
+        // Toggling back to false also works.
+        store.set_replay_context_strict_match(&ctx_id_strict, false).unwrap();
+        assert!(!store.get_replay_context(&ctx_id_strict).unwrap().unwrap().strict_match);
+    }
+
+    /// Santa review #3: cache_put / cache_get round-trip the format
+    /// discriminator. Pre-v0.13 cache entries default to format=0.
+    #[test]
+    fn cache_format_round_trips() {
+        let (store, _dir) = test_store();
+
+        // Write an envelope-format-1 cache entry (the new live-record path).
+        store
+            .cache_put(
+                "hash-envelope",
+                "blob-1",
+                crate::FORMAT_ENVELOPE_V1,
+                "gpt-4o",
+                100,
+                50,
+            )
+            .unwrap();
+        let entry = store.cache_get("hash-envelope").unwrap().unwrap();
+        assert_eq!(entry.response_blob_format, crate::FORMAT_ENVELOPE_V1);
+
+        // Write a legacy cache entry — format 0 stays 0 on read.
+        store
+            .cache_put(
+                "hash-legacy",
+                "blob-2",
+                crate::FORMAT_NAKED_LEGACY,
+                "gpt-4o",
+                10,
+                5,
+            )
+            .unwrap();
+        let legacy = store.cache_get("hash-legacy").unwrap().unwrap();
+        assert_eq!(legacy.response_blob_format, crate::FORMAT_NAKED_LEGACY);
     }
 }

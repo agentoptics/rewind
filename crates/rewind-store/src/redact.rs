@@ -26,7 +26,13 @@ const SENSITIVE_HEADERS: &[&str] = &[
 ];
 
 /// Hop-by-hop headers that proxies must not forward to upstream (RFC 7230 §6.1).
+///
+/// Per RFC 7230 §6.1: `Connection` is itself a hop-by-hop header, AND any
+/// header NAMES listed within the `Connection` header's value are themselves
+/// connection-specific and must be removed at the same hop. See
+/// [`is_connection_nominated`] for that secondary check.
 pub const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
     "transfer-encoding",
     "te",
     "trailer",
@@ -36,6 +42,38 @@ pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "keep-alive",
     "expect",
 ];
+
+/// Parse a `Connection` header value into the lower-cased set of header names
+/// it nominates. Per RFC 7230 §6.1, those headers are also connection-specific
+/// and must be stripped before forwarding or persistence.
+///
+/// Examples:
+/// - `Connection: close` → `{"close"}` (the literal token; no header named
+///   `close` exists, so no further effect)
+/// - `Connection: keep-alive, foo, bar` → `{"keep-alive", "foo", "bar"}`
+///
+/// Returns an empty set when no Connection header is present in `headers`.
+/// Header lookup is case-insensitive on the key.
+pub fn connection_nominated_headers<I, K, V>(headers: I) -> std::collections::HashSet<String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (k, v) in headers {
+        if !k.as_ref().eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        for token in v.as_ref().split(',') {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                out.insert(trimmed.to_ascii_lowercase());
+            }
+        }
+    }
+    out
+}
 
 /// Returns true if `header_name` is a hop-by-hop header (case-insensitive).
 pub fn is_hop_by_hop(header_name: &str) -> bool {
