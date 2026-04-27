@@ -7,9 +7,15 @@ pub mod redact;
 pub mod hash;
 pub mod envelope;
 pub mod sensitive;
+pub mod runners;
 
 pub use db::{dirs_path, Store, QueryResult};
 pub use models::*;
 pub use hash::normalize_and_hash;
 pub use envelope::{ResponseEnvelope, scrub_response_headers, FORMAT_NAKED_LEGACY, FORMAT_ENVELOPE_V1};
 pub use sensitive::SensitiveString;
+pub use runners::{
+    Runner, RunnerMode, RunnerStatus,
+    ReplayJob, ReplayJobState,
+    ReplayJobEvent, ReplayJobEventType,
+};

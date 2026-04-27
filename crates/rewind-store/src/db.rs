@@ -6,7 +6,12 @@ use crate::blobs::BlobStore;
 use crate::models::*;
 
 pub struct Store {
-    conn: Connection,
+    // Phase 3 commit 3: bumped from private to pub(crate) so the
+    // `runners` module (and future sibling modules) can extend Store
+    // with new tables without forcing every CRUD impl into this file.
+    // Stays crate-private; external consumers still go through the
+    // public methods.
+    pub(crate) conn: Connection,
     pub blobs: BlobStore,
     _root: PathBuf,
 }
@@ -373,6 +378,107 @@ impl Store {
         // cache rows default to 0 (legacy naked body), matching their write-time
         // semantics.
         let _ = self.conn.execute("ALTER TABLE replay_cache ADD COLUMN response_blob_format INTEGER NOT NULL DEFAULT 0", []);
+
+        // v0.14 migrations: Phase 3 runner registry + replay-job tracking.
+        //
+        //   - runners: registered agent processes; auth tokens stored
+        //     encrypted-at-rest under REWIND_RUNNER_SECRET_KEY (AES-256-GCM)
+        //     with auth_token_hash (SHA-256 hex) for fast inbound-auth lookup
+        //   - replay_jobs: state machine pending → dispatched → in_progress →
+        //     completed/errored, with lease columns for the reaper task
+        //   - replay_job_events: append-only event log per job
+        //
+        // See plans/phase-3-runner-registry-and-dashboard-replay.md for
+        // the full schema rationale, including why we store the encrypted
+        // raw token (NOT just the hash) — needed for outbound HMAC signing
+        // of webhooks, can't be derived from the hash.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS runners (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('webhook', 'polling')),
+                webhook_url TEXT,
+                encrypted_token BLOB NOT NULL,
+                token_nonce BLOB NOT NULL,
+                auth_token_hash TEXT NOT NULL,
+                auth_token_preview TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled', 'stale'))
+            )",
+            [],
+        )?;
+        // Indexed for the inbound-auth fast path (commit 6's
+        // X-Rewind-Runner-Auth header lookup).
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runners_auth_token_hash ON runners(auth_token_hash)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runners_status ON runners(status)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS replay_jobs (
+                id TEXT PRIMARY KEY,
+                runner_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                replay_context_id TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (state IN ('pending','dispatched','in_progress','completed','errored')),
+                error_message TEXT,
+                error_stage TEXT,
+                created_at TEXT NOT NULL,
+                dispatched_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                dispatch_deadline_at TEXT,
+                lease_expires_at TEXT,
+                progress_step INTEGER NOT NULL DEFAULT 0,
+                progress_total INTEGER,
+                FOREIGN KEY(session_id) REFERENCES sessions(id)
+            )",
+            [],
+        )?;
+        // Indexes the reaper + dashboard queries hit:
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replay_jobs_runner_id ON replay_jobs(runner_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replay_jobs_state ON replay_jobs(state)",
+            [],
+        )?;
+        // Reaper scans for expired leases (state ∈ {dispatched,
+        // in_progress} AND lease_expires_at < now). Index on
+        // lease_expires_at speeds the time-window filter.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replay_jobs_lease_expires ON replay_jobs(lease_expires_at)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replay_jobs_session_id ON replay_jobs(session_id)",
+            [],
+        )?;
+
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS replay_job_events (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                event_type TEXT NOT NULL
+                    CHECK (event_type IN ('started','progress','completed','errored')),
+                step_number INTEGER,
+                payload TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES replay_jobs(id) ON DELETE CASCADE
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replay_job_events_job_id ON replay_job_events(job_id)",
+            [],
+        )?;
 
         Ok(())
     }
