@@ -1022,6 +1022,19 @@ async fn record_llm_call(
     step.request_blob = request_blob;
     step.response_blob = response_blob;
     step.request_hash = Some(request_canonical_hash);
+    // Step 0.3: deliberately leave `response_blob_format` at the default
+    // (FORMAT_NAKED_LEGACY = 0) — there is no HTTP envelope to preserve
+    // here. The SDK caller already parsed the wire response into a JSON
+    // `Value` before POSTing to /llm-calls; status code, headers, and
+    // streaming framing are all gone by the time we see it. Wrapping the
+    // body in a synthetic ResponseEnvelope would store fabricated metadata
+    // (status=200, headers=[]) that's no truer than the format-0 read-side
+    // synthesis from `ResponseEnvelope::from_blob_bytes`. Keep it naked.
+    //
+    // If/when the explicit-API surface grows to accept HTTP metadata
+    // (e.g. a future `record_llm_call_v2` that takes status + headers +
+    // body), THAT path should set `response_blob_format = FORMAT_ENVELOPE_V1`
+    // and write a real envelope. Don't change this one.
     if let Some(ref cid) = body.client_step_id {
         step.id = cid.clone();
     }
@@ -1111,6 +1124,11 @@ async fn record_tool_call(
     step.tool_name = Some(body.tool_name);
     step.error = body.error;
     step.request_hash = Some(request_canonical_hash);
+    // Step 0.3: tool calls have no HTTP envelope at all — they're MCP
+    // tool invocations, function calls, internal tool dispatches. Leave
+    // `response_blob_format = FORMAT_NAKED_LEGACY` so the read path
+    // synthesizes a 200/empty-headers shell that consumers (CLI, MCP,
+    // OTel export) can iterate uniformly with proxy-recorded LLM calls.
     if let Some(ref cid) = body.client_step_id {
         step.id = cid.clone();
     }

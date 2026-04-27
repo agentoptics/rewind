@@ -37,8 +37,22 @@ use crate::redact;
 pub const FORMAT_NAKED_LEGACY: u8 = 0;
 pub const FORMAT_ENVELOPE_V1: u8 = 1;
 
-/// Structured response captured at record time. New writes always use this
-/// shape; reads switch on the step's `response_blob_format` column.
+/// Structured response captured at record time.
+///
+/// Used by the **proxy record path** (`handle_buffered_response` /
+/// `handle_streaming_response` in `crates/rewind-proxy/src/lib.rs`) to
+/// persist HTTP status, scrubbed headers, and body. Steps written this
+/// way set `Step.response_blob_format = FORMAT_ENVELOPE_V1`.
+///
+/// **Not** used by the explicit-API record path (`record_llm_call`,
+/// `record_tool_call` in `crates/rewind-web/src/api.rs`). Those receive
+/// the response as a parsed JSON `Value` from the SDK caller — there's
+/// no HTTP envelope to capture at that layer — and persist a naked
+/// body with `Step.response_blob_format = FORMAT_NAKED_LEGACY` (0).
+///
+/// Read paths uniformly call `from_blob_bytes(format, &raw)` and the
+/// discriminator column decides how to decode, so consumers don't
+/// branch on the writer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
     /// HTTP status code. Defaults to 200 when reading legacy naked blobs.

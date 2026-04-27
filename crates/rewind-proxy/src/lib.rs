@@ -583,8 +583,13 @@ async fn handle_buffered_response(
 
     // Populate Instant Replay cache on success.
     // Step 0.3 (Santa review #3): forward step.response_blob_format so
-    // cache hits unwrap with the correct discriminator. New live writes
-    // are FORMAT_ENVELOPE_V1; cache row inherits.
+    // cache hits unwrap with the correct discriminator. Live proxy writes
+    // (this function + handle_streaming_response) set
+    // step.response_blob_format = FORMAT_ENVELOPE_V1 because they have
+    // the full HTTP wire response to preserve. Explicit-API record paths
+    // in crates/rewind-web/src/api.rs use FORMAT_NAKED_LEGACY (= 0)
+    // because they have no HTTP envelope. Cache row inherits whichever
+    // format the originating step used; cache_get round-trips it on read.
     if state.instant_replay && step.status == StepStatus::Success && tokens_in > 0 {
         let store = state.store.lock().unwrap();
         let _ = store.cache_put(

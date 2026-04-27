@@ -353,7 +353,13 @@ impl Store {
         // structured response envelope). Backwards-compat preserved via:
         //   - request_hash NULL ⇒ "match anything" at lookup (pre-migration rows)
         //   - response_blob_format=0 ⇒ legacy naked body, read as {status: 200,
-        //     headers: [], body} (pre-migration rows). New writes use format=1.
+        //     headers: [], body} (pre-migration rows AND explicit-API record
+        //     paths, which have no HTTP envelope to capture — see record_llm_call
+        //     in crates/rewind-web/src/api.rs).
+        //   - response_blob_format=1 ⇒ ResponseEnvelope, used by the proxy
+        //     record path (handle_buffered_response / handle_streaming_response
+        //     in crates/rewind-proxy/src/lib.rs).
+        // Reads switch on the column regardless of writer.
         // See docs/replay-and-forking.md and the plan for full rationale.
         let _ = self.conn.execute("ALTER TABLE steps ADD COLUMN request_hash TEXT", []);
         let _ = self.conn.execute("ALTER TABLE steps ADD COLUMN response_blob_format INTEGER NOT NULL DEFAULT 0", []);
