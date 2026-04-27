@@ -339,28 +339,49 @@ def patch_httpx_clients(predicates: Predicates | None = None) -> None:
     original_async_client_init = _ORIGINAL_ASYNC_CLIENT_INIT
 
     def patched_client_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        # If user passed transport=…, wrap it so their custom retry /
-        # mocking / DNS resolution still runs. Otherwise install ours
-        # fresh. ``mounts=…`` (httpx's per-host transport routing) is
-        # orthogonal: a request to a mounted host bypasses us. Operators
-        # using mounts heavily should mount our transport explicitly.
+        # Phase 1 (Santa #5): preserve httpx's configured default transport
+        # options. The naive "swap in RewindHTTPTransport before calling
+        # original_init" approach DROPS verify / cert / trust_env / http2 /
+        # proxies / limits / local_address / retries / socket_options /
+        # default_encoding / etc., because httpx only constructs its
+        # configured default transport when transport=None reaches its
+        # __init__. By replacing transport=None with our transport up front,
+        # we short-circuit that path and the user loses every transport
+        # config knob.
+        #
+        # Fix: TWO modes.
+        #   (a) User explicitly passed transport= — wrap it. Their config
+        #       lives on their transport already.
+        #   (b) User passed only top-level config (verify=False, etc.) —
+        #       let httpx build its configured default first, then wrap
+        #       the post-init self._transport with ours.
         user_transport = kwargs.pop("transport", None)
         if user_transport is not None:
+            # Mode (a): wrap explicitly-supplied transport.
             kwargs["transport"] = rewind_sync_transport(_inner=user_transport)
+            original_client_init(self, *args, **kwargs)
         else:
-            kwargs["transport"] = rewind_sync_transport()
-        original_client_init(self, *args, **kwargs)
+            # Mode (b): let httpx do its standard transport
+            # construction, then wrap. self._transport is httpx's
+            # documented internal attribute (stable across 0.x).
+            original_client_init(self, *args, **kwargs)
+            configured = getattr(self, "_transport", None)
+            if configured is not None:
+                self._transport = rewind_sync_transport(_inner=configured)
 
     def patched_async_client_init(self: Any, *args: Any, **kwargs: Any) -> None:
         # AsyncClient.__init__ is a SYNC method (it just stores config;
-        # actual I/O happens later in async send). Symmetric to the
-        # sync wrapper above.
+        # actual I/O happens later in async send). Same two-mode fix as
+        # the sync variant above — see Santa #5 docstring.
         user_transport = kwargs.pop("transport", None)
         if user_transport is not None:
             kwargs["transport"] = rewind_async_transport(_inner=user_transport)
+            original_async_client_init(self, *args, **kwargs)
         else:
-            kwargs["transport"] = rewind_async_transport()
-        original_async_client_init(self, *args, **kwargs)
+            original_async_client_init(self, *args, **kwargs)
+            configured = getattr(self, "_transport", None)
+            if configured is not None:
+                self._transport = rewind_async_transport(_inner=configured)
 
     httpx.Client.__init__ = patched_client_init  # type: ignore[method-assign]
     httpx.AsyncClient.__init__ = patched_async_client_init  # type: ignore[method-assign]

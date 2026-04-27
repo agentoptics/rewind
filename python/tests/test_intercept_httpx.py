@@ -33,7 +33,7 @@ import pytest
 # never need it. CI installs httpx so these tests actually run; this
 # pytest.importorskip is the fallback for dev envs (e.g. a contributor
 # stripping the test deps to debug a different layer).
-httpx = pytest.importorskip("httpx")
+httpx = pytest.importorskip("httpx", exc_type=ImportError)
 
 # Imports below intentionally come after importorskip (ruff E402 ok'd
 # via noqa) — collecting these imports without httpx would trigger

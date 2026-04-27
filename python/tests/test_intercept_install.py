@@ -31,28 +31,48 @@ class TestInstallLifecycle(unittest.TestCase):
         uninstall()
 
     def test_install_patches_all_available_adapters(self) -> None:
+        # Adapters only patch when their library is importable. CI's
+        # python job runs without httpx/requests/aiohttp installed, so
+        # the assertion has to gate on *_AVAILABLE — otherwise a clean
+        # CI environment fails this test even though install() did the
+        # right thing (no-op for missing libs).
         self.assertFalse(is_installed())
         install()
         self.assertTrue(is_installed())
-        # All three are installed in the test env.
-        self.assertTrue(httpx_transport.is_patched())
-        self.assertTrue(requests_adapter.is_patched())
-        self.assertTrue(aiohttp_middleware.is_patched())
+        if httpx_transport.HTTPX_AVAILABLE:
+            self.assertTrue(httpx_transport.is_patched(), "httpx available → should be patched")
+        else:
+            self.assertFalse(httpx_transport.is_patched(), "httpx missing → not patched")
+        if requests_adapter.REQUESTS_AVAILABLE:
+            self.assertTrue(requests_adapter.is_patched(), "requests available → should be patched")
+        else:
+            self.assertFalse(requests_adapter.is_patched(), "requests missing → not patched")
+        if aiohttp_middleware.AIOHTTP_AVAILABLE:
+            self.assertTrue(aiohttp_middleware.is_patched(), "aiohttp available → should be patched")
+        else:
+            self.assertFalse(aiohttp_middleware.is_patched(), "aiohttp missing → not patched")
 
     def test_install_is_idempotent(self) -> None:
         install()
         install()  # no error, no double-patch
         install()
         self.assertTrue(is_installed())
-        # All three still patched (not nested / re-wrapped).
-        self.assertTrue(httpx_transport.is_patched())
-        self.assertTrue(requests_adapter.is_patched())
-        self.assertTrue(aiohttp_middleware.is_patched())
+        # Each adapter's state is the same as after a single install
+        # (no double-wrap, not flipped off). Only assert for libs that
+        # were actually patchable.
+        if httpx_transport.HTTPX_AVAILABLE:
+            self.assertTrue(httpx_transport.is_patched())
+        if requests_adapter.REQUESTS_AVAILABLE:
+            self.assertTrue(requests_adapter.is_patched())
+        if aiohttp_middleware.AIOHTTP_AVAILABLE:
+            self.assertTrue(aiohttp_middleware.is_patched())
 
     def test_uninstall_clears_all_adapters(self) -> None:
         install()
         uninstall()
         self.assertFalse(is_installed())
+        # All adapters un-patched regardless of whether they were
+        # ever patched (uninstall is a no-op for unpatched).
         self.assertFalse(httpx_transport.is_patched())
         self.assertFalse(requests_adapter.is_patched())
         self.assertFalse(aiohttp_middleware.is_patched())
@@ -73,19 +93,28 @@ class TestCustomPredicates(unittest.TestCase):
     def test_install_accepts_custom_predicates(self) -> None:
         # Custom predicates that match nothing should still install
         # cleanly. The patch is at the transport layer; predicates are
-        # invoked per-request.
+        # invoked per-request. Library-availability assertions gated
+        # by *_AVAILABLE for CI's bare environment.
         class NoMatchPredicates(DefaultPredicates):
             def is_llm_call(self, req):  # type: ignore[no-untyped-def]
                 return False
 
         install(predicates=NoMatchPredicates())
         self.assertTrue(is_installed())
-        # All adapters report patched.
-        self.assertTrue(httpx_transport.is_patched())
-        self.assertTrue(requests_adapter.is_patched())
-        self.assertTrue(aiohttp_middleware.is_patched())
+        if httpx_transport.HTTPX_AVAILABLE:
+            self.assertTrue(httpx_transport.is_patched())
+        if requests_adapter.REQUESTS_AVAILABLE:
+            self.assertTrue(requests_adapter.is_patched())
+        if aiohttp_middleware.AIOHTTP_AVAILABLE:
+            self.assertTrue(aiohttp_middleware.is_patched())
 
     def test_install_with_custom_predicates_applies_to_httpx(self) -> None:
+        # Skip when httpx isn't installed — the test exercises the
+        # actual transport patch with a MockTransport, which requires
+        # httpx to be importable.
+        if not httpx_transport.HTTPX_AVAILABLE:
+            self.skipTest("httpx not installed — skipping integration test")
+
         # Custom predicate that matches example.com (which the default
         # never would). Verify the custom predicate is what got bound.
         from unittest.mock import patch as mock_patch
@@ -135,7 +164,7 @@ class TestCustomPredicates(unittest.TestCase):
 
             # example.com — our custom predicate matches.
             client.post("https://api.example.com/anything", json={"x": 1})
-            # Hmm — api.example.com matches the substring "example.com",
+            # api.example.com matches the substring "example.com",
             # so it should record.
             self.assertEqual(len(recorded), 1, "example-host should record")
 

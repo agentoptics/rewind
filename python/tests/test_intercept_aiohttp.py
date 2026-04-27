@@ -23,7 +23,7 @@ import pytest
 
 # Skip module when aiohttp isn't installed. See test_intercept_httpx.py
 # for the rationale.
-aiohttp = pytest.importorskip("aiohttp")
+aiohttp = pytest.importorskip("aiohttp", exc_type=ImportError)
 
 # Imports after importorskip — see test_intercept_httpx.py for rationale.
 from rewind_agent.intercept import _flow, _savings  # noqa: E402

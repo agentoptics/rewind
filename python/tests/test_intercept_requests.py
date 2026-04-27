@@ -19,7 +19,7 @@ import pytest
 # Skip the module when requests isn't installed. See test_intercept_httpx.py
 # for the rationale (optional dep; CI installs it; importorskip is the
 # fallback for stripped dev envs).
-requests = pytest.importorskip("requests")
+requests = pytest.importorskip("requests", exc_type=ImportError)
 from requests.adapters import HTTPAdapter  # noqa: E402
 from requests.models import Response  # noqa: E402
 

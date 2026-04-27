@@ -89,6 +89,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from rewind_agent.explicit import ExplicitClient
+from rewind_agent.intercept._core import detect_streaming
 from rewind_agent.intercept._predicates import Predicates
 from rewind_agent.intercept._request import RewindRequest
 from rewind_agent.intercept._savings import record_cache_hit
@@ -165,14 +166,23 @@ def handle_intercepted_sync(
 
     Returns the library-native response object — either the live one
     or a ``synth_*`` synthetic. The caller treats both identically.
+
+    Streaming detection (Santa #3): the adapter passes ``is_streaming``
+    derived from transport-level signals (``stream=True`` kwarg, Accept:
+    text/event-stream header). We OR that with the body-aware
+    :func:`._core.detect_streaming` heuristic so a request with
+    ``{"stream": true}`` in the JSON body but no Accept header still
+    routes through the streaming path.
     """
+    streaming = is_streaming or detect_streaming(req)
+
     if predicates.is_llm_call(req):
         return _handle_llm_sync(
             req,
             live=live,
             synth_buffered=synth_buffered,
             synth_streaming=synth_streaming,
-            is_streaming=is_streaming,
+            is_streaming=streaming,
         )
 
     if predicates.is_tool_call(req):
@@ -206,6 +216,7 @@ def _handle_llm_sync(
         client=client,
         request_value=request_value,
         live=live,
+        is_streaming=is_streaming,
     )
 
 
@@ -248,17 +259,43 @@ def _serve_cache_miss_sync(
     client: ExplicitClient,
     request_value: Any,
     live: Callable[[], Response],
+    is_streaming: bool,
 ) -> Response:
     started = time.monotonic()
     resp = live()
     duration_ms = int((time.monotonic() - started) * 1000)
 
-    # Adapters ensure the response object exposes a parsed-JSON body via
-    # a common attribute. We accept any of three shapes for robustness:
+    # Phase 1 (Santa #2) — STREAMING MISS PASS-THROUGH.
     #
-    #   resp._rewind_response_body    (intercept-set, preferred)
-    #   resp.json()                   (if callable, used by httpx + requests)
-    #   resp.text / resp.content      (fallback)
+    # For streaming responses, do NOT pre-read the body. Pre-reading
+    # via resp.json() / resp.text would consume the stream before user
+    # code can iterate it (httpx raises ResponseNotRead; requests
+    # marks _content_consumed=True; aiohttp closes the connection).
+    # Phase 1 contract: live streams pass through immediately.
+    #
+    # Trade-off for v1: recording happens with placeholder
+    # ``response_value=None`` and zero tokens, since we can't safely
+    # capture the body without a tee wrapper around the response
+    # stream. Tee-based streaming recording (matching the Rust
+    # proxy's `handle_streaming_response`) is documented as a
+    # follow-up — see the v1.1 limitation notes in the PR description.
+    if is_streaming:
+        try:
+            client.record_llm_call(
+                request=request_value,
+                response=None,
+                model=_model_from_request(request_value),
+                duration_ms=duration_ms,
+                tokens_in=0,
+                tokens_out=0,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning("rewind: record_llm_call (streaming miss) failed: %s", exc)
+        return resp
+
+    # Non-streaming path: it's safe to pre-read the body for token
+    # extraction. Adapters expose a parsed-JSON body via several
+    # candidate shapes; see _read_response_body_sync.
     response_value = _read_response_body_sync(resp)
     tokens_in, tokens_out, model = extract_tokens_and_model(
         request_value, response_value
@@ -277,6 +314,17 @@ def _serve_cache_miss_sync(
         logger.warning("rewind: record_llm_call failed: %s", exc)
 
     return resp
+
+
+def _model_from_request(request_value: Any) -> str:
+    """Best-effort model extraction from the request when we can't
+    read the response (streaming pass-through). Matches the fallback
+    used in :func:`._tokens.extract_tokens_and_model`."""
+    if isinstance(request_value, dict):
+        model = request_value.get("model")
+        if isinstance(model, str):
+            return model
+    return ""
 
 
 def _handle_tool_sync(
@@ -351,15 +399,19 @@ async def handle_intercepted_async(
     ``live`` is awaitable; ``synth_*`` callbacks remain sync because
     they're pure data construction. ``predicates`` are also sync (a
     custom predicate that needs async I/O is rare and should pre-fetch
-    its data into a sync-readable cache).
+    its data into a sync-readable cache). Streaming detection uses
+    transport hints OR-combined with body-aware
+    :func:`._core.detect_streaming` (Santa #3).
     """
+    streaming = is_streaming or detect_streaming(req)
+
     if predicates.is_llm_call(req):
         return await _handle_llm_async(
             req,
             live=live,
             synth_buffered=synth_buffered,
             synth_streaming=synth_streaming,
-            is_streaming=is_streaming,
+            is_streaming=streaming,
         )
 
     if predicates.is_tool_call(req):
@@ -394,6 +446,26 @@ async def _handle_llm_async(
     started = time.monotonic()
     resp = await live()
     duration_ms = int((time.monotonic() - started) * 1000)
+
+    # Phase 1 (Santa #2): same streaming-pass-through contract as sync.
+    # Pre-reading the body would consume the stream before user code
+    # can iterate it. Streaming misses record with placeholder
+    # response/tokens; tee-based recording deferred to v1.1.
+    if is_streaming:
+        try:
+            await client.record_llm_call_async(
+                request=request_value,
+                response=None,
+                model=_model_from_request(request_value),
+                duration_ms=duration_ms,
+                tokens_in=0,
+                tokens_out=0,
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "rewind: record_llm_call_async (streaming miss) failed: %s", exc
+            )
+        return resp
 
     response_value = await _read_response_body_async(resp)
     tokens_in, tokens_out, model = extract_tokens_and_model(
