@@ -25,6 +25,16 @@ pub struct Session {
     ///
     /// Database invariant: `UNIQUE WHERE client_session_key IS NOT
     /// NULL` so concurrent inserts collapse via the constraint.
+    ///
+    /// **Wire format (review #155 R2):** the `serde(skip_serializing)`
+    /// attribute keeps this internal-routing field out of every
+    /// `/api/sessions` response. The key is typically a private
+    /// conversation_id that callers don't expect to be exposed to
+    /// dashboard users / SSE consumers; serializing it would broaden
+    /// the API surface and leak that detail. Deserialization is
+    /// allowed so DB-backed round-trips (test fixtures, restore from
+    /// snapshot) keep working.
+    #[serde(skip_serializing, default)]
     pub client_session_key: Option<String>,
 }
 

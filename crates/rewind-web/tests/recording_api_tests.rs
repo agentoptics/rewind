@@ -169,6 +169,41 @@ async fn test_start_session_idempotent_returns_existing() {
 }
 
 #[tokio::test]
+async fn test_start_session_empty_key_treated_as_none() {
+    // Review #155 R1: empty / whitespace-only client_session_key
+    // must NOT collapse callers into one shared session. Two POSTs
+    // with empty keys should produce two distinct sessions, same
+    // backward-compat behavior as omitting the field entirely.
+    let (app, store, _tmp) = setup();
+
+    let (s1, b1) = post_json(&app, "/api/sessions/start", json!({
+        "name": "first",
+        "client_session_key": ""
+    })).await;
+    let (s2, b2) = post_json(&app, "/api/sessions/start", json!({
+        "name": "second",
+        "client_session_key": "   "
+    })).await;
+
+    assert_eq!(s1, StatusCode::CREATED, "empty key should create, not dedup");
+    assert_eq!(s2, StatusCode::CREATED, "whitespace key should create too");
+    assert_ne!(
+        b1["session_id"], b2["session_id"],
+        "empty/whitespace keys must NOT route to the same session",
+    );
+
+    // The persisted client_session_key column should be NULL (None)
+    // for both — no UNIQUE-index claim happened.
+    let s = store.lock().unwrap();
+    let all = s.list_sessions().unwrap();
+    let with_key = all
+        .iter()
+        .filter(|x| x.client_session_key.is_some())
+        .count();
+    assert_eq!(with_key, 0, "no session should hold an empty/ws key in DB");
+}
+
+#[tokio::test]
 async fn test_start_session_distinct_keys_create_distinct_sessions() {
     let (app, _store, _tmp) = setup();
 
