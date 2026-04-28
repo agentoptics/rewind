@@ -5,7 +5,7 @@ interface UIState {
   selectedTimelineId: string | null
   selectedStepId: string | null
   sidebarCollapsed: boolean
-  view: 'sessions' | 'diff' | 'baselines' | 'evaluations'
+  view: 'sessions' | 'diff' | 'baselines' | 'evaluations' | 'runners'
 
   // Eval state
   selectedDatasetName: string | null
