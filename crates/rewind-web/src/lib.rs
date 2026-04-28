@@ -1,9 +1,11 @@
 pub mod api;
 pub mod auth;
+pub mod crypto;
 pub mod eval_api;
 pub mod hooks;
 pub mod otlp_ingest;
 mod polling;
+pub mod runners;
 mod spa;
 pub mod transcript;
 pub mod url_guard;
@@ -85,6 +87,11 @@ pub struct AppState {
     /// Bearer token required for protected routes. `None` disables auth (loopback default).
     /// See `auth::resolve_or_generate_token` and `docs/security-audit.md` §CRITICAL-02.
     pub auth_token: Option<String>,
+    /// AES-256-GCM cipher used to encrypt/decrypt runner auth tokens at rest.
+    /// `None` means `REWIND_RUNNER_SECRET_KEY` was unset at startup; the
+    /// `/api/runners` endpoints return `503` in that case so operators
+    /// see a clear bootstrap error. Phase 3 commit 4. See `crypto.rs`.
+    pub crypto: Option<crypto::CryptoBox>,
 }
 
 pub struct WebServer {
@@ -95,9 +102,34 @@ pub struct WebServer {
     auth_disabled: bool,
 }
 
+/// Read `REWIND_RUNNER_SECRET_KEY` and build the [`crypto::CryptoBox`].
+///
+/// **Review #153 MEDIUM 5 — fail-fast on misconfig:** if the env var
+/// is *unset*, returns `None` (runner endpoints will 503 with a clear
+/// bootstrap error). If the env var is *set but malformed* (bad
+/// base64, wrong key length), this **panics at startup** with an
+/// operator-actionable message rather than silently booting a server
+/// whose runner registry can never dispatch.
+///
+/// This matches the docstring on `crypto::CryptoBox::from_env`
+/// ("operator misconfig — fail loud at startup"). Previously the
+/// caller logged-and-swallowed, which made the failure invisible
+/// until the first `/api/runners` 503.
+fn bootstrap_crypto() -> Option<crypto::CryptoBox> {
+    match crypto::CryptoBox::from_env() {
+        Ok(maybe) => maybe,
+        Err(e) => panic!(
+            "FATAL: {} is set but malformed: {e}\n\
+             Generate a fresh key with `openssl rand -base64 32` and set it via the env var.",
+            crypto::KEY_ENV_VAR
+        ),
+    }
+}
+
 impl WebServer {
     pub fn new(store: Arc<Mutex<Store>>, event_tx: broadcast::Sender<StoreEvent>) -> Self {
         let otel_config = OtelConfig::from_env();
+        let crypto = bootstrap_crypto();
         WebServer {
             state: AppState {
                 store,
@@ -105,6 +137,7 @@ impl WebServer {
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
                 auth_token: None,
+                crypto,
             },
             dev_mode: false,
             auth_disabled: false,
@@ -114,6 +147,7 @@ impl WebServer {
     pub fn new_standalone(store: Store) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let otel_config = OtelConfig::from_env();
+        let crypto = bootstrap_crypto();
         WebServer {
             state: AppState {
                 store: Arc::new(Mutex::new(store)),
@@ -121,6 +155,7 @@ impl WebServer {
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
                 auth_token: None,
+                crypto,
             },
             dev_mode: false,
             auth_disabled: false,

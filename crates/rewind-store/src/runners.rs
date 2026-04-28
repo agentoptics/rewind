@@ -360,6 +360,61 @@ impl Store {
         Ok(())
     }
 
+    /// Count non-terminal jobs (`pending`, `dispatched`, `in_progress`)
+    /// owned by this runner.
+    ///
+    /// **Used by review #153 HIGH 3 + MEDIUM 4:** the HTTP layer
+    /// uses this to refuse `DELETE /api/runners/{id}` and
+    /// `POST /api/runners/{id}/regenerate-token` while in-flight
+    /// jobs would be orphaned (deletion → null `runner_id`,
+    /// rotation → in-flight callbacks fail auth).
+    pub fn count_active_jobs_for_runner(&self, runner_id: &str) -> Result<u32> {
+        let n: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM replay_jobs
+             WHERE runner_id = ?1
+               AND state NOT IN ('completed', 'errored')",
+            params![runner_id],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Rotate a runner's auth token. Replaces the encrypted token,
+    /// nonce, hash, and preview atomically. Returns `true` if a row
+    /// was updated, `false` if the id doesn't exist.
+    ///
+    /// **Phase 3 commit 4:** the dashboard's "regenerate token"
+    /// button calls this. The old hash is invalidated immediately
+    /// so any in-flight inbound auth attempts using the old token
+    /// will fail. In-flight outbound dispatches use the new token
+    /// because dispatch signs at dispatch time, not at job-creation
+    /// time.
+    pub fn rotate_runner_token(
+        &self,
+        id: &str,
+        encrypted_token: &[u8],
+        token_nonce: &[u8],
+        auth_token_hash: &str,
+        auth_token_preview: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE runners
+             SET encrypted_token = ?1,
+                 token_nonce = ?2,
+                 auth_token_hash = ?3,
+                 auth_token_preview = ?4
+             WHERE id = ?5",
+            params![
+                encrypted_token,
+                token_nonce,
+                auth_token_hash,
+                auth_token_preview,
+                id
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     fn row_to_runner(row: &rusqlite::Row) -> rusqlite::Result<Runner> {
         Ok(Runner {
             id: row.get(0)?,
