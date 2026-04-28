@@ -12,6 +12,7 @@ import { useCallback, useState } from 'react'
 import { ExportOtelModal } from './ExportOtelModal'
 import { ForkModal } from './ForkModal'
 import { ReplaySetupModal } from './ReplaySetupModal'
+import { ReplayJobModal } from './RunReplayButton'
 import { ActivityTimeline } from './ActivityTimeline'
 import type { StepResponse } from '@/types/api'
 
@@ -20,7 +21,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const queryClient = useQueryClient()
   const [autoFollow, setAutoFollow] = useState(true)
   const [exportOpen, setExportOpen] = useState(false)
-  const [modalState, setModalState] = useState<{ mode: 'fork' | 'replay'; step: number } | null>(null)
+  const [modalState, setModalState] = useState<{ mode: 'fork' | 'replay' | 'runReplay'; step: number } | null>(null)
   const [viewMode, setViewMode] = useState<'timeline' | 'list'>('timeline')
 
   const { data: detail, isLoading: detailLoading } = useQuery({
@@ -194,6 +195,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                 isCursor={isCursor}
                 onFork={(step) => setModalState({ mode: 'fork', step: step.step_number })}
                 onReplay={(step) => setModalState({ mode: 'replay', step: step.step_number })}
+                onRunReplay={(step) => setModalState({ mode: 'runReplay', step: step.step_number })}
               />
             )}
           </div>
@@ -265,6 +267,14 @@ export function SessionView({ sessionId }: { sessionId: string }) {
           sessionId={sessionId}
           timelineId={timelineId}
           atStep={modalState.step}
+        />
+      )}
+      {modalState?.mode === 'runReplay' && (
+        <ReplayJobModal
+          sessionId={sessionId}
+          sourceTimelineId={timelineId ?? ''}
+          atStep={modalState.step}
+          onClose={() => setModalState(null)}
         />
       )}
     </div>

@@ -286,6 +286,8 @@ interface ActivityTimelineProps {
   isCursor?: boolean
   onFork?: (step: StepResponse) => void
   onReplay?: (step: StepResponse) => void
+  /** Phase 3 commit 8: dispatch a replay job to a registered runner. */
+  onRunReplay?: (step: StepResponse) => void
 }
 
 const LANE_HEIGHT = 36
@@ -301,6 +303,8 @@ export function ActivityTimeline({
   isCursor,
   onFork,
   onReplay,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- forwarded API surface; UI integration in a follow-up commit
+  onRunReplay: _onRunReplay,
 }: ActivityTimelineProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const laneAreaRef = useRef<HTMLDivElement>(null)
