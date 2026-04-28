@@ -360,6 +360,46 @@ impl Store {
         Ok(())
     }
 
+    /// Set the dispatch deadline and initial lease on a freshly-
+    /// dispatched job. Used by the dispatcher in commit 5/13 right
+    /// after the runner returns 2xx.
+    ///
+    /// Both timestamps are absolute (caller computes them from
+    /// `Utc::now()`), so dispatcher-side test mocking can supply
+    /// deterministic values without monkey-patching time.
+    pub fn set_dispatch_deadline_and_lease(
+        &self,
+        id: &str,
+        dispatch_deadline_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE replay_jobs
+             SET dispatch_deadline_at = ?1, lease_expires_at = ?2
+             WHERE id = ?3",
+            params![
+                dispatch_deadline_at.to_rfc3339(),
+                lease_expires_at.to_rfc3339(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reaper-side query: jobs in state `dispatched` whose
+    /// `dispatch_deadline_at < now`. Means the runner accepted the
+    /// dispatch but never emitted a `Started` event in time.
+    pub fn list_dispatch_deadline_expired(&self, now: DateTime<Utc>) -> Result<Vec<ReplayJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total
+             FROM replay_jobs
+             WHERE state = 'dispatched' AND dispatch_deadline_at IS NOT NULL AND dispatch_deadline_at < ?1
+             ORDER BY dispatch_deadline_at ASC LIMIT 1000",
+        )?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], Self::row_to_replay_job)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Count non-terminal jobs (`pending`, `dispatched`, `in_progress`)
     /// owned by this runner.
     ///

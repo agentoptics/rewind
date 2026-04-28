@@ -1,10 +1,12 @@
 pub mod api;
 pub mod auth;
 pub mod crypto;
+pub mod dispatcher;
 pub mod eval_api;
 pub mod hooks;
 pub mod otlp_ingest;
 mod polling;
+pub mod reaper;
 pub mod runners;
 mod spa;
 pub mod transcript;
@@ -33,6 +35,20 @@ pub enum StoreEvent {
         status: String,
         total_steps: u32,
         total_tokens: u64,
+    },
+    /// Phase 3 commit 5/6: replay job state/progress changes broadcast
+    /// to subscribers (dashboard renders the "Run replay" modal).
+    /// Emitted by the reaper (lease/dispatch expiry → `errored`),
+    /// the dispatcher (`pending → dispatched`), and the inbound
+    /// event endpoint (`Started` / `Progress` / `Completed`).
+    ReplayJobUpdated {
+        job_id: String,
+        session_id: String,
+        state: String,
+        progress_step: Option<u32>,
+        progress_total: Option<u32>,
+        error_message: Option<String>,
+        error_stage: Option<String>,
     },
 }
 
@@ -92,6 +108,14 @@ pub struct AppState {
     /// `/api/runners` endpoints return `503` in that case so operators
     /// see a clear bootstrap error. Phase 3 commit 4. See `crypto.rs`.
     pub crypto: Option<crypto::CryptoBox>,
+    /// Outbound webhook dispatcher. `None` when `crypto` is None
+    /// (dispatch needs to decrypt runner tokens). Phase 3 commit 5.
+    pub dispatcher: Option<dispatcher::Dispatcher>,
+    /// Public-facing base URL (e.g. `http://localhost:4800`) sent
+    /// in dispatch payloads so runners know where to POST events
+    /// back. Reads from `REWIND_PUBLIC_URL` env var; falls back to
+    /// `http://127.0.0.1:4800`. Phase 3 commit 5.
+    pub base_url: String,
 }
 
 pub struct WebServer {
@@ -126,10 +150,29 @@ fn bootstrap_crypto() -> Option<crypto::CryptoBox> {
     }
 }
 
+/// Read `REWIND_PUBLIC_URL` (the externally-reachable base URL the
+/// runner SDK will POST events to). Falls back to
+/// `http://127.0.0.1:4800` for local development.
+///
+/// Operators running Rewind behind a proxy or on a non-default
+/// host MUST set this; otherwise dispatched runners receive
+/// `127.0.0.1:4800` in the payload and fail to call back.
+pub fn bootstrap_base_url() -> String {
+    std::env::var("REWIND_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:4800".to_string())
+}
+
 impl WebServer {
     pub fn new(store: Arc<Mutex<Store>>, event_tx: broadcast::Sender<StoreEvent>) -> Self {
         let otel_config = OtelConfig::from_env();
         let crypto = bootstrap_crypto();
+        let base_url = bootstrap_base_url();
+        let dispatcher = crypto.clone().and_then(|c| {
+            dispatcher::Dispatcher::new(c, base_url.clone())
+                .map_err(|e| {
+                    tracing::error!("dispatcher init failed: {e}");
+                })
+                .ok()
+        });
         WebServer {
             state: AppState {
                 store,
@@ -138,6 +181,8 @@ impl WebServer {
                 otel_config,
                 auth_token: None,
                 crypto,
+                dispatcher,
+                base_url,
             },
             dev_mode: false,
             auth_disabled: false,
@@ -148,6 +193,14 @@ impl WebServer {
         let (event_tx, _) = broadcast::channel(256);
         let otel_config = OtelConfig::from_env();
         let crypto = bootstrap_crypto();
+        let base_url = bootstrap_base_url();
+        let dispatcher = crypto.clone().and_then(|c| {
+            dispatcher::Dispatcher::new(c, base_url.clone())
+                .map_err(|e| {
+                    tracing::error!("dispatcher init failed: {e}");
+                })
+                .ok()
+        });
         WebServer {
             state: AppState {
                 store: Arc::new(Mutex::new(store)),
@@ -156,6 +209,8 @@ impl WebServer {
                 otel_config,
                 auth_token: None,
                 crypto,
+                dispatcher,
+                base_url,
             },
             dev_mode: false,
             auth_disabled: false,
@@ -265,7 +320,7 @@ impl WebServer {
         });
 
         // Periodic replay context TTL cleanup (every 10 minutes, 1h TTL)
-        let ctx_cleanup_state = drain_state;
+        let ctx_cleanup_state = drain_state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(600)).await;
@@ -278,6 +333,11 @@ impl WebServer {
                 }
             }
         });
+
+        // Phase 3 commit 5: replay-job reaper (lease + dispatch
+        // deadline expiry). Spawns whenever the server runs;
+        // a no-op when no jobs exist.
+        reaper::spawn(drain_state);
 
         axum::serve(listener, app).await?;
         Ok(())
