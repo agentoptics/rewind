@@ -69,11 +69,17 @@ use crate::crypto::CryptoBox;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Dispatch wire-format payload sent to the runner.
+///
+/// **Review #154 F2:** `replay_context_timeline_id` is the timeline
+/// the replay context targets — the SDK's `attach_replay_context`
+/// uses it to set `_timeline_id` so any cache-miss live recordings
+/// land in the fork rather than the original timeline.
 #[derive(Debug, serde::Serialize)]
 struct DispatchBody<'a> {
     pub job_id: &'a str,
     pub session_id: &'a str,
     pub replay_context_id: &'a str,
+    pub replay_context_timeline_id: &'a str,
     pub base_url: &'a str,
 }
 
@@ -83,20 +89,36 @@ pub const DISPATCH_DEADLINE_SECS: i64 = 10;
 pub const INITIAL_LEASE_SECS: i64 = 300; // 5 minutes; extended on heartbeat
 
 /// Build the canonical signing input for the wire-format signature.
-fn signing_input(job_id: &str, body: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(job_id.len() + 1 + body.len());
+///
+/// **Review #154 F5:** when `timestamp` is `Some(ts)`, the input is
+/// `ts || \n || job_id || \n || body` (defeats long-window replays
+/// of captured signatures). When `None`, the legacy two-line input
+/// is used (kept so the pinned reference-vector test that documents
+/// the pre-#154 wire format still passes; production dispatch
+/// always uses Some).
+fn signing_input(timestamp: Option<i64>, job_id: &str, body: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + job_id.len() + 2 + body.len());
+    if let Some(ts) = timestamp {
+        buf.extend_from_slice(ts.to_string().as_bytes());
+        buf.push(b'\n');
+    }
     buf.extend_from_slice(job_id.as_bytes());
     buf.push(b'\n');
     buf.extend_from_slice(body);
     buf
 }
 
-/// Compute `HMAC-SHA256(key, signing_input(job_id, body))` as a
-/// lowercase hex string. Pure function; tested directly.
-pub fn compute_signature(key: &[u8], job_id: &str, body: &[u8]) -> String {
+/// Compute `HMAC-SHA256(key, signing_input(timestamp, job_id, body))`
+/// as a lowercase hex string. Pure function; tested directly.
+pub fn compute_signature(
+    key: &[u8],
+    timestamp: Option<i64>,
+    job_id: &str,
+    body: &[u8],
+) -> String {
     let mut mac = HmacSha256::new_from_slice(key)
         .expect("HMAC-SHA256 accepts any key length");
-    mac.update(&signing_input(job_id, body));
+    mac.update(&signing_input(timestamp, job_id, body));
     let bytes = mac.finalize().into_bytes();
     let mut hex = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -133,7 +155,16 @@ impl Dispatcher {
     /// (no store handle) so the async HTTP work doesn't have to hold
     /// a `MutexGuard<Store>` across an `.await`. Caller applies the
     /// outcome via [`Self::apply_outcome`].
-    pub async fn dispatch(&self, runner: &Runner, job: &ReplayJob) -> DispatchOutcome {
+    ///
+    /// **Review #154 F2:** caller passes `replay_context_timeline_id`
+    /// so the dispatch payload can carry it and the SDK's
+    /// `attach_replay_context` can set `_timeline_id` correctly.
+    pub async fn dispatch(
+        &self,
+        runner: &Runner,
+        job: &ReplayJob,
+        replay_context_timeline_id: &str,
+    ) -> DispatchOutcome {
         let webhook_url = match runner.webhook_url.as_deref() {
             Some(u) => u,
             None => {
@@ -176,6 +207,7 @@ impl Dispatcher {
             job_id: &job.id,
             session_id: &job.session_id,
             replay_context_id,
+            replay_context_timeline_id,
             base_url: &self.base_url,
         };
         let body_bytes = match serde_json::to_vec(&body) {
@@ -184,7 +216,38 @@ impl Dispatcher {
                 return DispatchOutcome::Errored(format!("body serialization: {e}"));
             }
         };
-        let signature = compute_signature(raw_token.expose().as_bytes(), &job.id, &body_bytes);
+        // F5: include a timestamp in the signed input + send it in
+        // a header so the runner can enforce a tolerance window.
+        let timestamp = Utc::now().timestamp();
+        let signature = compute_signature(
+            raw_token.expose().as_bytes(),
+            Some(timestamp),
+            &job.id,
+            &body_bytes,
+        );
+
+        // F6: revalidate webhook_url against the SSRF policy at
+        // dispatch time, not just at registration. Closes the
+        // window where a host's DNS records change between
+        // registration and dispatch. Note: there's still a
+        // residual race between this check and the reqwest
+        // connect; a custom connector would be required to fully
+        // close it (deferred — pre-existing url_guard limitation
+        // documented in docs/runners.md).
+        let bypass_ssrf = std::env::var("REWIND_ALLOW_LOOPBACK_WEBHOOKS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !bypass_ssrf
+            && let Err(msg) = crate::url_guard::validate_export_endpoint(webhook_url).await
+        {
+            tracing::warn!(
+                "dispatcher: webhook_url for runner {} no longer passes SSRF check: {msg}",
+                runner.id
+            );
+            return DispatchOutcome::Errored(format!(
+                "webhook_url failed dispatch-time SSRF check: {msg}"
+            ));
+        }
 
         // 3. POST. Single attempt with timeout — runners must reply
         //    within 5s. The reaper handles dispatch_deadline_at if
@@ -198,6 +261,7 @@ impl Dispatcher {
             .post(webhook_url)
             .header("X-Rewind-Job-Id", &job.id)
             .header("X-Rewind-Signature", format!("sha256={signature}"))
+            .header("X-Rewind-Timestamp", timestamp.to_string())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body_bytes)
             .send()
@@ -296,73 +360,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signing_input_format_is_job_id_newline_body() {
-        let out = signing_input("abc", b"hello");
+    fn signing_input_legacy_format_when_no_timestamp() {
+        let out = signing_input(None, "abc", b"hello");
         assert_eq!(out, b"abc\nhello");
     }
 
     #[test]
+    fn signing_input_with_timestamp_prepends_three_lines() {
+        let out = signing_input(Some(1700000000), "abc", b"hello");
+        assert_eq!(out, b"1700000000\nabc\nhello");
+    }
+
+    #[test]
     fn signing_input_handles_empty_body() {
-        let out = signing_input("abc", b"");
+        let out = signing_input(None, "abc", b"");
         assert_eq!(out, b"abc\n");
     }
 
     #[test]
-    fn signing_input_includes_full_job_id_and_body() {
-        let out = signing_input(
-            "550e8400-e29b-41d4-a716-446655440000",
-            b"{\"k\":\"v\"}",
-        );
-        assert_eq!(
-            out,
-            b"550e8400-e29b-41d4-a716-446655440000\n{\"k\":\"v\"}".to_vec()
-        );
-    }
-
-    #[test]
     fn compute_signature_is_stable() {
-        let a = compute_signature(b"key", "job-1", b"body");
-        let b = compute_signature(b"key", "job-1", b"body");
+        let a = compute_signature(b"key", Some(1700000000), "job-1", b"body");
+        let b = compute_signature(b"key", Some(1700000000), "job-1", b"body");
         assert_eq!(a, b);
     }
 
     #[test]
+    fn compute_signature_changes_when_timestamp_changes() {
+        // F5: same key/job/body with different timestamps must produce
+        // different signatures, so a captured signature can't be
+        // replayed at a fresh timestamp without re-signing.
+        let a = compute_signature(b"key", Some(1700000000), "job-1", b"body");
+        let b = compute_signature(b"key", Some(1700000300), "job-1", b"body");
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn compute_signature_changes_when_key_changes() {
-        let a = compute_signature(b"key1", "job-1", b"body");
-        let b = compute_signature(b"key2", "job-1", b"body");
+        let a = compute_signature(b"key1", Some(1700000000), "job-1", b"body");
+        let b = compute_signature(b"key2", Some(1700000000), "job-1", b"body");
         assert_ne!(a, b);
     }
 
     #[test]
     fn compute_signature_changes_when_job_id_changes() {
-        let a = compute_signature(b"key", "job-1", b"body");
-        let b = compute_signature(b"key", "job-2", b"body");
+        let a = compute_signature(b"key", Some(1700000000), "job-1", b"body");
+        let b = compute_signature(b"key", Some(1700000000), "job-2", b"body");
         assert_ne!(a, b);
     }
 
     #[test]
     fn compute_signature_changes_when_body_changes() {
-        let a = compute_signature(b"key", "job-1", b"body-A");
-        let b = compute_signature(b"key", "job-1", b"body-B");
+        let a = compute_signature(b"key", Some(1700000000), "job-1", b"body-A");
+        let b = compute_signature(b"key", Some(1700000000), "job-1", b"body-B");
         assert_ne!(a, b);
     }
 
     #[test]
     fn compute_signature_is_64_hex_chars() {
-        let s = compute_signature(b"key", "job", b"body");
+        let s = compute_signature(b"key", Some(1700000000), "job", b"body");
         assert_eq!(s.len(), 64);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// Cross-check against a known test vector. Generated with:
-    ///   `python3 -c "import hmac,hashlib; print(hmac.new(b'secret', b'job-1\nbody', hashlib.sha256).hexdigest())"`
-    /// The runner SDK in commit 9 verifies signatures using the same
-    /// recipe; this test pins the wire-format so a Rust-side change
-    /// doesn't silently drift away from the Python implementation.
+    ///   `python3 -c "import hmac,hashlib; print(hmac.new(b'secret', b'1700000000\\njob-1\\nbody', hashlib.sha256).hexdigest())"`
+    ///
+    /// Pinned alongside the matching Python test
+    /// (`python/tests/test_runner.py::test_compute_signature_matches_rust_reference`)
+    /// so any change to either side that would silently drift the
+    /// wire format breaks both tests in lockstep.
     #[test]
-    fn compute_signature_matches_python_reference() {
-        let actual = compute_signature(b"secret", "job-1", b"body");
-        let expected = "52fd281254f1f940a5f2ad83ebce5bfbf92f77187afa03db6902bd328abd31f9";
+    fn compute_signature_matches_python_reference_with_timestamp() {
+        let actual = compute_signature(b"secret", Some(1700000000), "job-1", b"body");
+        let expected = "ea61914f63b2516960203b8bf3f4e8ee5c9a379ca941c8bd6edef2a1681944bb";
         assert_eq!(actual, expected, "drift from Python HMAC reference");
+    }
+
+    /// Pre-#154 legacy two-line input still works for backward-compat
+    /// and matches the original Python reference vector.
+    #[test]
+    fn compute_signature_legacy_no_timestamp_matches_python_reference() {
+        let actual = compute_signature(b"secret", None, "job-1", b"body");
+        let expected = "52fd281254f1f940a5f2ad83ebce5bfbf92f77187afa03db6902bd328abd31f9";
+        assert_eq!(actual, expected, "drift from legacy Python HMAC reference");
     }
 }

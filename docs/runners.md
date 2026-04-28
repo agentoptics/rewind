@@ -197,10 +197,11 @@ Transitions:
 | `in_progress` | runner posts `completed` event | `completed` |
 | `in_progress` | reaper sees `lease_expires_at` (5min) elapsed without heartbeat | `errored` (`stage="lease_expired"`) |
 
-Cancellation: operator can `DELETE /api/replay-jobs/{id}` from the
-dashboard or programmatically. v1 is fire-and-forget — the runner
-is not notified; if it later posts events they'll bounce off the
-SQL terminal-state guard.
+Cancellation: deferred to v3.1 (cooperative cancel protocol).
+There is no `DELETE /api/replay-jobs/{id}` in v1 — operators who
+need to abandon a runaway runner kill the runner process
+externally; the lease reaper subsequently marks the job `errored`
+with `stage='lease_expired'` once the heartbeat window passes.
 
 ---
 
@@ -233,6 +234,25 @@ that gates `export_otel`. Refuses loopback (`127.0.0.1`, `::1`,
 `localhost`), RFC 1918 private ranges, link-local + cloud
 metadata IPs (`169.254.169.254`), and parser-differential
 numeric forms (octal/hex/decimal IP literals).
+
+The check runs at **registration time** (POST /api/runners) AND
+again at **dispatch time** (each outbound webhook). Dispatch-time
+re-validation closes the window where a registered host's DNS
+records change between registration and dispatch (Review #154 F6).
+There's still a residual race between the dispatch-time DNS lookup
+and reqwest's connection-time re-resolve — a custom hyper connector
+that rejects private IPs at TCP connect would be required to fully
+close it; planned for v3.1.
+
+**Outbound webhook freshness (Review #154 F5):** every dispatch
+includes an `X-Rewind-Timestamp: <unix-seconds>` header AND the
+timestamp is part of the signed input (`HMAC-SHA256(token,
+timestamp || \\n || job_id || \\n || body)`). The runner SDK
+rejects requests outside a ±5 minute tolerance window, defeating
+long-window replays of captured signed dispatches. The SDK also
+keeps a process-local seen-cache of recent `job_id`s so a captured
+signature INSIDE the tolerance window still can't re-launch the
+agent (200 + `duplicate=true` on the second arrival).
 
 **Dev escape hatch:** `REWIND_ALLOW_LOOPBACK_WEBHOOKS=1`
 bypasses the SSRF guard. **NEVER set this in production.**

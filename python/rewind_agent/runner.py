@@ -77,6 +77,8 @@ import hmac
 import json
 import logging
 import os
+import time
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -135,11 +137,17 @@ class DispatchPayload:
     """Decoded body of a dispatch webhook from the Rewind server.
 
     Mirrors ``crates/rewind-web/src/dispatcher.rs::DispatchBody``.
+
+    **Review #154 F2:** ``replay_context_timeline_id`` is the timeline
+    the replay context targets — runners pass it to
+    ``ExplicitClient.attach_replay_context`` so live cache misses
+    record into the fork.
     """
 
     job_id: str
     session_id: str
     replay_context_id: str
+    replay_context_timeline_id: str
     base_url: str
 
     @classmethod
@@ -148,6 +156,11 @@ class DispatchPayload:
             job_id=body["job_id"],
             session_id=body["session_id"],
             replay_context_id=body["replay_context_id"],
+            # Tolerate older dispatch payloads (pre-#154) by defaulting
+            # to empty so the runner can still process them — but a
+            # missing timeline id will result in `_timeline_id` not
+            # being set, with the documented consequence.
+            replay_context_timeline_id=body.get("replay_context_timeline_id", ""),
             base_url=body["base_url"],
         )
 
@@ -159,15 +172,38 @@ class DispatchPayload:
 
 SIGNATURE_HEADER = "X-Rewind-Signature"
 JOB_ID_HEADER = "X-Rewind-Job-Id"
+TIMESTAMP_HEADER = "X-Rewind-Timestamp"
+
+#: Maximum allowable clock skew between dispatcher and runner
+#: (review #154 F5). Rejects captured-and-replayed dispatches whose
+#: timestamp is outside this window.
+TIMESTAMP_TOLERANCE_SECS = 300  # 5 minutes
 
 
-def compute_signature(token: str, job_id: str, body_bytes: bytes) -> str:
+def compute_signature(
+    token: str,
+    job_id: str,
+    body_bytes: bytes,
+    timestamp: Optional[int] = None,
+) -> str:
     """Compute the canonical signature for a dispatch.
 
     Mirrors ``crates/rewind-web/src/dispatcher.rs::compute_signature``.
-    Recipe: ``HMAC-SHA256(token, job_id || "\\n" || body)``, hex.
+
+    **Review #154 F5:** the signed input now includes a unix-seconds
+    timestamp so replays of captured dispatches outside the tolerance
+    window are rejected. ``timestamp=None`` (the default) preserves
+    the legacy two-line input ``job_id || "\\n" || body`` for tests
+    that pin against the pre-#154 reference vector; production
+    dispatch always passes a timestamp.
+
+    Recipe (with timestamp): ``HMAC-SHA256(token, timestamp || "\\n"
+    || job_id || "\\n" || body)``, hex.
     """
     mac = hmac.new(token.encode("utf-8"), digestmod=hashlib.sha256)
+    if timestamp is not None:
+        mac.update(str(timestamp).encode("utf-8"))
+        mac.update(b"\n")
     mac.update(job_id.encode("utf-8"))
     mac.update(b"\n")
     mac.update(body_bytes)
@@ -179,12 +215,19 @@ def verify_signature(
     config: RunnerConfig,
     headers: dict[str, str],
     body_bytes: bytes,
+    now: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Constant-time-compare the supplied signature against the canonical one.
 
     Returns ``(ok, reason)``. ``ok=True`` means the request is
     authentic. ``reason`` is a short human-readable hint when
     verification fails (don't echo it back to untrusted callers).
+
+    **Review #154 F5:** also enforces the timestamp tolerance window.
+    A request whose ``X-Rewind-Timestamp`` is more than
+    :data:`TIMESTAMP_TOLERANCE_SECS` seconds away from ``now`` is
+    refused, defeating long-window replay attacks even if the
+    attacker captured a previously-valid signature.
     """
     job_id = _header(headers, JOB_ID_HEADER)
     if not job_id:
@@ -195,7 +238,21 @@ def verify_signature(
         return False, "missing or malformed X-Rewind-Signature"
     supplied = sig_header[len("sha256=") :]
 
-    expected = compute_signature(config.auth_token, job_id, body_bytes)
+    ts_header = _header(headers, TIMESTAMP_HEADER)
+    timestamp: Optional[int] = None
+    if ts_header is not None:
+        try:
+            timestamp = int(ts_header)
+        except ValueError:
+            return False, "malformed X-Rewind-Timestamp"
+        current = now if now is not None else int(time.time())
+        if abs(current - timestamp) > TIMESTAMP_TOLERANCE_SECS:
+            return False, (
+                f"timestamp outside tolerance: |{current} - {timestamp}| "
+                f"> {TIMESTAMP_TOLERANCE_SECS}s"
+            )
+
+    expected = compute_signature(config.auth_token, job_id, body_bytes, timestamp)
     if not hmac.compare_digest(supplied, expected):
         return False, "signature mismatch"
     return True, None
@@ -223,12 +280,26 @@ class ProgressReporter:
     Built on top of httpx (already required transitively by other
     rewind_agent modules); falls back to ``urllib`` if httpx is
     absent.
+
+    **Review #154 F4:** the constructor takes ``base_url`` directly
+    so callbacks land back at the *dispatcher's* server URL rather
+    than the runner's own ``REWIND_URL`` env (they may differ when
+    Rewind sits behind a proxy or rewrites). :func:`asgi_handler`
+    builds the reporter from ``payload.base_url``;
+    ``RunnerConfig.rewind_base_url`` is the fallback for direct/test
+    usage.
     """
 
-    def __init__(self, config: RunnerConfig, job_id: str) -> None:
+    def __init__(
+        self,
+        config: RunnerConfig,
+        job_id: str,
+        base_url: Optional[str] = None,
+    ) -> None:
         self.config = config
         self.job_id = job_id
-        self._url = f"{config.rewind_base_url.rstrip('/')}/api/replay-jobs/{job_id}/events"
+        url_root = (base_url or config.rewind_base_url).rstrip("/")
+        self._url = f"{url_root}/api/replay-jobs/{job_id}/events"
 
     async def started(self) -> None:
         await self._post({"event_type": "started"})
@@ -328,6 +399,49 @@ def handle_replay(fn: HandlerFn) -> HandlerFn:
     return fn
 
 
+#: Recently-seen job_ids for replay protection (Review #154 F5).
+#: Bounded to 10_000 entries to cap memory; the dispatcher keeps
+#: job_ids unique per dispatch attempt so the only way for a job_id
+#: to repeat is a replay attack against the runner's webhook.
+_RECENT_JOB_IDS_CAP = 10_000
+_recent_job_ids: "OrderedDict[str, float]" = OrderedDict()
+_recent_lock: Optional[asyncio.Lock] = None
+
+
+def _get_recent_lock() -> asyncio.Lock:
+    """Lazy-create the lock so module import doesn't require a loop."""
+    global _recent_lock
+    if _recent_lock is None:
+        _recent_lock = asyncio.Lock()
+    return _recent_lock
+
+
+def reset_replay_protection_for_tests() -> None:
+    """Reset the seen-cache + lock. Test-only — never call in prod."""
+    global _recent_lock
+    _recent_job_ids.clear()
+    _recent_lock = None
+
+
+async def _seen_job_id(job_id: str) -> bool:
+    """Return True if this job_id was already accepted recently.
+
+    The dispatcher emits each `job_id` exactly once per real
+    dispatch; a duplicate is either a captured-replay attack OR a
+    legitimate retry from the dispatcher (which we currently don't
+    do, but defensive coding leaves room for v3.1 retries — when
+    that lands we'll switch to a delivery_id field).
+    """
+    async with _get_recent_lock():
+        if job_id in _recent_job_ids:
+            return True
+        _recent_job_ids[job_id] = time.time()
+        # Bound the cache.
+        while len(_recent_job_ids) > _RECENT_JOB_IDS_CAP:
+            _recent_job_ids.popitem(last=False)
+        return False
+
+
 async def asgi_handler(
     *,
     config: RunnerConfig,
@@ -343,16 +457,21 @@ async def asgi_handler(
 
     The handler runs as a background task — this function returns
     ``(202, {"job_id": ...})`` immediately on signature success so
-    the Rewind dispatcher's 5-second timeout is satisfied. The
-    handler then has up to the lease window (5 min, extended on
-    each ``progress`` call) to finish and emit ``completed`` /
-    ``errored``.
+    the Rewind dispatcher's 5-second timeout is satisfied.
 
-    If ``auto_emit_started`` is True (the default), the handler is
-    wrapped to call ``reporter.started()`` before invoking user
-    code, so the user code sees an ``in_progress`` job from the
-    start. Pass False to opt out (handler must call
-    ``reporter.started()`` itself).
+    **Review #154 F5:** before invoking the handler, the function
+    enforces:
+
+    1. Timestamp tolerance via :func:`verify_signature` (rejects
+       replays older than :data:`TIMESTAMP_TOLERANCE_SECS`).
+    2. Process-level idempotency via the ``job_id`` seen-cache —
+       a captured signed dispatch within the timestamp window
+       still cannot re-launch the agent because the second arrival
+       hits the cache and short-circuits with 200 + ``duplicate``.
+
+    **Review #154 F4:** the reporter handed to user code is built
+    from ``payload.base_url`` so event callbacks land at the
+    dispatcher's server, not the runner's local config.
     """
     ok, reason = verify_signature(
         config=config, headers=headers, body_bytes=body_bytes
@@ -367,7 +486,19 @@ async def asgi_handler(
     except (ValueError, KeyError) as e:
         return 400, {"error": f"invalid dispatch body: {e}"}
 
-    reporter = ProgressReporter(config, payload.job_id)
+    # F5: process-level idempotency. The signed input changes per
+    # dispatch (timestamp varies), so an attacker can't forge a fresh
+    # one — but if they captured a signed dispatch INSIDE the 5-min
+    # tolerance window, the timestamp check passes. The seen-cache
+    # closes that residual window at the runner.
+    if await _seen_job_id(payload.job_id):
+        logger.warning(
+            "rewind runner: duplicate dispatch for job %s — likely replay attempt; ignoring",
+            payload.job_id,
+        )
+        return 200, {"job_id": payload.job_id, "accepted": False, "duplicate": True}
+
+    reporter = ProgressReporter(config, payload.job_id, base_url=payload.base_url)
 
     async def _run() -> None:
         if auto_emit_started:

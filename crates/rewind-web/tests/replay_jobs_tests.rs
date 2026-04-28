@@ -25,7 +25,23 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+fn enable_loopback_webhook_dev_escape_once() {
+    use std::sync::Once;
+    static SET: Once = Once::new();
+    SET.call_once(|| {
+        // Review #154 F6: dispatch-time SSRF check would reject the
+        // localhost stub URLs these tests POST to. Set the dev
+        // escape env var once for the entire test process.
+        // SAFETY: env var swap is unsafe in the 2024 edition; the
+        // Once guard ensures it happens before any dispatch runs.
+        unsafe {
+            std::env::set_var("REWIND_ALLOW_LOOPBACK_WEBHOOKS", "1");
+        }
+    });
+}
+
 fn setup() -> (Router, Router, Arc<Mutex<Store>>, TempDir) {
+    enable_loopback_webhook_dev_escape_once();
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let store = Arc::new(Mutex::new(store));
@@ -190,7 +206,10 @@ async fn create_replay_job_shape_b_dispatches_to_runner_and_transitions_to_dispa
     let job_id = body["job_id"].as_str().unwrap().to_string();
     assert_eq!(body["state"], "pending");
     assert_eq!(body["replay_context_id"], ctx_id);
-    assert!(body["fork_timeline_id"].is_null());
+    // Review #154 F2: shape B also returns the context's timeline id
+    // (so the dashboard / SDK can resolve `_timeline_id` correctly).
+    // Pre-#154 this was null for shape B.
+    assert!(body["fork_timeline_id"].is_string());
 
     // Wait for the runner stub to receive the dispatch call.
     let headers =
@@ -293,6 +312,145 @@ async fn create_replay_job_rejects_context_in_use() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("in-flight"));
+}
+
+// ── Review #154 F1: strict_match must propagate to the context ──
+
+#[tokio::test]
+async fn shape_a_strict_match_true_sets_replay_context_strict_flag() {
+    let (api, _callbacks, store, _tmp) = setup();
+    let (webhook_url, _rx) = spawn_runner_stub_accepting().await;
+    let (runner_id, _raw) = register_runner(&store, &webhook_url);
+    // Need a session with at least one step to fork from.
+    let (session_id, root_timeline_id) = seed_session_with_step(&store);
+
+    let (status, body) = json_post(
+        api.clone(),
+        &format!("/api/sessions/{session_id}/replay-jobs"),
+        json!({
+            "runner_id": runner_id,
+            "source_timeline_id": root_timeline_id,
+            "at_step": 1,
+            "strict_match": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body:?}");
+
+    let ctx_id = body["replay_context_id"].as_str().unwrap();
+    let s = store.lock().unwrap();
+    let ctx = s.get_replay_context(ctx_id).unwrap().unwrap();
+    assert!(
+        ctx.strict_match,
+        "F1: strict_match=true on the request must set the context's strict_match flag"
+    );
+}
+
+#[tokio::test]
+async fn shape_a_strict_match_omitted_defaults_to_warn_only() {
+    let (api, _callbacks, store, _tmp) = setup();
+    let (webhook_url, _rx) = spawn_runner_stub_accepting().await;
+    let (runner_id, _raw) = register_runner(&store, &webhook_url);
+    let (session_id, root_timeline_id) = seed_session_with_step(&store);
+
+    let (status, body) = json_post(
+        api,
+        &format!("/api/sessions/{session_id}/replay-jobs"),
+        json!({
+            "runner_id": runner_id,
+            "source_timeline_id": root_timeline_id,
+            "at_step": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let ctx_id = body["replay_context_id"].as_str().unwrap();
+    let s = store.lock().unwrap();
+    let ctx = s.get_replay_context(ctx_id).unwrap().unwrap();
+    assert!(!ctx.strict_match);
+}
+
+// ── Review #154 F3: Shape B cursor + TTL validation ──
+
+#[tokio::test]
+async fn shape_b_rejects_context_whose_cursor_already_advanced() {
+    let (api, _callbacks, store, _tmp) = setup();
+    let (webhook_url, _rx) = spawn_runner_stub_accepting().await;
+    let (runner_id, _raw) = register_runner(&store, &webhook_url);
+    let (session_id, _, ctx_id) = seed_session_and_context(&store);
+
+    // Pre-advance the cursor (simulates a previous job that ran
+    // partway through the recording).
+    {
+        let s = store.lock().unwrap();
+        let _step = s.advance_replay_context(&ctx_id).unwrap();
+    }
+
+    let (status, body) = json_post(
+        api,
+        &format!("/api/sessions/{session_id}/replay-jobs"),
+        json!({"runner_id": runner_id, "replay_context_id": ctx_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("cursor already advanced"), "got: {err}");
+}
+
+#[tokio::test]
+async fn shape_b_rejects_expired_context() {
+    let (api, _callbacks, store, _tmp) = setup();
+    let (webhook_url, _rx) = spawn_runner_stub_accepting().await;
+    let (runner_id, _raw) = register_runner(&store, &webhook_url);
+    let (session_id, _, ctx_id) = seed_session_and_context(&store);
+
+    // Backdate last_accessed_at past the TTL window via the test-only
+    // helper (review #154 F3).
+    {
+        let s = store.lock().unwrap();
+        let very_old = chrono::Utc::now() - chrono::Duration::seconds(7200);
+        s._test_set_replay_context_last_accessed(&ctx_id, very_old)
+            .unwrap();
+    }
+
+    let (status, body) = json_post(
+        api,
+        &format!("/api/sessions/{session_id}/replay-jobs"),
+        json!({"runner_id": runner_id, "replay_context_id": ctx_id}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("TTL"), "got: {err}");
+}
+
+// Helper: session with one recorded step so Shape A's fork(at_step=1)
+// has something to fork from.
+fn seed_session_with_step(store: &Arc<Mutex<Store>>) -> (String, String) {
+    use rewind_store::{Session, SessionSource, SessionStatus, Step, StepStatus, StepType, Timeline};
+    let s = store.lock().unwrap();
+    let session = Session {
+        id: Uuid::new_v4().to_string(),
+        name: "f1-f3-test".into(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        status: SessionStatus::Recording,
+        source: SessionSource::Hooks,
+        total_steps: 0,
+        total_tokens: 0,
+        metadata: serde_json::json!({}),
+        thread_id: None,
+        thread_ordinal: None,
+    };
+    let timeline = Timeline::new_root(&session.id);
+    s.create_session(&session).unwrap();
+    s.create_timeline(&timeline).unwrap();
+    let mut step = Step::new_llm_call(&timeline.id, &session.id, 1, "stub-model");
+    step.status = StepStatus::Success;
+    step.duration_ms = 10;
+    s.create_step(&step).unwrap();
+    s.update_session_stats(&session.id, 1, 0).unwrap();
+    (session.id, timeline.id)
 }
 
 #[tokio::test]

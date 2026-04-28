@@ -77,8 +77,6 @@ export function ReplayJobModal({
     isDispatching,
     dispatchError,
     job,
-    cancel,
-    isCanceling,
     reset,
   } = useReplayJob(sessionId)
 
@@ -138,12 +136,7 @@ export function ReplayJobModal({
             error={dispatchError?.message ?? null}
           />
         ) : (
-          <JobProgressView
-            job={job}
-            onCancel={cancel}
-            isCanceling={isCanceling}
-            onClose={handleClose}
-          />
+          <JobProgressView job={job} onClose={handleClose} />
         )}
       </div>
     </div>
@@ -262,13 +255,9 @@ function NoRunnersFallback({
 
 function JobProgressView({
   job,
-  onCancel,
-  isCanceling,
   onClose,
 }: {
   job: NonNullable<ReturnType<typeof useReplayJob>['job']>
-  onCancel: () => void
-  isCanceling: boolean
   onClose: () => void
 }) {
   const isTerminal = job.state === 'completed' || job.state === 'errored'
@@ -337,15 +326,6 @@ function JobProgressView({
       )}
 
       <div className="flex justify-end gap-2 pt-2">
-        {!isTerminal && (
-          <button
-            onClick={onCancel}
-            disabled={isCanceling}
-            className="px-3 py-1.5 text-sm text-red-400 hover:text-red-300"
-          >
-            {isCanceling ? 'Cancelling...' : 'Cancel'}
-          </button>
-        )}
         <button
           onClick={onClose}
           className="px-3 py-1.5 text-sm bg-neutral-700 hover:bg-neutral-600 text-white rounded"

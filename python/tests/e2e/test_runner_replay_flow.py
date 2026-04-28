@@ -68,7 +68,16 @@ TEST_AUTH_TOKEN = "phase3-e2e-bearer-token"
 
 
 class _StubRunner:
-    """Tiny HTTP server that pretends to be a runner."""
+    """Tiny HTTP server that pretends to be a runner.
+
+    **Review #154 N2:** the SDK code paths (`ProgressReporter`
+    base_url, DispatchPayload decoding, signature verification with
+    timestamp) are exercised by unit tests in
+    `python/tests/test_runner.py`. The e2e here uses a raw stub
+    so the test stays fast + deterministic without spinning a
+    dedicated event loop per HTTP request inside an HTTPServer
+    handler thread.
+    """
 
     def __init__(self, runner_token_holder: list[str]) -> None:
         self.received: list[dict] = []
@@ -86,19 +95,17 @@ class _StubRunner:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
-            # Suppress default access logging.
             def log_message(self, *_args, **_kwargs) -> None:  # noqa: D401
                 return
 
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
-                job_id = self.headers.get("X-Rewind-Job-Id", "")
-                signature = self.headers.get("X-Rewind-Signature", "")
                 outer.received.append(
                     {
-                        "job_id": job_id,
-                        "signature": signature,
+                        "job_id": self.headers.get("X-Rewind-Job-Id", ""),
+                        "signature": self.headers.get("X-Rewind-Signature", ""),
+                        "timestamp": self.headers.get("X-Rewind-Timestamp", ""),
                         "body": body.decode("utf-8"),
                     }
                 )
@@ -107,8 +114,6 @@ class _StubRunner:
                 self.end_headers()
                 self.wfile.write(b'{"accepted": true}')
 
-                # Async-style: spawn a thread that posts events back
-                # so we don't block the dispatcher.
                 threading.Thread(
                     target=outer._post_events_back,
                     args=(json.loads(body), outer.token_holder[0]),
@@ -124,6 +129,9 @@ class _StubRunner:
     @staticmethod
     def _post_events_back(payload: dict, raw_token: str) -> None:
         time.sleep(0.05)
+        # Use the dispatch payload's base_url (Review #154 F4 wire-
+        # format contract: server tells the runner where to call
+        # back, runner doesn't infer from local config).
         base = payload["base_url"].rstrip("/")
         url = f"{base}/api/replay-jobs/{payload['job_id']}/events"
         headers = {
@@ -311,20 +319,29 @@ def test_full_runner_replay_flow_register_dispatch_callback(rewind_server) -> No
         first = stub.received[0]
         assert first["job_id"] == job_id
         assert first["signature"].startswith("sha256=")
+        # Review #154 F5: timestamp header must be present.
+        assert first["timestamp"], "X-Rewind-Timestamp header missing"
         body_json = json.loads(first["body"])
         assert body_json["job_id"] == job_id
         assert body_json["session_id"] == sess_id
         assert body_json["base_url"] == base_url
+        # F2: dispatch payload now carries the fork timeline id.
+        assert body_json.get("replay_context_timeline_id"), \
+            "dispatch payload missing replay_context_timeline_id (F2 regression)"
 
-        # Verify the signature is what we'd compute locally from the raw token.
+        # Verify the signature reconstructs against the F5 wire format.
+        ts = int(first["timestamp"])
         expected_sig = hmac.new(
             token_holder[0].encode(),
             digestmod=hashlib.sha256,
         )
+        expected_sig.update(str(ts).encode())
+        expected_sig.update(b"\n")
         expected_sig.update(job_id.encode())
         expected_sig.update(b"\n")
         expected_sig.update(first["body"].encode())
-        assert first["signature"] == f"sha256={expected_sig.hexdigest()}"
+        assert first["signature"] == f"sha256={expected_sig.hexdigest()}", \
+            "signature does not match F5 (timestamp || job_id || body) recipe"
 
         # 6. Poll job state until completed.
         for _ in range(60):

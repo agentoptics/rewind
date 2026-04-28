@@ -54,6 +54,12 @@ use uuid::Uuid;
 use crate::crypto::{self, CryptoBox};
 use crate::{AppState, StoreEvent};
 
+/// Replay context TTL (seconds). Mirrors the constant in
+/// `WebServer::run`'s background cleanup task. Used by Shape-B
+/// dispatch validation (review #154 F3) to refuse contexts that
+/// would race the cleanup.
+const REPLAY_CONTEXT_TTL_SECS: i64 = 3600;
+
 /// Build the runners + replay-job-create sub-router (bearer-protected).
 /// Caller should `.nest("/api", ...)` it alongside the existing
 /// `api::routes`.
@@ -74,10 +80,10 @@ pub fn routes() -> Router<AppState> {
             "/sessions/{sid}/replay-jobs",
             post(create_replay_job).get(list_replay_jobs_for_session),
         )
-        .route(
-            "/replay-jobs/{id}",
-            get(get_replay_job).delete(cancel_replay_job_handler),
-        )
+        // Review #154 N1: cancellation removed. The plan defers
+        // cooperative cancel to v3.1; only inspection (GET) is
+        // exposed in v1.
+        .route("/replay-jobs/{id}", get(get_replay_job))
 }
 
 /// Runner-callback routes mount OUTSIDE the bearer-auth middleware
@@ -596,6 +602,16 @@ async fn create_replay_job(
                 store
                     .create_replay_context(&ctx_id, &session.id, &fork.id, a.at_step)
                     .map_err(internal)?;
+                // Review #154 F1: apply strict_match if requested.
+                // create_replay_context defaults to warn-on-divergence;
+                // strict callers explicitly opt in here so a body
+                // divergence later raises 409 instead of returning a
+                // cached step with `divergent: true`.
+                if a.strict_match {
+                    store
+                        .set_replay_context_strict_match(&ctx_id, true)
+                        .map_err(internal)?;
+                }
                 (a.runner_id, ctx_id, Some(fork.id))
             }
             CreateReplayJobRequest::ReuseContext(b) => {
@@ -621,17 +637,42 @@ async fn create_replay_job(
                         b.replay_context_id, ctx.session_id, session.id
                     )));
                 }
+                // Review #154 F3 (cursor): a context whose cursor has
+                // already advanced past `from_step` is mid-replay
+                // already — reusing it would skip recorded steps and
+                // start partway through the timeline.
+                if ctx.current_step != ctx.from_step {
+                    return Err(conflict(format!(
+                        "replay_context {} cursor already advanced to step {} \
+                         (started at {}); a fresh context is required for a new dispatch",
+                        b.replay_context_id, ctx.current_step, ctx.from_step
+                    )));
+                }
+                // Review #154 F3 (TTL): replay contexts age out after
+                // REPLAY_CONTEXT_TTL_SECS (currently 1h, matching
+                // the WebServer cleanup task). Reusing a context past
+                // its TTL is racy with the cleanup deletion that's
+                // about to remove it; refuse upfront.
+                let age = chrono::Utc::now()
+                    .signed_duration_since(ctx.last_accessed_at)
+                    .num_seconds();
+                if age > REPLAY_CONTEXT_TTL_SECS {
+                    return Err(conflict(format!(
+                        "replay_context {} is {}s old (TTL {}s); create a fresh context",
+                        b.replay_context_id, age, REPLAY_CONTEXT_TTL_SECS
+                    )));
+                }
                 let in_flight = store
                     .count_in_flight_jobs_for_replay_context(&b.replay_context_id)
                     .map_err(internal)?;
                 if in_flight > 0 {
                     return Err(conflict(format!(
                         "replay_context {} already has {in_flight} in-flight job(s); \
-                         finish or cancel them before dispatching a new one",
+                         finish them before dispatching a new one",
                         b.replay_context_id
                     )));
                 }
-                (b.runner_id, b.replay_context_id, None)
+                (b.runner_id, b.replay_context_id, Some(ctx.timeline_id))
             }
         };
 
@@ -668,12 +709,21 @@ async fn create_replay_job(
     // (returns a DispatchOutcome) so the async HTTP doesn't hold
     // a MutexGuard across await — we apply the outcome inside a
     // briefly-held lock after the network call settles.
+    //
+    // F2: the dispatch payload carries the replay-context timeline id
+    // so the runner SDK's attach_replay_context can set _timeline_id
+    // before any live cache miss records into the wrong timeline.
     let job_clone = job.clone();
     let runner_clone = runner.clone();
     let store_arc = state.store.clone();
     let event_tx = state.event_tx.clone();
+    let timeline_for_payload = fork_timeline_id
+        .clone()
+        .unwrap_or_default();
     tokio::spawn(async move {
-        let outcome = dispatcher.dispatch(&runner_clone, &job_clone).await;
+        let outcome = dispatcher
+            .dispatch(&runner_clone, &job_clone, &timeline_for_payload)
+            .await;
         let after = {
             let store = match store_arc.lock() {
                 Ok(s) => s,
@@ -790,42 +840,11 @@ async fn get_replay_job(
     Ok(Json(job.into()))
 }
 
-/// `DELETE /api/replay-jobs/{id}` — operator cancel (forces the job
-/// into `errored` with stage `"cancelled"`). v1 cancellation is
-/// fire-and-forget: the runner is not notified; if it later posts
-/// progress events they'll bounce off the terminal-state guard.
-async fn cancel_replay_job_handler(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|e| internal(format!("store lock: {e}")))?;
-    let advanced = store
-        .advance_replay_job_state(
-            &id,
-            ReplayJobState::Errored,
-            Some("cancelled by operator"),
-            Some("cancelled"),
-        )
-        .map_err(internal)?;
-    if !advanced {
-        return Err(not_found("replay_job (or already terminal)"));
-    }
-    if let Ok(Some(job)) = store.get_replay_job(&id) {
-        let _ = state.event_tx.send(StoreEvent::ReplayJobUpdated {
-            job_id: job.id,
-            session_id: job.session_id,
-            state: "errored".to_string(),
-            progress_step: Some(job.progress_step),
-            progress_total: job.progress_total,
-            error_message: Some("cancelled by operator".to_string()),
-            error_stage: Some("cancelled".to_string()),
-        });
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
+// Review #154 N1: cancellation endpoint removed (plan defers
+// cooperative cancel to v3.1). Operators who need to abandon a
+// runaway runner kill the runner process externally; the lease
+// reaper will subsequently mark the job `errored` with
+// `stage='lease_expired'`.
 
 // ──────────────────────────────────────────────────────────────────
 // Runner-callback: POST /api/replay-jobs/{id}/events

@@ -887,10 +887,20 @@ impl Store {
     /// the warn-on-divergence fallback at the lookup layer.
     pub fn get_replay_context(&self, context_id: &str) -> Result<Option<ReplayContextRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, timeline_id, from_step, current_step, strict_match
+            "SELECT session_id, timeline_id, from_step, current_step, strict_match, last_accessed_at
              FROM replay_contexts WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![context_id], |row| {
+            let last_accessed_str: String = row.get(5)?;
+            let last_accessed_at = chrono::DateTime::parse_from_rfc3339(&last_accessed_str)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        format!("invalid last_accessed_at timestamp: {e}").into(),
+                    )
+                })?;
             Ok(ReplayContextRow {
                 session_id: row.get::<_, String>(0)?,
                 timeline_id: row.get::<_, String>(1)?,
@@ -899,6 +909,7 @@ impl Store {
                 // Option<i64> to gracefully handle the (impossible-but-defensive)
                 // case of a pre-migration row read against a v0.13+ schema.
                 strict_match: row.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
+                last_accessed_at,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -938,6 +949,26 @@ impl Store {
             params![context_id],
         )?;
         Ok(affected > 0)
+    }
+
+    /// Test-only: backdate `last_accessed_at` to simulate an
+    /// expired replay context. Used by Phase 3 commit 6 + review #154
+    /// F3 tests to exercise the dispatcher's TTL-rejection branch
+    /// without sleeping for the actual TTL window.
+    ///
+    /// Public because integration tests live outside the crate; the
+    /// `_test_` prefix and docstring flag the contract that this is
+    /// not for production use.
+    pub fn _test_set_replay_context_last_accessed(
+        &self,
+        context_id: &str,
+        when: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE replay_contexts SET last_accessed_at = ?1 WHERE id = ?2",
+            params![when.to_rfc3339(), context_id],
+        )?;
+        Ok(())
     }
 
     pub fn cleanup_expired_replay_contexts(&self, max_age_secs: i64) -> Result<usize> {

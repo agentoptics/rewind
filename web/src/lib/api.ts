@@ -139,12 +139,10 @@ export const api = {
   listReplayJobsForSession: (sessionId: string) =>
     get<ReplayJobView[]>(`/sessions/${sessionId}/replay-jobs`),
   replayJob: (jobId: string) => get<ReplayJobView>(`/replay-jobs/${jobId}`),
-  cancelReplayJob: (jobId: string) =>
-    request(`/replay-jobs/${jobId}`, { method: 'DELETE' }).then(async (res) => {
-      if (res.status === 204) return { ok: true } as const
-      const body = await res.json().catch(() => ({}))
-      throw new Error(body.error || `cancel failed: ${res.status}`)
-    }),
+  // Review #154 N1: cancellation removed. The plan defers cooperative
+  // cancel to v3.1; the UI no longer surfaces a button. Operators
+  // who must abandon a runaway runner kill the runner process; the
+  // lease reaper marks the job errored ~5 min later.
 }
 
 // ──────────────────────────────────────────────────────────────────
