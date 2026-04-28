@@ -3,6 +3,7 @@ import { SessionView } from '@/components/SessionView'
 import { DiffView } from '@/components/DiffView'
 import { BaselinesView } from '@/components/BaselinesView'
 import { EvalDashboard } from '@/components/EvalDashboard'
+import { RunnersPage } from '@/components/RunnersPage'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { useStore } from '@/hooks/use-store'
 
@@ -22,6 +23,8 @@ export function App() {
           <BaselinesView />
         ) : view === 'evaluations' ? (
           <EvalDashboard />
+        ) : view === 'runners' ? (
+          <RunnersPage />
         ) : (
           <EmptyState />
         )}

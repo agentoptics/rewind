@@ -4,6 +4,7 @@ import { cn, formatDuration, formatTokens } from '@/lib/utils'
 import {
   CheckCircle2, XCircle, Loader2, Brain, Wrench, ClipboardList,
   Eye, Pencil, FileText, Terminal, Search, Bot, Globe, ListTodo, Plug, MessageSquare, Zap, GitBranch,
+  Play,
 } from 'lucide-react'
 import type { StepResponse } from '@/types/api'
 
@@ -13,9 +14,11 @@ interface StepTimelineProps {
   onSelectStep: (id: string | null) => void
   autoFollow?: boolean
   onFork?: (step: StepResponse) => void
+  /** Phase 3 commit 8: dispatch a replay job to a registered runner. */
+  onRunReplay?: (step: StepResponse) => void
 }
 
-export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow, onFork }: StepTimelineProps) {
+export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow, onFork, onRunReplay }: StepTimelineProps) {
   const parentRef = useRef<HTMLDivElement>(null)
 
   const virtualizer = useVirtualizer({
@@ -83,16 +86,28 @@ export function StepTimeline({ steps, selectedStepId, onSelectStep, autoFollow, 
                   )}
                 </div>
               </button>
-              {onFork && (
-                <button
-                  onClick={() => onFork(step)}
-                  title={`Fork from step #${step.step_number}`}
-                  aria-label={`Fork from step ${step.step_number}`}
-                  className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 focus:opacity-100 flex items-center gap-1 text-[10px] text-amber-400 hover:text-amber-300 bg-neutral-900 border border-amber-900/60 hover:border-amber-700 px-1.5 py-0.5 rounded transition-opacity"
-                >
-                  <GitBranch size={10} /> Fork
-                </button>
-              )}
+              <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100 flex items-center gap-1 transition-opacity">
+                {onRunReplay && (
+                  <button
+                    onClick={() => onRunReplay(step)}
+                    title={`Run replay from step #${step.step_number} on a runner`}
+                    aria-label={`Run replay from step ${step.step_number}`}
+                    className="flex items-center gap-1 text-[10px] text-cyan-400 hover:text-cyan-300 bg-neutral-900 border border-cyan-900/60 hover:border-cyan-700 px-1.5 py-0.5 rounded"
+                  >
+                    <Play size={10} /> Run replay
+                  </button>
+                )}
+                {onFork && (
+                  <button
+                    onClick={() => onFork(step)}
+                    title={`Fork from step #${step.step_number}`}
+                    aria-label={`Fork from step ${step.step_number}`}
+                    className="flex items-center gap-1 text-[10px] text-amber-400 hover:text-amber-300 bg-neutral-900 border border-amber-900/60 hover:border-amber-700 px-1.5 py-0.5 rounded"
+                  >
+                    <GitBranch size={10} /> Fork
+                  </button>
+                )}
+              </div>
             </div>
           )
         })}

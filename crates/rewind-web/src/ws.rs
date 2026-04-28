@@ -62,6 +62,24 @@ enum ServerMessage {
     SessionUpdate { data: SessionUpdateData },
     #[serde(rename = "subscribed")]
     Subscribed { session_id: String },
+    /// Phase 3 commit 5/6: replay-job state/progress updates.
+    #[serde(rename = "replay_job_update")]
+    ReplayJobUpdate { data: ReplayJobUpdateData },
+}
+
+#[derive(Serialize)]
+struct ReplayJobUpdateData {
+    job_id: String,
+    session_id: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_step: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress_total: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_stage: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -166,6 +184,33 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     total_tokens: *total_tokens,
                                 },
                             })
+                        }
+                        StoreEvent::ReplayJobUpdated {
+                            job_id,
+                            session_id,
+                            state: job_state,
+                            progress_step,
+                            progress_total,
+                            error_message,
+                            error_stage,
+                        } => {
+                            // Forward replay-job updates only to clients
+                            // subscribed to the owning session.
+                            if subscribed_session.as_deref() == Some(session_id) {
+                                Some(ServerMessage::ReplayJobUpdate {
+                                    data: ReplayJobUpdateData {
+                                        job_id: job_id.clone(),
+                                        session_id: session_id.clone(),
+                                        state: job_state.clone(),
+                                        progress_step: *progress_step,
+                                        progress_total: *progress_total,
+                                        error_message: error_message.clone(),
+                                        error_stage: error_stage.clone(),
+                                    },
+                                })
+                            } else {
+                                None
+                            }
                         }
                     };
 

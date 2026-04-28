@@ -118,4 +118,90 @@ export const api = {
     del<DeleteReplayContextResponse>(`/replay-contexts/${id}`),
   deleteTimeline: (sessionId: string, timelineId: string) =>
     del<DeleteTimelineResponse>(`/sessions/${sessionId}/timelines/${timelineId}`),
+
+  // Phase 3 commit 7/13: runner registry
+  runners: () => get<RunnerView[]>('/runners'),
+  runner: (id: string) => get<RunnerView>(`/runners/${id}`),
+  registerRunner: (body: { name: string; mode: 'webhook'; webhook_url: string }) =>
+    post<RegisterRunnerResponse>('/runners', body),
+  removeRunner: (id: string) =>
+    request(`/runners/${id}`, { method: 'DELETE' }).then(async (res) => {
+      if (res.status === 204) return { ok: true } as const
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || `delete failed: ${res.status}`)
+    }),
+  regenerateRunnerToken: (id: string) =>
+    post<RegisterRunnerResponse>(`/runners/${id}/regenerate-token`, {}),
+
+  // Phase 3 commit 8/13: replay-job dispatch + introspection
+  createReplayJob: (sessionId: string, body: CreateReplayJobBody) =>
+    post<CreateReplayJobResponse>(`/sessions/${sessionId}/replay-jobs`, body),
+  listReplayJobsForSession: (sessionId: string) =>
+    get<ReplayJobView[]>(`/sessions/${sessionId}/replay-jobs`),
+  replayJob: (jobId: string) => get<ReplayJobView>(`/replay-jobs/${jobId}`),
+  // Review #154 N1: cancellation removed. The plan defers cooperative
+  // cancel to v3.1; the UI no longer surfaces a button. Operators
+  // who must abandon a runaway runner kill the runner process; the
+  // lease reaper marks the job errored ~5 min later.
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Phase 3 commit 7+8 types (kept here so the runners page + the
+// dispatch button share a single source of truth without yet
+// touching the broader types/api.ts file)
+// ──────────────────────────────────────────────────────────────────
+
+export interface RunnerView {
+  id: string
+  name: string
+  mode: 'webhook' | 'polling'
+  webhook_url: string | null
+  auth_token_preview: string
+  status: 'active' | 'disabled' | 'stale'
+  created_at: string
+  last_seen_at: string | null
+}
+
+export interface RegisterRunnerResponse {
+  runner: RunnerView
+  raw_token: string
+  raw_token_warning: string
+}
+
+export type CreateReplayJobBody =
+  | {
+      runner_id: string
+      source_timeline_id: string
+      at_step: number
+      strict_match?: boolean
+    }
+  | {
+      runner_id: string
+      replay_context_id: string
+    }
+
+export interface CreateReplayJobResponse {
+  job_id: string
+  replay_context_id: string
+  fork_timeline_id?: string | null
+  state: string
+  dispatch_deadline_at?: string | null
+}
+
+export interface ReplayJobView {
+  id: string
+  runner_id: string | null
+  session_id: string
+  replay_context_id: string | null
+  state: string
+  error_message: string | null
+  error_stage: string | null
+  progress_step: number
+  progress_total: number | null
+  created_at: string
+  dispatched_at: string | null
+  started_at: string | null
+  completed_at: string | null
+  dispatch_deadline_at: string | null
+  lease_expires_at: string | null
 }

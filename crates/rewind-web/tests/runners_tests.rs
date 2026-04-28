@@ -51,7 +51,11 @@ fn setup_inner(with_crypto: bool) -> (Router, Arc<Mutex<Store>>, TempDir) {
         hooks: Arc::new(HookIngestionState::new()),
         otel_config: None,
         auth_token: None,
-        crypto,
+        crypto: crypto.clone(),
+        dispatcher: crypto.and_then(|c| {
+            rewind_web::dispatcher::Dispatcher::new(c, "http://127.0.0.1:4800".to_string()).ok()
+        }),
+        base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
     (app, store, tmp)

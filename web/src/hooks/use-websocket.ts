@@ -2,13 +2,25 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import type { WsServerMessage, StepResponse } from '@/types/api'
 import { getToken } from '@/lib/auth'
 
+export interface ReplayJobUpdateData {
+  job_id: string
+  session_id: string
+  state: string
+  progress_step?: number
+  progress_total?: number
+  error_message?: string
+  error_stage?: string
+}
+
 interface UseWebSocketOptions {
   sessionId: string | null
   onStep?: (step: StepResponse) => void
   onSessionUpdate?: (data: { session_id: string; status: string; total_steps: number; total_tokens: number }) => void
+  /** Phase 3 commit 8: replay-job state/progress updates. */
+  onReplayJobUpdate?: (data: ReplayJobUpdateData) => void
 }
 
-export function useWebSocket({ sessionId, onStep, onSessionUpdate }: UseWebSocketOptions) {
+export function useWebSocket({ sessionId, onStep, onSessionUpdate, onReplayJobUpdate }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null)
   const [connected, setConnected] = useState(false)
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout>>(undefined)
@@ -33,13 +45,18 @@ export function useWebSocket({ sessionId, onStep, onSessionUpdate }: UseWebSocke
 
     ws.onmessage = (event) => {
       try {
-        const msg: WsServerMessage = JSON.parse(event.data)
+        const msg = JSON.parse(event.data) as
+          | WsServerMessage
+          | { type: 'replay_job_update'; data: ReplayJobUpdateData }
         switch (msg.type) {
           case 'step':
-            onStep?.(msg.data)
+            onStep?.((msg as { data: StepResponse }).data)
             break
           case 'session_update':
-            onSessionUpdate?.(msg.data)
+            onSessionUpdate?.((msg as { data: { session_id: string; status: string; total_steps: number; total_tokens: number } }).data)
+            break
+          case 'replay_job_update':
+            onReplayJobUpdate?.(msg.data)
             break
         }
       } catch {
@@ -57,7 +74,7 @@ export function useWebSocket({ sessionId, onStep, onSessionUpdate }: UseWebSocke
     }
 
     wsRef.current = ws
-  }, [sessionId, onStep, onSessionUpdate])
+  }, [sessionId, onStep, onSessionUpdate, onReplayJobUpdate])
 
   useEffect(() => {
     connect()

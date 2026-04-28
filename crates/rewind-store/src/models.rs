@@ -165,6 +165,11 @@ pub struct ReplayContextRow {
     /// peeked by `Store::peek_next_replay_step` for pre-validation
     /// lookups so a strict-mode 409 doesn't consume an ordinal slot.
     pub current_step: u32,
+    /// **Phase 3 commit 6 (review #154 F3):** the replay-job dispatch
+    /// path uses `last_accessed_at` to refuse Shape-B reuse of contexts
+    /// older than the TTL window so a stale context can't silently
+    /// resume cache lookups against expired blobs.
+    pub last_accessed_at: chrono::DateTime<chrono::Utc>,
     /// `false` (default) → warn-on-divergence: cache hit returns the
     /// recorded step plus an `X-Rewind-Cache-Divergent: true` header.
     /// `true` → divergence escalates to HTTP 409 and the cursor stays put

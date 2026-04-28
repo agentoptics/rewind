@@ -566,6 +566,48 @@ class ExplicitClient:
             self._delete(f"/replay-contexts/{ctx_id}")
             _replay_context_id.set(None)
 
+    def attach_replay_context(
+        self,
+        session_id: str,
+        replay_context_id: str,
+        timeline_id: str | None = None,
+    ) -> None:
+        """Attach to a *pre-existing* replay context.
+
+        **Phase 3 commit 9 (resolves review HIGH #4 from the plan):**
+        :meth:`start_replay` *creates* a fresh replay context; runners
+        receive an *existing* one in their dispatch payload and must
+        attach to it without creating a duplicate. This method sets
+        the contextvars so subsequent recorder/intercept lookups
+        target the supplied context.
+
+        **Review #154 F2:** the dispatch payload now carries
+        ``replay_context_timeline_id``. Pass it as ``timeline_id`` so
+        ``_timeline_id`` is set; otherwise the first cache *miss*
+        after the fork records its new live step into the root
+        timeline instead of the fork. The dispatcher always supplies
+        this field; callers using attach without going through a
+        dispatch (e.g. tests) can omit it and accept that live misses
+        won't have a defined recording target.
+
+        Use this in runner code receiving a dispatch webhook:
+
+        .. code-block:: python
+
+            client = ExplicitClient(base_url=payload["base_url"])
+            client.attach_replay_context(
+                session_id=payload["session_id"],
+                replay_context_id=payload["replay_context_id"],
+                timeline_id=payload["replay_context_timeline_id"],
+            )
+
+        No server round-trip; sets contextvars only.
+        """
+        _session_id.set(session_id)
+        _replay_context_id.set(replay_context_id)
+        if timeline_id is not None:
+            _timeline_id.set(timeline_id)
+
     def replay_from_iteration(
         self, session_id: str, iteration: int,
         *, timeline_id: str | None = None,

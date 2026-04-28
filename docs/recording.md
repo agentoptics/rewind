@@ -2,24 +2,30 @@
 
 **Rewind** is a time-travel debugger for AI agents. It records every LLM call your agent makes — the full request, response, context window, token counts, and timing — so you can inspect, fork, replay, and diff later.
 
-This page covers the two recording modes, agent hooks for enriching traces, and streaming behavior.
+This page covers the recording modes, agent hooks for enriching traces, and streaming behavior.
 
 ---
 
-## Three ways to record
+## Five ways to record + replay
 
 Choose the approach that fits your stack:
 
-| | **Direct mode** (Python) | **HTTP intercept** (Python) | **Proxy mode** (any language) |
-|:---|:---|:---|:---|
-| **Setup** | `rewind_agent.init()` — one line | `rewind_agent.intercept.install()` — one line | `rewind record` in a second terminal |
-| **Languages** | Python (OpenAI + Anthropic SDKs) | Python (any HTTP-based LLM client) | Any language that makes HTTP calls |
-| **How it works** | Monkey-patches SDK clients in-process | Patches HTTP transport layer (httpx, requests, aiohttp) | HTTP proxy intercepts LLM traffic |
-| **Custom gateways** | No (only OpenAI/Anthropic SDKs) | **Yes** (custom predicate matches any host) | Yes (point upstream at anything) |
-| **Streaming** | Captured via stream wrappers | Pass-through on miss; synthetic SSE on hit | SSE pass-through, zero added latency |
-| **Best for** | Quick iteration with OpenAI/Anthropic SDK | Custom HTTP clients, mTLS gateways, third-party LLM wrappers | Polyglot teams, non-Python agents |
+| | **Direct mode** (Python) | **HTTP intercept** (Python) | **`cached_llm_call`** (Python) | **Proxy mode** (any language) | **Dashboard runner** (Python, Phase 3) |
+|:---|:---|:---|:---|:---|:---|
+| **Setup** | `rewind_agent.init()` — one line | `rewind_agent.intercept.install()` — one line | `@cached_llm_call(...)` decorator | `rewind record` in a second terminal | Register a runner; click "Run replay" in the dashboard |
+| **Languages** | Python (OpenAI + Anthropic SDKs) | Python (any HTTP-based LLM client) | Python (any sync/async function returning a dict-like response) | Any language that makes HTTP calls | Python (long-lived runner process) |
+| **How it works** | Monkey-patches SDK clients in-process | Patches HTTP transport layer (httpx, requests, aiohttp) | Wraps a single function with cache-then-live + record | HTTP proxy intercepts LLM traffic | Dashboard POSTs HMAC-signed webhook to the runner; runner runs the agent under `intercept.install()` and posts progress events back |
+| **Custom gateways** | No (only OpenAI/Anthropic SDKs) | **Yes** (custom predicate matches any host) | N/A — caller decides what to wrap | Yes (point upstream at anything) | Inherits from intercept (any predicate the runner installs) |
+| **Streaming** | Captured via stream wrappers | Pass-through on miss; synthetic SSE on hit | Pass-through (function returns whatever the underlying call returns) | SSE pass-through, zero added latency | Inherits from intercept |
+| **Best for** | Quick iteration with OpenAI/Anthropic SDK | Custom HTTP clients, mTLS gateways, third-party LLM wrappers | Per-function granular caching when intercept is too broad | Polyglot teams, non-Python agents | Operator-driven replays from the dashboard against registered agent processes |
 
-**Picking between direct and intercept:** if you use the OpenAI or Anthropic SDK directly, `init()` is zero-config. For everything else Python — LangChain, custom gateways, ray-agent-style mTLS proxies, or wrappers around `httpx`/`requests`/`aiohttp` — use `intercept.install()`. See the [HTTP Intercept Quickstart](intercept-quickstart.md) for examples.
+**Picking between modes:**
+
+- **Use `init()`** if you call OpenAI / Anthropic SDKs directly and want zero-config.
+- **Use `intercept.install()`** if your agent talks to LLMs through a custom HTTP client, gateway, or proxy. See the [HTTP Intercept Quickstart](intercept-quickstart.md).
+- **Use `@cached_llm_call`** for one-off functions where transport-level intercept is too broad. See [`cached-llm-call.md`](cached-llm-call.md).
+- **Use proxy mode** for non-Python stacks or polyglot teams.
+- **Use the dashboard runner** when you want a human in the loop pressing "Run replay" against a long-lived agent process. See [`runners.md`](runners.md).
 
 ---
 

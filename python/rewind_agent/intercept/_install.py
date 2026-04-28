@@ -113,11 +113,75 @@ def install(predicates: Predicates | None = None) -> None:
         logger.debug("rewind: intercept.install() already active; ignoring")
         return
 
+    # Phase 3 commit 9: env-var bootstrap. A runner subprocess
+    # spawned by an operator (or by a runner-library helper) can
+    # specify the session + replay-context to attach to via env
+    # vars, without touching the explicit SDK. install() picks
+    # them up here so subsequent intercept lookups target the
+    # right context.
+    _bootstrap_replay_context_from_env()
+
     httpx_transport.patch_httpx_clients(predicates)
     requests_adapter.patch_requests_sessions(predicates)
     aiohttp_middleware.patch_aiohttp_sessions(predicates)
 
     _INSTALLED = True
+
+
+def _bootstrap_replay_context_from_env() -> None:
+    """Read REWIND_SESSION_ID + REWIND_REPLAY_CONTEXT_ID
+    (+ optional REWIND_REPLAY_CONTEXT_TIMELINE_ID) and attach.
+
+    The first two are required and must be set together. If either
+    is missing, this is a silent no-op (operator either explicitly
+    attached via the SDK or doesn't want bootstrap behavior).
+    Misconfiguration (one set, other unset) logs a WARN — likely
+    an env-var typo.
+
+    **Review #154 round 2 fix:** REWIND_REPLAY_CONTEXT_TIMELINE_ID
+    is also honored. Without it the subprocess-bootstrap path used
+    to leave `_timeline_id` unset, with the documented consequence
+    that live cache misses record into the root timeline instead
+    of the fork. Now it forwards through to attach_replay_context
+    so the env-var path matches the direct SDK path.
+    """
+    import os
+
+    session_id = os.environ.get("REWIND_SESSION_ID")
+    replay_context_id = os.environ.get("REWIND_REPLAY_CONTEXT_ID")
+    timeline_id = os.environ.get("REWIND_REPLAY_CONTEXT_TIMELINE_ID")
+
+    if session_id and replay_context_id:
+        try:
+            from rewind_agent.explicit import ExplicitClient
+
+            base_url = os.environ.get("REWIND_URL", "http://127.0.0.1:4800")
+            client = ExplicitClient(base_url=base_url)
+            client.attach_replay_context(
+                session_id, replay_context_id, timeline_id=timeline_id
+            )
+            logger.info(
+                "rewind: attached to replay context %s (session %s, timeline %s) from env",
+                replay_context_id,
+                session_id,
+                timeline_id or "<unset — live misses will not have a defined timeline>",
+            )
+            if not timeline_id:
+                logger.warning(
+                    "rewind: REWIND_REPLAY_CONTEXT_TIMELINE_ID is not set; "
+                    "live cache misses during this replay will not have a "
+                    "defined recording target. Set it from the dispatch payload's "
+                    "replay_context_timeline_id field for correct fork-timeline binding."
+                )
+        except Exception as e:  # noqa: BLE001 — log + continue, don't break install()
+            logger.warning("rewind: env-var bootstrap failed: %s", e)
+    elif session_id or replay_context_id:
+        logger.warning(
+            "rewind: REWIND_SESSION_ID and REWIND_REPLAY_CONTEXT_ID must be set together; "
+            "skipping env-var bootstrap (got session=%s ctx=%s)",
+            bool(session_id),
+            bool(replay_context_id),
+        )
     _log_install_status()
 
 

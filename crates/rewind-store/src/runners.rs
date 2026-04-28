@@ -360,6 +360,61 @@ impl Store {
         Ok(())
     }
 
+    /// Set the dispatch deadline and initial lease on a freshly-
+    /// dispatched job. Used by the dispatcher in commit 5/13 right
+    /// after the runner returns 2xx.
+    ///
+    /// Both timestamps are absolute (caller computes them from
+    /// `Utc::now()`), so dispatcher-side test mocking can supply
+    /// deterministic values without monkey-patching time.
+    pub fn set_dispatch_deadline_and_lease(
+        &self,
+        id: &str,
+        dispatch_deadline_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE replay_jobs
+             SET dispatch_deadline_at = ?1, lease_expires_at = ?2
+             WHERE id = ?3",
+            params![
+                dispatch_deadline_at.to_rfc3339(),
+                lease_expires_at.to_rfc3339(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reaper-side query: jobs in state `dispatched` whose
+    /// `dispatch_deadline_at < now`. Means the runner accepted the
+    /// dispatch but never emitted a `Started` event in time.
+    pub fn list_dispatch_deadline_expired(&self, now: DateTime<Utc>) -> Result<Vec<ReplayJob>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total
+             FROM replay_jobs
+             WHERE state = 'dispatched' AND dispatch_deadline_at IS NOT NULL AND dispatch_deadline_at < ?1
+             ORDER BY dispatch_deadline_at ASC LIMIT 1000",
+        )?;
+        let rows = stmt.query_map(params![now.to_rfc3339()], Self::row_to_replay_job)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count non-terminal jobs that reference this replay context.
+    /// **Phase 3 commit 6** uses this to enforce one-job-per-context
+    /// for shape-B job creation: the cursor would otherwise be a
+    /// hot-spot if two runners advanced it concurrently.
+    pub fn count_in_flight_jobs_for_replay_context(&self, replay_context_id: &str) -> Result<u32> {
+        let n: u32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM replay_jobs
+             WHERE replay_context_id = ?1
+               AND state NOT IN ('completed', 'errored')",
+            params![replay_context_id],
+            |row| row.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Count non-terminal jobs (`pending`, `dispatched`, `in_progress`)
     /// owned by this runner.
     ///
@@ -623,6 +678,39 @@ impl Store {
                 params![new_state.as_str(), error_message, error_stage, id],
             )?
         };
+        Ok(n > 0)
+    }
+
+    /// Mark a `dispatched` job as `errored` from the dispatch path
+    /// (review #154 round 2 follow-up).
+    ///
+    /// Stricter than `advance_replay_job_state` because it ONLY
+    /// matches rows currently in `dispatched`. Used by the
+    /// dispatcher's apply_outcome failure branch so a fast runner
+    /// that already emitted `started` (transitioning the row to
+    /// `in_progress`) isn't overwritten by a later HTTP-error
+    /// transition. The general advance helper's
+    /// `WHERE state NOT IN ('completed', 'errored')` guard would
+    /// otherwise match the in_progress row and corrupt the state.
+    ///
+    /// Returns `true` if the row was updated, `false` if no row
+    /// matched (job missing OR already in `in_progress`/terminal).
+    pub fn mark_dispatched_job_as_errored(
+        &self,
+        id: &str,
+        error_message: &str,
+        error_stage: &str,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn.execute(
+            "UPDATE replay_jobs
+             SET state = 'errored',
+                 error_message = ?1,
+                 error_stage = ?2,
+                 completed_at = ?3
+             WHERE id = ?4 AND state = 'dispatched'",
+            params![error_message, error_stage, now, id],
+        )?;
         Ok(n > 0)
     }
 

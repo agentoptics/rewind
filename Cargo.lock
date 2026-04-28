@@ -535,6 +535,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -849,6 +850,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -1910,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-assert"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1925,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1952,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-eval"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1967,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-mcp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "rewind-assert",
@@ -1985,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-otel"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2010,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-proxy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2032,7 +2042,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-replay"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2049,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-store"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2068,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-tui"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2086,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "rewind-web"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2095,6 +2105,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures-util",
+ "hmac",
  "http-body-util",
  "hyper",
  "mime_guess",
