@@ -116,4 +116,4 @@ rewind record --upstream http://localhost:11434
 
 ## Next steps
 
-For a deeper look at how recording works — direct mode vs proxy mode, agent hooks, and streaming — see [recording.md](recording.md).
+For a deeper look at how recording works — the **five ways to record + replay** (direct mode, HTTP intercept, `cached_llm_call`, proxy mode, and dashboard runners), agent hooks, and streaming — see [recording.md](recording.md). Operator-driven replays from the dashboard ("Run replay" button against a registered runner) are documented in [runners.md](runners.md).
