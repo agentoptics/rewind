@@ -20,7 +20,6 @@ can't be set in the test environment.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextlib
 import hashlib
@@ -30,12 +29,10 @@ import os
 import secrets
 import socket
 import subprocess
-import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
 
 import pytest
 
