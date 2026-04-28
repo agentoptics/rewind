@@ -15,6 +15,27 @@ pub struct Session {
     pub metadata: serde_json::Value,
     pub thread_id: Option<String>,
     pub thread_ordinal: Option<u32>,
+    /// Caller-supplied stable key for idempotent session creation.
+    ///
+    /// When set, two `/sessions/start` requests carrying the same key
+    /// resolve to the SAME session — the server returns the existing
+    /// row instead of inserting a duplicate. Closes the multi-replica
+    /// race where each runner-process keeps its own in-process
+    /// `_session_cache` and creates a fresh session on cache miss.
+    ///
+    /// Database invariant: `UNIQUE WHERE client_session_key IS NOT
+    /// NULL` so concurrent inserts collapse via the constraint.
+    ///
+    /// **Wire format (review #155 R2):** the `serde(skip_serializing)`
+    /// attribute keeps this internal-routing field out of every
+    /// `/api/sessions` response. The key is typically a private
+    /// conversation_id that callers don't expect to be exposed to
+    /// dashboard users / SSE consumers; serializing it would broaden
+    /// the API surface and leak that detail. Deserialization is
+    /// allowed so DB-backed round-trips (test fixtures, restore from
+    /// snapshot) keep working.
+    #[serde(skip_serializing, default)]
+    pub client_session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -348,6 +369,7 @@ impl Session {
             metadata: serde_json::json!({}),
             thread_id: None,
             thread_ordinal: None,
+            client_session_key: None,
         }
     }
 }

@@ -856,6 +856,16 @@ struct StartSessionRequest {
     source: Option<String>,
     thread_id: Option<String>,
     metadata: Option<serde_json::Value>,
+    /// Caller-supplied stable key for idempotent session creation.
+    ///
+    /// Multi-replica runners (Ray Serve, autoscaling worker pools)
+    /// each keep their own `_session_cache`; without a server-side
+    /// dedup, a follow-up `/query` for the same conversation that
+    /// lands on a different replica creates a duplicate session.
+    /// When this field is present, the server returns the existing
+    /// session for a previously-seen key with `200 OK` instead of
+    /// inserting a new row.
+    client_session_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -868,9 +878,49 @@ async fn start_session(
     State(state): State<AppState>,
     Json(body): Json<StartSessionRequest>,
 ) -> Result<(StatusCode, Json<StartSessionResponse>), (StatusCode, String)> {
+    // Review #155 R1: normalize the idempotency key — empty string
+    // and whitespace-only strings get coerced to None so they don't
+    // claim the UNIQUE-index slot. Without this, the first caller
+    // doing `convo_id or ""` would lock that slot and every
+    // subsequent empty-key caller would silently get routed to the
+    // same session, corrupting unrelated conversations.
+    let normalized_key = body
+        .client_session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Find-or-create when an idempotency key is supplied. Pre-flight
+    // lookup avoids the common case of paying the unique-constraint
+    // round trip; the post-insert retry handles the race window.
+    if let Some(client_key) = normalized_key {
+        let store = state.store.lock().map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {e}"))
+        })?;
+        if let Some(existing) = store.get_session_by_client_key(client_key).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+        })? {
+            let root_id = resolve_root_timeline_id(&store, &existing.id)?;
+            // Review #155 R4: deliberately NOT emitting
+            // StoreEvent::SessionUpdated here. The session was
+            // announced when first created; replaying that event for
+            // every dedup hit would spam SSE/WebSocket clients with
+            // fake "new session" notifications. Dashboard listeners
+            // only need to learn about a session once.
+            return Ok((
+                StatusCode::OK,
+                Json(StartSessionResponse {
+                    session_id: existing.id,
+                    root_timeline_id: root_id,
+                }),
+            ));
+        }
+    }
+
     let mut session = Session::new(&body.name);
     session.source = SessionSource::Api;
     session.thread_id = body.thread_id;
+    session.client_session_key = normalized_key.map(String::from);
     if let Some(meta) = body.metadata {
         session.metadata = meta;
     }
@@ -886,12 +936,47 @@ async fn start_session(
         let store = state.store.lock().map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Lock error: {e}"))
         })?;
-        store.create_session(&session).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
-        })?;
-        store.create_timeline(&timeline).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
-        })?;
+        match store.create_session(&session) {
+            Ok(()) => {
+                store.create_timeline(&timeline).map_err(|e| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+                })?;
+            }
+            Err(e) if is_unique_violation(&e) => {
+                // Race: a concurrent request inserted the session
+                // between our pre-flight lookup and this insert. Resolve
+                // the winner; client_session_key MUST be set to land
+                // here (UNIQUE index ignores NULLs).
+                let key = normalized_key.ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unique violation without client_session_key — UUID collision".to_string(),
+                    )
+                })?;
+                let winner = store
+                    .get_session_by_client_key(key)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "unique violation but no session found by client_key".to_string(),
+                        )
+                    })?;
+                let root_id = resolve_root_timeline_id(&store, &winner.id)?;
+                // Same intentional no-event reasoning as the
+                // pre-flight dedup path above (review #155 R4).
+                return Ok((
+                    StatusCode::OK,
+                    Json(StartSessionResponse {
+                        session_id: winner.id,
+                        root_timeline_id: root_id,
+                    }),
+                ));
+            }
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")));
+            }
+        }
     }
 
     let _ = state.event_tx.send(StoreEvent::SessionUpdated {
@@ -905,6 +990,42 @@ async fn start_session(
         session_id,
         root_timeline_id: timeline_id,
     })))
+}
+
+/// True when the error wraps a SQLite `SQLITE_CONSTRAINT_UNIQUE`. The
+/// rewind-store crate hides the rusqlite error type behind anyhow so
+/// we string-match against the conventional message; this is brittle
+/// across rusqlite versions but stable for the unique-violation case
+/// since the error code is part of SQLite's API contract.
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("UNIQUE constraint failed")
+        || s.contains("SQLITE_CONSTRAINT_UNIQUE")
+}
+
+/// Look up the parent-less (root) timeline id for a session.
+///
+/// Used by both `/sessions/start` dedup paths to keep the response
+/// shape consistent with the create branch — callers always get a
+/// `root_timeline_id` back regardless of whether the session was
+/// just created or already existed (review #155 R3).
+fn resolve_root_timeline_id(
+    store: &rewind_store::Store,
+    session_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    let timelines = store.get_timelines(session_id).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+    })?;
+    let root = timelines
+        .iter()
+        .find(|t| t.parent_timeline_id.is_none())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("session {session_id} has no root timeline"),
+            )
+        })?;
+    Ok(root.id.clone())
 }
 
 #[derive(Deserialize)]
