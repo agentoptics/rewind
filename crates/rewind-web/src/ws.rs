@@ -185,6 +185,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 },
                             })
                         }
+                        StoreEvent::StepUpdated { .. } => {
+                            // The frontend hook (useStepEdit) already
+                            // invalidates react-query caches on save,
+                            // so there's no need to broadcast here. A
+                            // dedicated StepUpdate WS message type is
+                            // a future enhancement for multi-tab sync.
+                            None
+                        }
                         StoreEvent::ReplayJobUpdated {
                             job_id,
                             session_id,
