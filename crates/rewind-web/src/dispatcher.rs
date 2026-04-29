@@ -21,6 +21,8 @@
 //!   "job_id": "<uuid>",
 //!   "session_id": "<uuid>",
 //!   "replay_context_id": "<uuid>",
+//!   "replay_context_timeline_id": "<uuid>",
+//!   "at_step": <u32>,
 //!   "base_url": "<rewind-server-base>"
 //! }
 //! ```
@@ -74,12 +76,22 @@ type HmacSha256 = Hmac<Sha256>;
 /// the replay context targets — the SDK's `attach_replay_context`
 /// uses it to set `_timeline_id` so any cache-miss live recordings
 /// land in the fork rather than the original timeline.
+///
+/// **`at_step`** (added 2026-04-29): the original fork-point of the
+/// replay-context's timeline (i.e. the step number the user clicked
+/// "Run replay" at in the dashboard). Distinct from the replay
+/// context's `from_step` which is always 0 (the agent re-runs from
+/// scratch). Runners use this to know which conversation turn the
+/// user wanted to start from — needed for multi-turn replay where
+/// edits to step #N's user message in turn 2+ should drive the
+/// agent at iteration N (companion ray-agent change).
 #[derive(Debug, serde::Serialize)]
 struct DispatchBody<'a> {
     pub job_id: &'a str,
     pub session_id: &'a str,
     pub replay_context_id: &'a str,
     pub replay_context_timeline_id: &'a str,
+    pub at_step: u32,
     pub base_url: &'a str,
 }
 
@@ -159,11 +171,16 @@ impl Dispatcher {
     /// **Review #154 F2:** caller passes `replay_context_timeline_id`
     /// so the dispatch payload can carry it and the SDK's
     /// `attach_replay_context` can set `_timeline_id` correctly.
+    ///
+    /// `at_step` (added 2026-04-29): the fork-point of the timeline
+    /// (= the step number the user clicked Run replay at). Forwarded
+    /// in the dispatch body for runner-side multi-turn replay.
     pub async fn dispatch(
         &self,
         runner: &Runner,
         job: &ReplayJob,
         replay_context_timeline_id: &str,
+        at_step: u32,
     ) -> DispatchOutcome {
         let webhook_url = match runner.webhook_url.as_deref() {
             Some(u) => u,
@@ -208,6 +225,7 @@ impl Dispatcher {
             session_id: &job.session_id,
             replay_context_id,
             replay_context_timeline_id,
+            at_step,
             base_url: &self.base_url,
         };
         let body_bytes = match serde_json::to_vec(&body) {
