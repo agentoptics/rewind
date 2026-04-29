@@ -1729,8 +1729,16 @@ async fn fork_and_edit_step(
         )));
     }
 
-    let original_step = store.get_step_by_number(&body.source_timeline_id, body.at_step)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?
+    // Use the engine's union view so callers can edit a step that lives
+    // on the parent timeline (i.e. inherited via a previous fork) — the
+    // bare `store.get_step_by_number` only matches owned steps and would
+    // 400 with "no step #N on timeline 'X'" even though the dashboard
+    // happily shows that step in the picker.
+    let engine = ReplayEngine::new(&store);
+    let timeline_steps = engine.get_full_timeline_steps(&body.source_timeline_id, &session.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    let original_step = timeline_steps.into_iter()
+        .find(|s| s.step_number == body.at_step)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!(
             "no step #{} on timeline '{}'", body.at_step, body.source_timeline_id
         )))?;
@@ -1746,7 +1754,6 @@ async fn fork_and_edit_step(
         })?;
         tl
     } else {
-        let engine = ReplayEngine::new(&store);
         engine.fork(&session.id, &body.source_timeline_id, body.at_step - 1, label)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?
     };

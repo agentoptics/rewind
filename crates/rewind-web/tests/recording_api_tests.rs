@@ -1634,3 +1634,55 @@ async fn test_fork_and_edit_step_at_zero() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "at_step=0 should return 400");
 }
+
+#[tokio::test]
+async fn test_fork_and_edit_step_inherited_step() {
+    // Regression: fork-and-edit on a step that lives on the parent
+    // timeline (inherited via a previous fork) used to 400 because
+    // `store.get_step_by_number(timeline_id, n)` only matches steps
+    // OWNED by that timeline. The dashboard, however, happily shows
+    // inherited steps in the picker, so the user-facing workflow
+    // "open fork → edit any visible step" was silently broken for
+    // every step the fork didn't own. The fix routes the lookup
+    // through `engine.get_full_timeline_steps` (the union view).
+    //
+    // Repro recipe used in dev1 smoke (2026-04-29):
+    //   1. seed main with 5 steps
+    //   2. fork at step 2 → fork owns nothing, inherits steps 1-2
+    //   3. fork-and-edit on FORK at_step=2 → 400 before fix, 201 after
+    let (app, _store, _tmp) = setup();
+    let (sid, _root_tid) = seed_session(&app, 5).await;
+
+    let (_, fork) = post_json(&app, &format!("/api/sessions/{sid}/fork"), json!({
+        "at_step": 2, "label": "first-fork"
+    })).await;
+    let fork_tid = fork["fork_timeline_id"].as_str().unwrap();
+
+    // Now ask fork-and-edit to edit step #2 of THIS fork. Step #2 is
+    // inherited from main; the fork itself owns no steps yet.
+    let (status, body) = post_json(&app, &format!("/api/sessions/{sid}/fork-and-edit-step"), json!({
+        "source_timeline_id": fork_tid,
+        "at_step": 2,
+        "response_body": {"edit": "of-an-inherited-step"},
+        "label": "second-fork-via-inherited-edit"
+    })).await;
+
+    assert_eq!(
+        status, StatusCode::CREATED,
+        "fork-and-edit on an inherited step should succeed (got: {body})"
+    );
+    let new_fork_tid = body["fork_timeline_id"].as_str().unwrap();
+    let new_step_id = body["step_id"].as_str().unwrap();
+    assert!(!new_fork_tid.is_empty());
+    assert!(!new_step_id.is_empty());
+
+    // The newly-created step lives on the new fork at step_number = at_step.
+    // (Note: the new fork's full-step view is currently incomplete for
+    // nested forks because `get_full_timeline_steps` only walks one
+    // parent level up — that's a separate bug worth its own fix. Here
+    // we assert the direct invariants of the edit itself.)
+    let s = _store.lock().unwrap();
+    let new_step = s.get_step(new_step_id).unwrap().unwrap();
+    assert_eq!(new_step.step_number, 2);
+    assert_eq!(new_step.timeline_id, new_fork_tid);
+}
