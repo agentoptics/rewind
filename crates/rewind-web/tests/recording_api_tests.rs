@@ -1768,7 +1768,15 @@ async fn test_patch_promote_inherited_step() {
 
 #[tokio::test]
 async fn test_patch_promote_idempotent_re_edit() {
-    let (app, store, _tmp) = setup();
+    // After the first PATCH promote, the fork OWNS a step at step_number=N.
+    // The dedup in `get_full_timeline_steps` (added 2026-04-29) makes the
+    // inherited row at #N invisible from fork's view — owned wins. So the
+    // dashboard's realistic re-edit flow is: first PATCH targets the
+    // INHERITED id with target_timeline_id (promote), and the SECOND edit
+    // targets the resolved OWNED id WITHOUT target (in-place edit). Both
+    // calls must return the same step_id so the panel knows it's editing
+    // the same row.
+    let (app, _store, _tmp) = setup();
     let (sid, _root_tid) = seed_session(&app, 3).await;
 
     let (_, fork) = post_json(&app, &format!("/api/sessions/{sid}/fork"), json!({
@@ -1779,19 +1787,21 @@ async fn test_patch_promote_idempotent_re_edit() {
     let (_, steps) = get_json(&app, &format!("/api/sessions/{sid}/steps")).await;
     let main_step1_id = steps.as_array().unwrap()[0]["id"].as_str().unwrap();
 
+    // Promote: PATCH inherited id with target=fork → creates a new owned row.
     let (s1, b1) = patch_json(&app, &format!("/api/steps/{main_step1_id}/edit"), json!({
         "response_body": {"edit": 1}, "target_timeline_id": fork_tid
     })).await;
     assert_eq!(s1, StatusCode::OK);
     let first_resolved = b1["resolved_step_id"].as_str().unwrap().to_string();
+    assert_ne!(first_resolved, main_step1_id, "first promote inserts a new owned step");
 
-    let (s2, b2) = patch_json(&app, &format!("/api/steps/{main_step1_id}/edit"), json!({
-        "response_body": {"edit": 2}, "target_timeline_id": fork_tid
+    // Re-edit: PATCH the resolved owned id (no target) → in-place edit.
+    let (s2, b2) = patch_json(&app, &format!("/api/steps/{first_resolved}/edit"), json!({
+        "response_body": {"edit": 2}
     })).await;
-    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK, "in-place edit on the resolved owned step should succeed");
     let second_resolved = b2["resolved_step_id"].as_str().unwrap().to_string();
-
-    assert_eq!(first_resolved, second_resolved, "re-edit should mutate the same owned step");
+    assert_eq!(first_resolved, second_resolved, "in-place edit returns the same step id");
 }
 
 #[tokio::test]
@@ -1894,6 +1904,19 @@ async fn test_patch_promote_preserves_step_type_and_tool_name() {
 
 #[tokio::test]
 async fn test_cascade_count_target_aware() {
+    // The point of `?target_timeline_id=` on cascade-count is so the
+    // confirm modal shows the count that will actually be deleted on
+    // the SELECTED timeline, not on the step's physical owner. Verify
+    // by comparing the same step's cascade-count without target (=
+    // main's downstream) vs with target=fork (= fork's downstream).
+    //
+    // Note: we deliberately do NOT seed owned steps on the fork at
+    // step_numbers that would collide with inherited ones — the dedup
+    // would (correctly) hide the inherited rows once owned twins exist,
+    // and the promote-path visibility check would then reject the
+    // cascade-count call by id. The dashboard's real flow PATCHes the
+    // owned id directly in that case, so this scenario isn't reachable
+    // from the UI.
     let (app, _store, _tmp) = setup();
     let (sid, _root_tid) = seed_session(&app, 5).await;
 
@@ -1901,8 +1924,6 @@ async fn test_cascade_count_target_aware() {
         "at_step": 3, "label": "cascade-target"
     })).await;
     let fork_tid = fork["fork_timeline_id"].as_str().unwrap();
-
-    seed_steps_on_timeline(&app, &sid, fork_tid, 2).await;
 
     let (_, steps) = get_json(&app, &format!("/api/sessions/{sid}/steps")).await;
     let step2_id = steps.as_array().unwrap()[1]["id"].as_str().unwrap();
@@ -1916,7 +1937,13 @@ async fn test_cascade_count_target_aware() {
     let fork_count = b2["deleted_downstream_count"].as_u64().unwrap();
     let on_main = b2["on_main"].as_bool().unwrap();
 
-    assert!(main_count > fork_count, "main should have more downstream than fork (main={main_count}, fork={fork_count})");
+    // Main has steps 3, 4, 5 after step #2 → main_count = 3.
+    // Fork inherits 1, 2, 3 with no own steps → fork_count = 0
+    // (count_steps_after counts only OWNED rows; inherited steps live
+    // on main and aren't part of the fork's timeline_id row count).
+    assert_eq!(main_count, 3, "main should have 3 downstream after step #2");
+    assert_eq!(fork_count, 0, "fork has no owned downstream after step #2");
+    assert!(main_count > fork_count, "main_count({main_count}) > fork_count({fork_count})");
     assert!(!on_main, "cascade-count with target=fork should report on_main=false");
 }
 
@@ -1966,6 +1993,46 @@ async fn test_patch_promote_cross_fork_mutation_blocked() {
         "CROSS_FORK_MUTATION",
         "fork_b's step should NOT have been overwritten"
     );
+}
+
+#[tokio::test]
+async fn test_steps_endpoint_dedupes_owned_over_inherited_after_promote() {
+    // Regression for the dev1 v0.14.6 bug where a user promoted an
+    // inherited step (PATCH .../edit?target_timeline_id=fork) but the
+    // dashboard kept showing the inherited row because /steps?timeline=fork
+    // returned BOTH the inherited and the owned step at the same
+    // step_number. After the dedup fix in get_full_timeline_steps the
+    // owned row supersedes the inherited one in this view.
+    let (app, _store, _tmp) = setup();
+    let (sid, _root_tid) = seed_session(&app, 3).await;
+
+    let (_, fork) = post_json(&app, &format!("/api/sessions/{sid}/fork"), json!({
+        "at_step": 2, "label": "dedup-test"
+    })).await;
+    let fork_tid = fork["fork_timeline_id"].as_str().unwrap();
+
+    let (_, main_steps) = get_json(&app, &format!("/api/sessions/{sid}/steps")).await;
+    let main_step2_id = main_steps.as_array().unwrap()[1]["id"].as_str().unwrap();
+
+    // Promote-and-mutate: PATCH the inherited step #2 with target = fork.
+    let (status, body) = patch_json(&app, &format!("/api/steps/{main_step2_id}/edit"), json!({
+        "response_body": {"edit": "promoted-via-PATCH"},
+        "target_timeline_id": fork_tid
+    })).await;
+    assert_eq!(status, StatusCode::OK, "promote should succeed: {body}");
+    let resolved = body["resolved_step_id"].as_str().unwrap();
+
+    // Fork's step view: must show step #2 ONCE, owned by the fork.
+    let (_, fork_view) = get_json(&app, &format!("/api/sessions/{sid}/steps?timeline={fork_tid}")).await;
+    let at_two: Vec<&serde_json::Value> = fork_view.as_array().unwrap()
+        .iter()
+        .filter(|s| s["step_number"].as_u64() == Some(2))
+        .collect();
+    assert_eq!(at_two.len(), 1,
+        "fork view should have exactly one row at step #2 after promote, got {:?}", at_two);
+    assert_eq!(at_two[0]["id"].as_str().unwrap(), resolved,
+        "the surviving row at step #2 must be the OWNED one (resolved_step_id), not the inherited one");
+    assert_eq!(at_two[0]["timeline_id"].as_str().unwrap(), fork_tid);
 }
 
 #[tokio::test]

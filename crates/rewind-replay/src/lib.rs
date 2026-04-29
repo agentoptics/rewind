@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use rewind_store::{Span, Step, Store, Timeline};
+use std::collections::HashMap;
 
 /// Truncate an id to 8 chars for error messages — char-boundary safe (no
 /// panic on multi-byte input).
@@ -90,21 +91,36 @@ impl<'a> ReplayEngine<'a> {
         ReplayEngine { store }
     }
 
-    /// Get all steps for a timeline, including inherited steps from parent (for forks)
+    /// Get all steps visible on `timeline_id`, including inherited steps
+    /// from the parent up to the fork point. When the same `step_number`
+    /// exists on both the parent (inherited) and on the timeline itself
+    /// (owned, e.g. via `upsert_step_on_timeline_and_cascade` after a
+    /// promote-and-mutate edit), the **owned** row wins — the inherited
+    /// row is omitted so the dashboard's step picker doesn't show two
+    /// rows at the same step_number masking the user's edit.
     pub fn get_full_timeline_steps(&self, timeline_id: &str, session_id: &str) -> Result<Vec<Step>> {
         let timelines = self.store.get_timelines(session_id)?;
         let timeline = timelines.iter().find(|t| t.id == timeline_id)
             .context("Timeline not found")?;
 
         if let (Some(parent_id), Some(fork_at)) = (&timeline.parent_timeline_id, timeline.fork_at_step) {
-            // This is a forked timeline — get parent steps up to fork point, then own steps
             let parent_steps = self.store.get_steps(parent_id)?;
             let own_steps = self.store.get_steps(timeline_id)?;
 
-            let mut combined: Vec<Step> = parent_steps.into_iter()
-                .filter(|s| s.step_number <= fork_at)
-                .collect();
-            combined.extend(own_steps);
+            // Insert parent (inherited) first, then own — HashMap::insert
+            // returning the previous value gives us "owned overrides
+            // inherited at the same step_number" for free. Pre-size the
+            // map to avoid rehash on long sessions (review #162 S3).
+            let cap = (fork_at as usize).saturating_add(own_steps.len());
+            let mut by_step_number: HashMap<u32, Step> = HashMap::with_capacity(cap);
+            for s in parent_steps.into_iter().filter(|s| s.step_number <= fork_at) {
+                by_step_number.insert(s.step_number, s);
+            }
+            for s in own_steps {
+                by_step_number.insert(s.step_number, s);
+            }
+
+            let mut combined: Vec<Step> = by_step_number.into_values().collect();
             combined.sort_by_key(|s| s.step_number);
             Ok(combined)
         } else {
@@ -382,6 +398,49 @@ mod tests {
         let engine = ReplayEngine::new(&store);
         let err = engine.fork(&sid, &tid, 0, "bad-fork").unwrap_err();
         assert!(err.to_string().contains("Invalid fork step 0"));
+    }
+
+    #[test]
+    fn get_full_timeline_steps_dedupes_owned_over_inherited() {
+        // Regression: when a fork OWNS a step at the same step_number
+        // as an inherited (parent) step — e.g. after a promote-and-mutate
+        // PATCH /steps/{id}/edit?target_timeline_id=fork — the union view
+        // must return ONE row (the owned one), not both. Without this
+        // the dashboard's step picker shows two #N entries on the fork
+        // and the inherited one masks the user's edit (visible bug in
+        // dev1 with session ray-agent-30053072 on 2026-04-29).
+        let (_tmp, store) = setup();
+        let (sid, root_tid) = seed_session_with_steps(&store, 3);
+
+        let engine = ReplayEngine::new(&store);
+        let fork = engine.fork(&sid, &root_tid, 2, "dedup-test").unwrap();
+
+        // Manually insert an owned step on the fork at step_number=2
+        // (this is what upsert_step_on_timeline_and_cascade does after
+        // promote-and-mutate).
+        let mut owned = Step::new_llm_call(&fork.id, &sid, 2, "edited-model");
+        owned.id = "fork-owned-2".to_string();
+        store.create_step(&owned).unwrap();
+
+        let view = engine.get_full_timeline_steps(&fork.id, &sid).unwrap();
+
+        // Two distinct step_numbers visible: 1 (inherited) + 2 (owned).
+        // Before the dedup fix this returned 3 rows: 1 inherited, 2
+        // inherited from main, and 2 owned by the fork.
+        assert_eq!(view.len(), 2, "expected 2 rows, got {:?}",
+            view.iter().map(|s| (s.step_number, &s.timeline_id, &s.id)).collect::<Vec<_>>());
+
+        let at_two: Vec<&Step> = view.iter().filter(|s| s.step_number == 2).collect();
+        assert_eq!(at_two.len(), 1, "expected exactly one row at step #2");
+        assert_eq!(at_two[0].timeline_id, fork.id,
+            "the surviving row must be the OWNED one (timeline=fork), not the inherited one");
+        assert_eq!(at_two[0].id, "fork-owned-2");
+        assert_eq!(at_two[0].model, "edited-model");
+
+        // Step #1 is still inherited from main, untouched by the dedup.
+        let at_one: Vec<&Step> = view.iter().filter(|s| s.step_number == 1).collect();
+        assert_eq!(at_one.len(), 1);
+        assert_eq!(at_one[0].timeline_id, root_tid);
     }
 
     #[test]
