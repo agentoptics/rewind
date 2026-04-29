@@ -1571,12 +1571,12 @@ fn check_edit_blob_size(
     bytes: &Option<Vec<u8>>,
     field: &str,
 ) -> Result<(), (StatusCode, String)> {
-    if let Some(b) = bytes {
-        if b.len() > MAX_EDIT_BLOB_SIZE {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, format!(
-                "{field} exceeds {MAX_EDIT_BLOB_SIZE} bytes"
-            )));
-        }
+    if let Some(b) = bytes
+        && b.len() > MAX_EDIT_BLOB_SIZE
+    {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!(
+            "{field} exceeds {MAX_EDIT_BLOB_SIZE} bytes"
+        )));
     }
     Ok(())
 }
