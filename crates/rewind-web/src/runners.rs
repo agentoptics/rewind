@@ -1,97 +1,48 @@
-//! Runner registry HTTP endpoints (Phase 3, commit 4/13).
-//!
-//! Wires REST CRUD on top of `rewind-store`'s runner CRUD methods,
-//! using the [`crypto::CryptoBox`](crate::crypto::CryptoBox) to
-//! encrypt the auth token at rest under `REWIND_RUNNER_SECRET_KEY`.
+//! Replay-job HTTP endpoints.
 //!
 //! ## Routes (mounted at `/api`)
 //!
-//! | method | path                                  | purpose                                   |
-//! |--------|---------------------------------------|-------------------------------------------|
-//! | GET    | `/api/runners`                        | list runners (no tokens)                  |
-//! | POST   | `/api/runners`                        | register; returns raw token ONCE          |
-//! | GET    | `/api/runners/{id}`                   | get one runner (no tokens)                |
-//! | DELETE | `/api/runners/{id}`                   | remove runner (cascades runner_id→NULL)   |
-//! | POST   | `/api/runners/{id}/regenerate-token`  | rotate token; returns new raw token ONCE  |
-//!
-//! ## Bootstrap behavior
-//!
-//! All write endpoints (POST/DELETE/regenerate) return `503 Service
-//! Unavailable` if `REWIND_RUNNER_SECRET_KEY` is unset, with a clear
-//! `error: "REWIND_RUNNER_SECRET_KEY env var is not set..."` body.
-//! Read endpoints (GET) work without crypto since they don't touch
-//! ciphertext.
-//!
-//! ## Token surface
-//!
-//! - **Raw token** is generated server-side at register / regenerate
-//!   and returned in the JSON body **exactly once**. Never persisted
-//!   in plaintext, never logged, never re-readable from the store.
-//! - **`auth_token_hash`** (SHA-256 hex) is stored for the fast
-//!   inbound-auth lookup path (commit 6's event ingestion).
-//! - **`auth_token_preview`** (`<first 8 chars>***`) is shown in the
-//!   dashboard so operators can identify which token they hold.
-//! - **`encrypted_token` + `token_nonce`** are stored for the dispatch
-//!   path (commit 5's webhook signing) — decrypted on demand, never
-//!   in-memory cached, never re-serialized through the API.
+//! | method | path                                   | purpose                      |
+//! |--------|----------------------------------------|------------------------------|
+//! | POST   | `/api/sessions/{sid}/replay-jobs`      | create + dispatch replay job |
+//! | GET    | `/api/sessions/{sid}/replay-jobs`      | list jobs for a session      |
+//! | GET    | `/api/replay-jobs/{id}`                | get one job                  |
+//! | POST   | `/api/replay-jobs/{id}/events`         | runner posts progress events |
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::Json,
     routing::{get, post},
     Router,
 };
 use chrono::Utc;
 use rewind_replay::ReplayEngine;
-use rewind_store::{
-    ReplayJob, ReplayJobEvent, ReplayJobEventType, ReplayJobState, Runner, RunnerMode,
-    RunnerStatus,
-};
+use rewind_store::{ReplayJob, ReplayJobEvent, ReplayJobEventType, ReplayJobState};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::crypto::{self, CryptoBox};
 use crate::{AppState, StoreEvent};
 
 /// Replay context TTL (seconds). Mirrors the constant in
-/// `WebServer::run`'s background cleanup task. Used by Shape-B
-/// dispatch validation (review #154 F3) to refuse contexts that
-/// would race the cleanup.
+/// `WebServer::run`'s background cleanup task.
 const REPLAY_CONTEXT_TTL_SECS: i64 = 3600;
 
-/// Build the runners + replay-job-create sub-router (bearer-protected).
-/// Caller should `.nest("/api", ...)` it alongside the existing
-/// `api::routes`.
+/// Lease duration for replay jobs (5 minutes, extended on heartbeat).
+pub const INITIAL_LEASE_SECS: i64 = 300;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/runners", get(list_runners).post(register_runner))
-        .route(
-            "/runners/{id}",
-            get(get_runner).delete(remove_runner),
-        )
-        .route(
-            "/runners/{id}/regenerate-token",
-            post(regenerate_token),
-        )
-        // Phase 3 commit 6: dashboard initiates a replay job for a
-        // session. Bearer-protected (dashboard action).
         .route(
             "/sessions/{sid}/replay-jobs",
             post(create_replay_job).get(list_replay_jobs_for_session),
         )
-        // Review #154 N1: cancellation removed. The plan defers
-        // cooperative cancel to v3.1; only inspection (GET) is
-        // exposed in v1.
         .route("/replay-jobs/{id}", get(get_replay_job))
 }
 
-/// Runner-callback routes mount OUTSIDE the bearer-auth middleware
-/// because runners authenticate with `X-Rewind-Runner-Auth` and may
-/// not even know the operator's bearer token. The handler enforces
-/// its own auth + ownership check.
-///
-/// Mounted at the top-level router in [`crate::WebServer::build_router`].
+/// Runner-callback route for posting replay job events.
+/// Mounted OUTSIDE bearer auth middleware — no authentication required
+/// (the runner is a co-located sidecar or trusted process).
 pub fn runner_callback_routes() -> Router<AppState> {
     Router::new().route(
         "/api/replay-jobs/{id}/events",
@@ -99,148 +50,7 @@ pub fn runner_callback_routes() -> Router<AppState> {
     )
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Public response shapes (no token leakage)
-// ──────────────────────────────────────────────────────────────────
-
-/// Public view of a runner. Excludes ciphertext, nonce, and any
-/// derivative of the raw token beyond the operator-visible preview.
-#[derive(Debug, Serialize, Clone)]
-pub struct RunnerView {
-    pub id: String,
-    pub name: String,
-    pub mode: String,
-    pub webhook_url: Option<String>,
-    pub auth_token_preview: String,
-    pub status: String,
-    pub created_at: String,
-    pub last_seen_at: Option<String>,
-}
-
-impl From<Runner> for RunnerView {
-    fn from(r: Runner) -> Self {
-        Self {
-            id: r.id,
-            name: r.name,
-            mode: r.mode.as_str().to_string(),
-            webhook_url: r.webhook_url,
-            auth_token_preview: r.auth_token_preview,
-            status: r.status.as_str().to_string(),
-            created_at: r.created_at.to_rfc3339(),
-            last_seen_at: r.last_seen_at.map(|t| t.to_rfc3339()),
-        }
-    }
-}
-
-/// Returned ONLY at register / regenerate. The raw token is never
-/// retrievable after this response.
-#[derive(Debug, Serialize)]
-pub struct RegisterRunnerResponse {
-    pub runner: RunnerView,
-    /// The raw auth token. Save this NOW — it cannot be retrieved
-    /// after this response. Used by the runner to verify HMAC-signed
-    /// dispatch webhooks (`X-Rewind-Signature` header).
-    pub raw_token: String,
-    pub raw_token_warning: &'static str,
-}
-
-// ──────────────────────────────────────────────────────────────────
-// Request shapes
-// ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct RegisterRunnerRequest {
-    pub name: String,
-    pub mode: RunnerMode,
-    /// Required if `mode == "webhook"`; must be `http(s)://` URL.
-    /// Forbidden if `mode == "polling"`.
-    pub webhook_url: Option<String>,
-}
-
-// ──────────────────────────────────────────────────────────────────
-// Validation
-// ──────────────────────────────────────────────────────────────────
-
-const NAME_MIN: usize = 1;
-const NAME_MAX: usize = 100;
-
-fn validate_name(name: &str) -> Result<(), String> {
-    let n = name.trim();
-    if n.len() < NAME_MIN {
-        return Err("name must not be empty".into());
-    }
-    if n.chars().count() > NAME_MAX {
-        return Err(format!("name must be at most {NAME_MAX} characters"));
-    }
-    if n.chars().any(|c| c.is_control()) {
-        return Err("name must not contain control characters".into());
-    }
-    Ok(())
-}
-
-/// Validate the (mode, webhook_url) tuple at registration time.
-///
-/// **Review #153 HIGH 1:** `mode = polling` is rejected with a 400.
-/// The Phase 3 plan defers pull-based runners to v3.1 — there is no
-/// polling worker in the current dispatcher path, so accepting a
-/// polling registration would silently create a runner that can
-/// never receive jobs. The schema column accepts `polling` for
-/// future-compat, but the API surface refuses it until commit-N
-/// (v3.1) ships the polling worker.
-///
-/// **Review #153 HIGH 2:** SSRF validation on `webhook_url` is
-/// performed by the caller via [`url_guard::validate_export_endpoint`]
-/// after this function returns the trimmed URL. We additionally
-/// reject userinfo (`http://user:pass@host/...`) here because
-/// `url_guard` doesn't enforce that.
-fn validate_webhook_url(mode: RunnerMode, url: Option<&str>) -> Result<String, String> {
-    if matches!(mode, RunnerMode::Polling) {
-        return Err(
-            "polling mode is not implemented in v1; only mode=webhook is accepted. \
-             Pull-based runners are tracked for v3.1."
-                .into(),
-        );
-    }
-    let u = url
-        .ok_or_else(|| "webhook_url is required for mode=webhook".to_string())?
-        .trim();
-    if !u.starts_with("http://") && !u.starts_with("https://") {
-        return Err("webhook_url must be http:// or https://".into());
-    }
-    if u == "http://" || u == "https://" {
-        return Err("webhook_url is missing a host".into());
-    }
-    let parsed = url::Url::parse(u).map_err(|e| format!("webhook_url is malformed: {e}"))?;
-    // Reject embedded credentials — no legitimate webhook target uses
-    // basic-auth-style URLs, and they're a known SSRF/credential-leak
-    // surface.
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("webhook_url must not contain userinfo (user:pass@...)".into());
-    }
-    if parsed.host_str().is_none() {
-        return Err("webhook_url is missing a host".into());
-    }
-    Ok(u.to_string())
-}
-
-// ──────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────
-
-/// Map a missing crypto key to a 503 with operator-actionable body.
-fn require_crypto(state: &AppState) -> Result<&CryptoBox, (StatusCode, Json<ErrorBody>)> {
-    state.crypto.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                error: format!(
-                    "{} env var is not set; runner registry endpoints unavailable. Generate one with `openssl rand -base64 32` and restart the server.",
-                    crypto::KEY_ENV_VAR
-                ),
-            }),
-        )
-    })
-}
+// ── Error helpers ────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
@@ -278,242 +88,21 @@ fn conflict(msg: String) -> (StatusCode, Json<ErrorBody>) {
     (StatusCode::CONFLICT, Json(ErrorBody { error: msg }))
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Handlers
-// ──────────────────────────────────────────────────────────────────
+// ── Create replay job ────────────────────────────────────────────
 
-/// `GET /api/runners` — list all runners (no tokens).
-async fn list_runners(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<RunnerView>>, (StatusCode, Json<ErrorBody>)> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|e| internal(format!("store lock: {e}")))?;
-    let runners = store.list_runners().map_err(internal)?;
-    Ok(Json(runners.into_iter().map(RunnerView::from).collect()))
-}
-
-/// `POST /api/runners` — register a new runner. Returns the raw
-/// auth token in the body **once**.
-async fn register_runner(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterRunnerRequest>,
-) -> Result<(StatusCode, Json<RegisterRunnerResponse>), (StatusCode, Json<ErrorBody>)> {
-    let cb = require_crypto(&state)?;
-    validate_name(&req.name).map_err(bad_request)?;
-    let mode = req.mode.clone();
-    let webhook_url = validate_webhook_url(mode, req.webhook_url.as_deref())
-        .map_err(bad_request)?;
-    // Review #153 HIGH 2: SSRF guard — refuse webhook_url targets
-    // that resolve to loopback / private / link-local / metadata IPs.
-    // Reuses the same policy that gates `export_otel`.
-    //
-    // Dev/test escape hatch: REWIND_ALLOW_LOOPBACK_WEBHOOKS=1 bypasses
-    // the SSRF check. NEVER set this in production — any operator who
-    // can reach the dashboard could then dispatch webhooks at
-    // localhost / cloud-metadata IPs. Documented in docs/runners.md.
-    let bypass = std::env::var("REWIND_ALLOW_LOOPBACK_WEBHOOKS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !bypass {
-        crate::url_guard::validate_export_endpoint(&webhook_url)
-            .await
-            .map_err(bad_request)?;
-    }
-
-    let raw_token = crypto::generate_runner_token();
-    let nonce = CryptoBox::fresh_nonce();
-    let encrypted = cb
-        .encrypt(raw_token.expose().as_bytes(), &nonce)
-        .map_err(internal)?;
-
-    let runner = Runner {
-        id: Uuid::new_v4().to_string(),
-        name: req.name.trim().to_string(),
-        mode: req.mode,
-        // Polling mode is rejected above (HIGH 1), so webhook_url is
-        // always Some(url). The schema column stays Option<String>
-        // for forward-compat when v3.1 ships polling.
-        webhook_url: Some(webhook_url),
-        encrypted_token: encrypted,
-        token_nonce: nonce.to_vec(),
-        auth_token_hash: crypto::hash_runner_token(raw_token.expose()),
-        auth_token_preview: crypto::token_preview(raw_token.expose()),
-        created_at: chrono::Utc::now(),
-        last_seen_at: None,
-        status: RunnerStatus::Active,
-    };
-
-    {
-        let store = state
-            .store
-            .lock()
-            .map_err(|e| internal(format!("store lock: {e}")))?;
-        store.create_runner(&runner).map_err(internal)?;
-    }
-
-    let response = RegisterRunnerResponse {
-        runner: runner.into(),
-        raw_token: raw_token.expose().to_string(),
-        raw_token_warning: "Save this token now. It cannot be retrieved after this response.",
-    };
-    Ok((StatusCode::CREATED, Json(response)))
-}
-
-/// `GET /api/runners/{id}` — fetch a single runner (no tokens).
-async fn get_runner(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<RunnerView>, (StatusCode, Json<ErrorBody>)> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|e| internal(format!("store lock: {e}")))?;
-    let runner = store
-        .get_runner(&id)
-        .map_err(internal)?
-        .ok_or_else(|| not_found("runner"))?;
-    Ok(Json(runner.into()))
-}
-
-/// `DELETE /api/runners/{id}` — hard-delete the runner.
-///
-/// **Review #153 MEDIUM 4 (active-jobs guard):** refuses deletion
-/// when the runner has non-terminal jobs (state ∈ {pending,
-/// dispatched, in_progress}). Returns `409 Conflict` with the count
-/// in the body; operators must drain in-flight jobs first (mark
-/// runner disabled + wait for them to settle, OR cancel them
-/// explicitly). Otherwise `ON DELETE SET NULL` would orphan the
-/// in-flight jobs (no dispatcher to send to, no auth surface for
-/// inbound events).
-///
-/// Historical / terminal jobs (`completed`, `errored`) survive the
-/// cascade with `runner_id` nulled out and render as "Runner
-/// deleted" in the dashboard. (Review #152 FK rules.)
-async fn remove_runner(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|e| internal(format!("store lock: {e}")))?;
-    let active = store.count_active_jobs_for_runner(&id).map_err(internal)?;
-    if active > 0 {
-        return Err(conflict(format!(
-            "runner has {active} non-terminal job(s) (pending/dispatched/in_progress); \
-             drain or cancel them before deletion. Alternatively, mark the runner \
-             disabled to stop new dispatches and wait for active jobs to settle."
-        )));
-    }
-    let removed = store.delete_runner(&id).map_err(internal)?;
-    if removed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(not_found("runner"))
-    }
-}
-
-/// `POST /api/runners/{id}/regenerate-token` — rotate the runner's
-/// auth token. Returns the new raw token once.
-///
-/// **Review #153 HIGH 3 (active-jobs guard):** refuses rotation
-/// while in-flight jobs reference this runner. Returns `409 Conflict`
-/// with the count. The old `auth_token_hash` is invalidated
-/// immediately on rotation, which would break any in-flight
-/// runner→server callback signed with the old token (the runner
-/// already accepted the dispatch under it). Operator workflow:
-/// drain or cancel in-flight jobs, then rotate. Future v3.1 may
-/// add a token-grace list to allow lossless rotation.
-async fn regenerate_token(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<RegisterRunnerResponse>, (StatusCode, Json<ErrorBody>)> {
-    let cb = require_crypto(&state)?;
-
-    let raw_token = crypto::generate_runner_token();
-    let nonce = CryptoBox::fresh_nonce();
-    let encrypted = cb
-        .encrypt(raw_token.expose().as_bytes(), &nonce)
-        .map_err(internal)?;
-    let auth_token_hash = crypto::hash_runner_token(raw_token.expose());
-    let auth_token_preview = crypto::token_preview(raw_token.expose());
-
-    let updated_runner = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|e| internal(format!("store lock: {e}")))?;
-        // Verify the runner exists first; rotation on a deleted runner
-        // is a 404, not a silent no-op that returns a token bound to
-        // nothing.
-        let existing = store
-            .get_runner(&id)
-            .map_err(internal)?
-            .ok_or_else(|| not_found("runner"))?;
-        // Active-jobs guard: see docstring above.
-        let active = store.count_active_jobs_for_runner(&id).map_err(internal)?;
-        if active > 0 {
-            return Err(conflict(format!(
-                "runner has {active} non-terminal job(s) (pending/dispatched/in_progress); \
-                 rotating now would invalidate the token bound to in-flight callbacks. \
-                 Drain or cancel them before rotating, or mark the runner disabled to \
-                 stop new dispatches and wait for active jobs to settle."
-            )));
-        }
-        store
-            .rotate_runner_token(
-                &id,
-                &encrypted,
-                &nonce,
-                &auth_token_hash,
-                &auth_token_preview,
-            )
-            .map_err(internal)?;
-        // Re-fetch so the response reflects the post-rotation state.
-        store
-            .get_runner(&id)
-            .map_err(internal)?
-            .unwrap_or(existing)
-    };
-
-    Ok(Json(RegisterRunnerResponse {
-        runner: updated_runner.into(),
-        raw_token: raw_token.expose().to_string(),
-        raw_token_warning: "Save this token now. It cannot be retrieved after this response.",
-    }))
-}
-
-// ──────────────────────────────────────────────────────────────────
-// Phase 3 commit 6: Replay job dispatch + event ingestion
-// ──────────────────────────────────────────────────────────────────
-
-/// Dispatch endpoint shape A: server creates fork + replay context
-/// + replay job atomically.
-///
-/// Used by the dashboard "Run replay" button when the operator
-/// clicks on a session step.
 #[derive(Debug, Deserialize)]
 pub struct CreateReplayJobShapeA {
-    pub runner_id: String,
     pub source_timeline_id: String,
     pub at_step: u32,
     #[serde(default)]
     pub strict_match: bool,
 }
 
-/// Dispatch endpoint shape B: caller already has a replay context
-/// (e.g. CLI or programmatic clients). Server validates ownership
-/// and that the cursor isn't already in use.
 #[derive(Debug, Deserialize)]
 pub struct CreateReplayJobShapeB {
-    pub runner_id: String,
     pub replay_context_id: String,
 }
 
-/// Dual-shape request body. `serde(untagged)` picks based on which
-/// fields are present.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum CreateReplayJobRequest {
@@ -525,40 +114,33 @@ pub enum CreateReplayJobRequest {
 pub struct CreateReplayJobResponse {
     pub job_id: String,
     pub replay_context_id: String,
-    /// Present when the server created a fresh fork timeline (shape A).
-    /// Null when the caller supplied an existing replay_context (shape B).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_timeline_id: Option<String>,
     pub state: String,
-    /// Echoed back so the dashboard knows when the runner must reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_deadline_at: Option<String>,
 }
 
 /// `POST /api/sessions/{sid}/replay-jobs`
+///
+/// Creates a replay job and dispatches it to `REWIND_REPLAY_WEBHOOK_URL`
+/// with a plain unsigned POST.
 async fn create_replay_job(
     State(state): State<AppState>,
     Path(sid): Path<String>,
     Json(req): Json<CreateReplayJobRequest>,
 ) -> Result<(StatusCode, Json<CreateReplayJobResponse>), (StatusCode, Json<ErrorBody>)> {
-    let dispatcher = state
-        .dispatcher
-        .clone()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    error: format!(
-                        "{} env var is not set; replay-job dispatch unavailable.",
-                        crypto::KEY_ENV_VAR
-                    ),
-                }),
-            )
-        })?;
+    let webhook_url = state.replay_webhook_url.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "REWIND_REPLAY_WEBHOOK_URL is not configured; replay dispatch unavailable."
+                    .to_string(),
+            }),
+        )
+    })?;
 
-    // 1. Resolve session, runner, and replay-context (creating fork+
-    //    context if shape A). All store work in a single lock scope
-    //    so we don't race with deletions between checks.
-    let (job, runner, fork_timeline_id, at_step) = {
+    let (job, fork_timeline_id, at_step) = {
         let store = state
             .store
             .lock()
@@ -568,20 +150,8 @@ async fn create_replay_job(
             .map_err(internal)?
             .ok_or_else(|| not_found("session"))?;
 
-        let (runner_id, replay_context_id, fork_timeline_id, at_step) = match req {
+        let (replay_context_id, fork_timeline_id, at_step) = match req {
             CreateReplayJobRequest::CreateAndDispatch(a) => {
-                // Validate runner.
-                let runner = store
-                    .get_runner(&a.runner_id)
-                    .map_err(internal)?
-                    .ok_or_else(|| not_found("runner"))?;
-                if !matches!(runner.status, RunnerStatus::Active) {
-                    return Err(conflict(format!(
-                        "runner {} is in status {:?}; cannot dispatch",
-                        runner.id, runner.status
-                    )));
-                }
-                // Validate timeline + at_step + create fork.
                 let timelines = store.get_timelines(&session.id).map_err(internal)?;
                 if !timelines.iter().any(|t| t.id == a.source_timeline_id) {
                     return Err(bad_request(format!(
@@ -599,53 +169,17 @@ async fn create_replay_job(
                     )
                     .map_err(|e| bad_request(format!("fork failed: {e}")))?;
                 let ctx_id = Uuid::new_v4().to_string();
-                // Replay context cursor must start at the BEGINNING
-                // of the recording (from_step=0), not at a.at_step.
-                //
-                // Rationale: the runner re-executes the agent from
-                // scratch (it doesn't know how to "fast-forward" the
-                // ReAct loop to iteration N). On the agent's first
-                // LLM call, the cache lookup must hit recorded step
-                // #1 so the replay tracks the original deterministically.
-                //
-                // a.at_step is the FORK-point — it controls which
-                // pre-step prefix is *inherited* on the fork timeline,
-                // and where new (post-divergence) recordings get
-                // numbered. The two concepts were conflated in the
-                // initial Phase 3 wiring; with from_step=at_step, the
-                // first cache lookup targets recorded step at_step+1
-                // (or at_step+2 because peek returns current+1),
-                // skipping the inherited prefix in the cache and
-                // forcing a live re-run that produces "diverges at
-                // step N" artifacts in the diff view.
                 store
                     .create_replay_context(&ctx_id, &session.id, &fork.id, 0)
                     .map_err(internal)?;
-                // Review #154 F1: apply strict_match if requested.
-                // create_replay_context defaults to warn-on-divergence;
-                // strict callers explicitly opt in here so a body
-                // divergence later raises 409 instead of returning a
-                // cached step with `divergent: true`.
                 if a.strict_match {
                     store
                         .set_replay_context_strict_match(&ctx_id, true)
                         .map_err(internal)?;
                 }
-                (a.runner_id, ctx_id, Some(fork.id), a.at_step)
+                (ctx_id, Some(fork.id), a.at_step)
             }
             CreateReplayJobRequest::ReuseContext(b) => {
-                let runner = store
-                    .get_runner(&b.runner_id)
-                    .map_err(internal)?
-                    .ok_or_else(|| not_found("runner"))?;
-                if !matches!(runner.status, RunnerStatus::Active) {
-                    return Err(conflict(format!(
-                        "runner {} is in status {:?}; cannot dispatch",
-                        runner.id, runner.status
-                    )));
-                }
-                // Validate context belongs to this session and isn't
-                // already being consumed by another in-flight job.
                 let ctx = store
                     .get_replay_context(&b.replay_context_id)
                     .map_err(internal)?
@@ -656,22 +190,13 @@ async fn create_replay_job(
                         b.replay_context_id, ctx.session_id, session.id
                     )));
                 }
-                // Review #154 F3 (cursor): a context whose cursor has
-                // already advanced past `from_step` is mid-replay
-                // already — reusing it would skip recorded steps and
-                // start partway through the timeline.
                 if ctx.current_step != ctx.from_step {
                     return Err(conflict(format!(
                         "replay_context {} cursor already advanced to step {} \
-                         (started at {}); a fresh context is required for a new dispatch",
+                         (started at {}); a fresh context is required",
                         b.replay_context_id, ctx.current_step, ctx.from_step
                     )));
                 }
-                // Review #154 F3 (TTL): replay contexts age out after
-                // REPLAY_CONTEXT_TTL_SECS (currently 1h, matching
-                // the WebServer cleanup task). Reusing a context past
-                // its TTL is racy with the cleanup deletion that's
-                // about to remove it; refuse upfront.
                 let age = chrono::Utc::now()
                     .signed_duration_since(ctx.last_accessed_at)
                     .num_seconds();
@@ -686,18 +211,10 @@ async fn create_replay_job(
                     .map_err(internal)?;
                 if in_flight > 0 {
                     return Err(conflict(format!(
-                        "replay_context {} already has {in_flight} in-flight job(s); \
-                         finish them before dispatching a new one",
+                        "replay_context {} already has {in_flight} in-flight job(s)",
                         b.replay_context_id
                     )));
                 }
-                // Resolve at_step from the context's fork timeline. The
-                // dispatch payload carries the user-clicked step number
-                // so the runner can drive multi-turn replay; for
-                // ReuseContext that step is baked into the timeline's
-                // fork_at_step. Root timelines (parent_timeline_id =
-                // None) shouldn't reach here because contexts always
-                // target a fork; defensive fallback to 1.
                 let at_step = store
                     .get_timelines(&session.id)
                     .map_err(internal)?
@@ -705,18 +222,13 @@ async fn create_replay_job(
                     .find(|t| t.id == ctx.timeline_id)
                     .and_then(|t| t.fork_at_step)
                     .unwrap_or(1);
-                (b.runner_id, b.replay_context_id, Some(ctx.timeline_id), at_step)
+                (b.replay_context_id, Some(ctx.timeline_id), at_step)
             }
         };
 
-        // 2. Insert the job (state=pending; FK-validated by commit 3).
-        let runner = store
-            .get_runner(&runner_id)
-            .map_err(internal)?
-            .ok_or_else(|| not_found("runner"))?;
         let job = ReplayJob {
             id: Uuid::new_v4().to_string(),
-            runner_id: Some(runner_id.clone()),
+            runner_id: None,
             session_id: session.id.clone(),
             replay_context_id: Some(replay_context_id),
             state: ReplayJobState::Pending,
@@ -732,83 +244,71 @@ async fn create_replay_job(
             progress_total: None,
         };
         store.create_replay_job(&job).map_err(internal)?;
-        // Review #154 round 2 BLOCKER fix: transition pending →
-        // dispatched SYNCHRONOUSLY before spawning the dispatcher.
-        // Otherwise the runner can call back with `started` before
-        // the async dispatcher's apply_outcome flips state, and the
-        // state-machine guard from #152 round 2 rejects the
-        // `Pending → Started` transition as illegal — the runner
-        // sees a 409, the job sits in `pending` until the reaper
-        // marks it errored. By advancing state up front, the runner
-        // ALWAYS finds the job in `dispatched` when it tries to
-        // call back. If dispatch later fails, apply_outcome
-        // transitions dispatched → errored (legal startup-failure
-        // path). If `started` lands first (as it can with very
-        // fast runners), the apply_outcome failure transition will
-        // be a no-op (SQL guard refuses Dispatched→Errored when
-        // current state is in_progress) and the run proceeds.
         store
-            .advance_replay_job_state(
-                &job.id,
-                ReplayJobState::Dispatched,
-                None,
-                None,
-            )
+            .advance_replay_job_state(&job.id, ReplayJobState::Dispatched, None, None)
             .map_err(internal)?;
-        (job, runner, fork_timeline_id, at_step)
+        (job, fork_timeline_id, at_step)
     };
 
-    // 3. Fire the dispatcher in the background. The handler returns
-    //    immediately with the job id; progress flows over the
-    //    WebSocket as state changes.
-    // Fire dispatcher in the background. The dispatcher is pure
-    // (returns a DispatchOutcome) so the async HTTP doesn't hold
-    // a MutexGuard across await — we apply the outcome inside a
-    // briefly-held lock after the network call settles.
-    //
-    // F2: the dispatch payload carries the replay-context timeline id
-    // so the runner SDK's attach_replay_context can set _timeline_id
-    // before any live cache miss records into the wrong timeline.
+    // Dispatch via plain POST to the configured webhook URL.
     let job_clone = job.clone();
-    let runner_clone = runner.clone();
     let store_arc = state.store.clone();
     let event_tx = state.event_tx.clone();
-    let timeline_for_payload = fork_timeline_id
-        .clone()
-        .unwrap_or_default();
-    let at_step_for_payload = at_step;
+    let timeline_for_payload = fork_timeline_id.clone().unwrap_or_default();
+    let base_url = state.base_url.clone();
     tokio::spawn(async move {
-        let outcome = dispatcher
-            .dispatch(&runner_clone, &job_clone, &timeline_for_payload, at_step_for_payload)
+        let payload = serde_json::json!({
+            "job_id": job_clone.id,
+            "session_id": job_clone.session_id,
+            "replay_context_id": job_clone.replay_context_id,
+            "replay_context_timeline_id": timeline_for_payload,
+            "at_step": at_step,
+            "base_url": base_url,
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let result = client
+            .post(&webhook_url)
+            .header("Content-Type", "application/json")
+            .header("X-Rewind-Job-Id", &job_clone.id)
+            .json(&payload)
+            .send()
             .await;
-        let after = {
-            let store = match store_arc.lock() {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("dispatch spawn: store lock poisoned: {e}");
-                    return;
-                }
-            };
-            if let Err(e) = crate::dispatcher::Dispatcher::apply_outcome(
-                &outcome,
-                &job_clone.id,
-                &store,
-            ) {
-                tracing::error!("dispatch spawn: apply_outcome failed: {e}");
-                return;
-            }
-            store.get_replay_job(&job_clone.id).ok().flatten()
+        let outcome_err = match result {
+            Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED => None,
+            Ok(resp) => Some(format!("webhook returned {}", resp.status())),
+            Err(e) => Some(format!("webhook dispatch failed: {e}")),
         };
-        if let Some(after) = after {
-            let _ = event_tx.send(StoreEvent::ReplayJobUpdated {
-                job_id: after.id.clone(),
-                session_id: after.session_id.clone(),
-                state: after.state.as_str().to_string(),
-                progress_step: Some(after.progress_step),
-                progress_total: after.progress_total,
-                error_message: after.error_message.clone(),
-                error_stage: after.error_stage.clone(),
-            });
+        if let Some(err_msg) = &outcome_err {
+            if let Ok(store) = store_arc.lock() {
+                let _ = store.advance_replay_job_state(
+                    &job_clone.id,
+                    ReplayJobState::Errored,
+                    Some(err_msg),
+                    Some("dispatch"),
+                );
+            }
+        } else if let Ok(store) = store_arc.lock() {
+            let _ = store.set_dispatch_deadline_and_lease(
+                &job_clone.id,
+                Utc::now() + chrono::Duration::seconds(10),
+                Utc::now() + chrono::Duration::seconds(INITIAL_LEASE_SECS),
+            );
+        }
+        if let Ok(store) = store_arc.lock() {
+            if let Ok(Some(after)) = store.get_replay_job(&job_clone.id) {
+                let _ = event_tx.send(StoreEvent::ReplayJobUpdated {
+                    job_id: after.id.clone(),
+                    session_id: after.session_id.clone(),
+                    state: after.state.as_str().to_string(),
+                    progress_step: Some(after.progress_step),
+                    progress_total: after.progress_total,
+                    error_message: after.error_message.clone(),
+                    error_stage: after.error_stage.clone(),
+                });
+            }
         }
     });
 
@@ -818,15 +318,13 @@ async fn create_replay_job(
             job_id: job.id.clone(),
             replay_context_id: job.replay_context_id.clone().unwrap_or_default(),
             fork_timeline_id,
-            // Pre-spawn transition (review #154 round 2 BLOCKER fix)
-            // means the response always reports `dispatched` rather
-            // than the prior `pending`. Dashboard sees the "real"
-            // state immediately.
             state: "dispatched".to_string(),
             dispatch_deadline_at: job.dispatch_deadline_at.map(|t| t.to_rfc3339()),
         }),
     ))
 }
+
+// ── ReplayJobView ────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 pub struct ReplayJobView {
@@ -869,7 +367,7 @@ impl From<ReplayJob> for ReplayJobView {
     }
 }
 
-/// `GET /api/sessions/{sid}/replay-jobs` — list jobs for a session.
+/// `GET /api/sessions/{sid}/replay-jobs`
 async fn list_replay_jobs_for_session(
     State(state): State<AppState>,
     Path(sid): Path<String>,
@@ -878,14 +376,13 @@ async fn list_replay_jobs_for_session(
         .store
         .lock()
         .map_err(|e| internal(format!("store lock: {e}")))?;
-    let _ = 100u32; // limit hint preserved for future pagination
     let jobs = store
         .list_replay_jobs_by_session(&sid)
         .map_err(internal)?;
     Ok(Json(jobs.into_iter().map(ReplayJobView::from).collect()))
 }
 
-/// `GET /api/replay-jobs/{id}` — fetch a single replay job.
+/// `GET /api/replay-jobs/{id}`
 async fn get_replay_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -901,17 +398,7 @@ async fn get_replay_job(
     Ok(Json(job.into()))
 }
 
-// Review #154 N1: cancellation endpoint removed (plan defers
-// cooperative cancel to v3.1). Operators who need to abandon a
-// runaway runner kill the runner process externally; the lease
-// reaper will subsequently mark the job `errored` with
-// `stage='lease_expired'`.
-
-// ──────────────────────────────────────────────────────────────────
-// Runner-callback: POST /api/replay-jobs/{id}/events
-// (mounted OUTSIDE the bearer-auth middleware; uses
-// X-Rewind-Runner-Auth + ownership check.)
-// ──────────────────────────────────────────────────────────────────
+// ── Runner callback: POST /api/replay-jobs/{id}/events ───────────
 
 #[derive(Debug, Deserialize)]
 pub struct PostReplayJobEventRequest {
@@ -926,76 +413,30 @@ pub struct PostReplayJobEventRequest {
 #[derive(Debug, Serialize)]
 pub struct PostReplayJobEventResponse {
     pub accepted: bool,
-    /// Present when the event was rejected (terminal state, illegal
-    /// transition, ownership mismatch). Helps runners tell "you got
-    /// here too late" from "you sent garbage".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub state: String,
 }
 
-const RUNNER_AUTH_HEADER: &str = "X-Rewind-Runner-Auth";
-
+/// `POST /api/replay-jobs/{id}/events`
+///
+/// No authentication required — the runner is a co-located sidecar
+/// or trusted process communicating over localhost/cluster-internal network.
 async fn post_replay_job_event(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
-    headers: HeaderMap,
     Json(req): Json<PostReplayJobEventRequest>,
 ) -> Result<(StatusCode, Json<PostReplayJobEventResponse>), (StatusCode, Json<ErrorBody>)> {
-    // 1. Extract runner-auth header.
-    let supplied_token = headers
-        .get(RUNNER_AUTH_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorBody {
-                    error: format!("missing {RUNNER_AUTH_HEADER} header"),
-                }),
-            )
-        })?;
-    let supplied_hash = crypto::hash_runner_token(supplied_token);
-
-    // 2. Look up runner by hash, verify ownership, and apply the event
-    //    atomically.
     let mut store = state
         .store
         .lock()
         .map_err(|e| internal(format!("store lock: {e}")))?;
-
-    let runner = store
-        .get_runner_by_auth_hash(&supplied_hash)
-        .map_err(internal)?
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorBody {
-                    error: format!("invalid {RUNNER_AUTH_HEADER} token"),
-                }),
-            )
-        })?;
 
     let job = store
         .get_replay_job(&job_id)
         .map_err(internal)?
         .ok_or_else(|| not_found("replay_job"))?;
 
-    if job.runner_id.as_deref() != Some(runner.id.as_str()) {
-        // Runner can authenticate but doesn't own this job. Return
-        // 403 (not 404) so legitimate operators can debug runner
-        // misconfiguration.
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ErrorBody {
-                error: "runner does not own this job".to_string(),
-            }),
-        ));
-    }
-
-    // Touch last_seen_at for runner liveness tracking.
-    let _ = store.touch_runner_last_seen(&runner.id);
-
-    // 3. Build event row + apply via atomic state-machine helper.
     let event = ReplayJobEvent {
         id: Uuid::new_v4().to_string(),
         job_id: job.id.clone(),
@@ -1013,11 +454,10 @@ async fn post_replay_job_event(
             req.progress_total,
             req.error_message.as_deref(),
             req.error_stage.as_deref(),
-            crate::dispatcher::INITIAL_LEASE_SECS,
+            INITIAL_LEASE_SECS,
         )
         .map_err(internal)?;
 
-    // 4. Re-read state for response + WebSocket broadcast.
     let after = store
         .get_replay_job(&job.id)
         .map_err(internal)?

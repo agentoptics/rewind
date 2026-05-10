@@ -200,7 +200,7 @@ fn _arc_marker(_: Arc<()>) {}
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
-    use rewind_store::{ReplayJob, ReplayJobState, Runner, RunnerMode, RunnerStatus, Session, Store, Timeline};
+    use rewind_store::{ReplayJob, ReplayJobState, Session, Store, Timeline};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tokio::sync::broadcast;
@@ -217,30 +217,10 @@ mod tests {
             hooks: Arc::new(crate::HookIngestionState::new()),
             otel_config: None,
             auth_token: None,
-            crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+            replay_webhook_url: None,
+            base_url: "http://127.0.0.1:4800".to_string(),
         };
         (state, store, tmp)
-    }
-
-    fn seed_runner(store: &Store) -> Runner {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(b"reaper-token");
-        let runner = Runner {
-            id: Uuid::new_v4().to_string(),
-            name: "reaper-test".into(),
-            mode: RunnerMode::Webhook,
-            webhook_url: Some("http://1.1.1.1/wh".into()),
-            encrypted_token: vec![1, 2, 3],
-            token_nonce: vec![0; 12],
-            auth_token_hash: format!("{:x}", h.finalize()),
-            auth_token_preview: "tok***".into(),
-            created_at: Utc::now(),
-            last_seen_at: None,
-            status: RunnerStatus::Active,
-        };
-        store.create_runner(&runner).unwrap();
-        runner
     }
 
     fn seed_session_and_ctx(store: &Store) -> (String, String) {
@@ -257,7 +237,6 @@ mod tests {
     }
 
     fn make_dispatched_job(
-        runner_id: &str,
         session_id: &str,
         ctx_id: &str,
         deadline_offset: ChronoDuration,
@@ -265,7 +244,7 @@ mod tests {
         let now = Utc::now();
         ReplayJob {
             id: Uuid::new_v4().to_string(),
-            runner_id: Some(runner_id.into()),
+            runner_id: None,
             session_id: session_id.into(),
             replay_context_id: Some(ctx_id.into()),
             state: ReplayJobState::Dispatched,
@@ -286,11 +265,8 @@ mod tests {
     fn tick_marks_dispatch_deadline_expired_jobs() {
         let (state, store_arc, _tmp) = fixture_state();
         let store = store_arc.lock().unwrap();
-        let runner = seed_runner(&store);
         let (session_id, ctx_id) = seed_session_and_ctx(&store);
-        // Deadline 10s in the past → already expired.
         let job = make_dispatched_job(
-            &runner.id,
             &session_id,
             &ctx_id,
             ChronoDuration::seconds(-10),
@@ -313,13 +289,11 @@ mod tests {
     fn tick_does_not_touch_dispatched_jobs_within_deadline() {
         let (state, store_arc, _tmp) = fixture_state();
         let store = store_arc.lock().unwrap();
-        let runner = seed_runner(&store);
         let (session_id, ctx_id) = seed_session_and_ctx(&store);
         let job = make_dispatched_job(
-            &runner.id,
             &session_id,
             &ctx_id,
-            ChronoDuration::seconds(60), // future deadline
+            ChronoDuration::seconds(60),
         );
         let job_id = job.id.clone();
         store.create_replay_job(&job).unwrap();
@@ -337,12 +311,11 @@ mod tests {
     fn tick_marks_in_progress_jobs_with_expired_lease() {
         let (state, store_arc, _tmp) = fixture_state();
         let store = store_arc.lock().unwrap();
-        let runner = seed_runner(&store);
         let (session_id, ctx_id) = seed_session_and_ctx(&store);
         let now = Utc::now();
         let job = ReplayJob {
             id: Uuid::new_v4().to_string(),
-            runner_id: Some(runner.id.clone()),
+            runner_id: None,
             session_id: session_id.clone(),
             replay_context_id: Some(ctx_id.clone()),
             state: ReplayJobState::InProgress,
@@ -353,7 +326,7 @@ mod tests {
             started_at: Some(now),
             completed_at: None,
             dispatch_deadline_at: None,
-            lease_expires_at: Some(now - ChronoDuration::seconds(60)), // expired
+            lease_expires_at: Some(now - ChronoDuration::seconds(60)),
             progress_step: 3,
             progress_total: Some(10),
         };

@@ -392,59 +392,13 @@ impl Store {
 
         // v0.14 migrations: Phase 3 runner registry + replay-job tracking.
         //
-        //   - runners: registered agent processes; auth tokens stored
-        //     encrypted-at-rest under REWIND_RUNNER_SECRET_KEY (AES-256-GCM)
-        //     with auth_token_hash (SHA-256 hex) for fast inbound-auth lookup
         //   - replay_jobs: state machine pending → dispatched → in_progress →
         //     completed/errored, with lease columns for the reaper task
         //   - replay_job_events: append-only event log per job
-        //
-        // See plans/phase-3-runner-registry-and-dashboard-replay.md for
-        // the full schema rationale, including why we store the encrypted
-        // raw token (NOT just the hash) — needed for outbound HMAC signing
-        // of webhooks, can't be derived from the hash.
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS runners (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                mode TEXT NOT NULL CHECK (mode IN ('webhook', 'polling')),
-                webhook_url TEXT,
-                encrypted_token BLOB NOT NULL,
-                token_nonce BLOB NOT NULL,
-                auth_token_hash TEXT NOT NULL,
-                auth_token_preview TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                last_seen_at TEXT,
-                status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled', 'stale'))
-            )",
-            [],
-        )?;
-        // Review #152 comment 4: auth_token_hash MUST be UNIQUE — it's
-        // the inbound-auth lookup key. If two rows ever share a hash
-        // (buggy import, fixture mistake, manual edit, pathological
-        // generation), get_runner_by_auth_hash returns whichever row
-        // SQLite yields first and ownership checks could bind events
-        // to the wrong runner. Enforce at the schema boundary.
-        self.conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_runners_auth_token_hash ON runners(auth_token_hash)",
-            [],
-        )?;
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_runners_status ON runners(status)",
-            [],
-        )?;
-
-        // Review #152 comment 3: replay_jobs needs FKs on runner_id and
-        // replay_context_id. Both nullable with ON DELETE SET NULL so
-        // historical job rows survive runner / replay-context deletion
-        // (the dashboard renders "Runner deleted" / "Context deleted"
-        // for null values). Hard NOT NULL would force cascading deletes
-        // (lose history) or RESTRICT (block delete until jobs are
-        // cleaned). Nullable+SET NULL is the documented choice.
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS replay_jobs (
                 id TEXT PRIMARY KEY,
-                runner_id TEXT REFERENCES runners(id) ON DELETE SET NULL,
+                runner_id TEXT,
                 session_id TEXT NOT NULL REFERENCES sessions(id),
                 replay_context_id TEXT REFERENCES replay_contexts(id) ON DELETE SET NULL,
                 state TEXT NOT NULL DEFAULT 'pending'
@@ -460,11 +414,6 @@ impl Store {
                 progress_step INTEGER NOT NULL DEFAULT 0,
                 progress_total INTEGER
             )",
-            [],
-        )?;
-        // Indexes the reaper + dashboard queries hit:
-        self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_replay_jobs_runner_id ON replay_jobs(runner_id)",
             [],
         )?;
         self.conn.execute(

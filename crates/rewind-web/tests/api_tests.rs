@@ -21,7 +21,7 @@ fn setup() -> (Router, Arc<Mutex<Store>>, TempDir) {
         event_tx,
         hooks: Arc::new(HookIngestionState::new()),
         otel_config: None,
-        auth_token: None, crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+        auth_token: None, replay_webhook_url: None, base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
     (app, store, tmp)
@@ -461,7 +461,7 @@ async fn test_export_otel_returns_404_for_missing_session() {
             protocol: rewind_otel::export::Protocol::Http,
             headers: vec![],
         }),
-        auth_token: None, crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+        auth_token: None, replay_webhook_url: None, base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
 
@@ -487,7 +487,7 @@ async fn test_export_otel_rejects_loopback_endpoint() {
         event_tx,
         hooks: Arc::new(HookIngestionState::new()),
         otel_config: None,
-        auth_token: None, crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+        auth_token: None, replay_webhook_url: None, base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
 
@@ -513,7 +513,7 @@ async fn test_export_otel_rejects_cloud_metadata_endpoint() {
         event_tx,
         hooks: Arc::new(HookIngestionState::new()),
         otel_config: None,
-        auth_token: None, crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+        auth_token: None, replay_webhook_url: None, base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
 
@@ -537,7 +537,7 @@ async fn test_export_otel_rejects_rfc1918_endpoint() {
         event_tx,
         hooks: Arc::new(HookIngestionState::new()),
         otel_config: None,
-        auth_token: None, crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+        auth_token: None, replay_webhook_url: None, base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api", rewind_web::api_routes(state));
 

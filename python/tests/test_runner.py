@@ -1,11 +1,10 @@
 """Tests for rewind_agent.runner — the operator-facing runner library
-that processes dispatch webhooks (Phase 3 commit 9/13)."""
+that processes dispatch webhooks."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import time
 from typing import Any
 
 import pytest
@@ -13,304 +12,23 @@ import pytest
 from rewind_agent import runner
 
 
-@pytest.fixture(autouse=True)
-def _reset_replay_protection():
-    """Each test gets a clean process-level idempotency cache so
-    same-job-id reuse across tests doesn't trigger duplicate
-    short-circuiting (Review #154 F5).
-
-    Note: the lock is also reset because asyncio.Lock() instances
-    are bound to the event loop they're created in; asyncio.run()
-    creates a new loop per test, so a lock from a previous test
-    would deadlock or panic in the next."""
-    runner.reset_replay_protection_for_tests()
-    yield
-    runner.reset_replay_protection_for_tests()
-
-
 # ──────────────────────────────────────────────────────────────────
-# RunnerConfig.from_env
+# ProgressReporter
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_from_env_requires_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("REWIND_RUNNER_TOKEN", raising=False)
-    with pytest.raises(RuntimeError, match="REWIND_RUNNER_TOKEN"):
-        runner.RunnerConfig.from_env()
-
-
-def test_from_env_uses_defaults_for_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("REWIND_RUNNER_TOKEN", "abc")
-    monkeypatch.delenv("REWIND_URL", raising=False)
-    cfg = runner.RunnerConfig.from_env()
-    assert cfg.auth_token == "abc"
-    assert cfg.rewind_base_url == "http://127.0.0.1:4800"
-
-
-def test_from_env_honors_rewind_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("REWIND_RUNNER_TOKEN", "abc")
-    monkeypatch.setenv("REWIND_URL", "https://rewind.example/api")
-    cfg = runner.RunnerConfig.from_env()
-    assert cfg.rewind_base_url == "https://rewind.example/api"
-
-
-# ──────────────────────────────────────────────────────────────────
-# Signature verification (cross-checked against Rust impl)
-# ──────────────────────────────────────────────────────────────────
-
-
-def test_compute_signature_matches_rust_reference_legacy() -> None:
-    """Pre-#154 two-line input — kept for backward compat.
-    Pinned vs ``compute_signature_legacy_no_timestamp_matches_python_reference``.
-    """
-    sig = runner.compute_signature("secret", "job-1", b"body")
-    assert sig == "52fd281254f1f940a5f2ad83ebce5bfbf92f77187afa03db6902bd328abd31f9"
-
-
-def test_compute_signature_matches_rust_reference_with_timestamp() -> None:
-    """Review #154 F5 wire format. Pinned vs
-    ``compute_signature_matches_python_reference_with_timestamp`` on the Rust side.
-    """
-    sig = runner.compute_signature("secret", "job-1", b"body", timestamp=1700000000)
-    assert sig == "ea61914f63b2516960203b8bf3f4e8ee5c9a379ca941c8bd6edef2a1681944bb"
-
-
-def test_verify_signature_accepts_canonical_signature_with_timestamp() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    body = b'{"job_id":"x","session_id":"y","replay_context_id":"z","base_url":"u"}'
-    ts = int(time.time())
-    sig = runner.compute_signature(cfg.auth_token, "x", body, timestamp=ts)
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": f"sha256={sig}",
-        "X-Rewind-Timestamp": str(ts),
-    }
-    ok, reason = runner.verify_signature(config=cfg, headers=headers, body_bytes=body)
-    assert ok, f"expected ok, got reason={reason}"
-
-
-def test_verify_signature_accepts_legacy_signature_without_timestamp() -> None:
-    """Pre-#154 dispatchers (none in production, but defensively
-    handled): no X-Rewind-Timestamp header → fall back to legacy
-    two-line input. Once the dispatcher always emits a timestamp,
-    this path becomes opt-in for legacy clients only."""
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    body = b"body"
-    sig = runner.compute_signature(cfg.auth_token, "x", body)  # no timestamp
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": f"sha256={sig}",
-    }
-    ok, _ = runner.verify_signature(config=cfg, headers=headers, body_bytes=body)
-    assert ok
-
-
-def test_verify_signature_rejects_missing_job_id_header() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    headers = {"X-Rewind-Signature": "sha256=abc"}
-    ok, reason = runner.verify_signature(config=cfg, headers=headers, body_bytes=b"")
-    assert not ok
-    assert "Job-Id" in reason
-
-
-def test_verify_signature_rejects_missing_signature_header() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    headers = {"X-Rewind-Job-Id": "x"}
-    ok, reason = runner.verify_signature(config=cfg, headers=headers, body_bytes=b"")
-    assert not ok
-    assert "Signature" in reason
-
-
-def test_verify_signature_rejects_malformed_signature_prefix() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        # Missing "sha256=" prefix.
-        "X-Rewind-Signature": "abc123",
-    }
-    ok, reason = runner.verify_signature(config=cfg, headers=headers, body_bytes=b"")
-    assert not ok
-    assert "Signature" in reason
-
-
-def test_verify_signature_rejects_tampered_body() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    body = b'{"k":"v"}'
-    sig = runner.compute_signature(cfg.auth_token, "x", body)
-    tampered_body = b'{"k":"DIFFERENT"}'
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": f"sha256={sig}",
-    }
-    ok, reason = runner.verify_signature(
-        config=cfg, headers=headers, body_bytes=tampered_body
-    )
-    assert not ok
-    assert "mismatch" in reason
-
-
-def test_verify_signature_rejects_wrong_token() -> None:
-    body = b"body"
-    cfg_signing = runner.RunnerConfig(auth_token="signing-key")
-    cfg_verifying = runner.RunnerConfig(auth_token="different-key")
-    sig = runner.compute_signature(cfg_signing.auth_token, "x", body)
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": f"sha256={sig}",
-    }
-    ok, _ = runner.verify_signature(
-        config=cfg_verifying, headers=headers, body_bytes=body
-    )
-    assert not ok
-
-
-def test_verify_signature_is_case_insensitive_for_header_lookup() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    body = b"body"
-    sig = runner.compute_signature(cfg.auth_token, "x", body)
-    headers = {
-        "x-rewind-job-id": "x",  # lowercase
-        "x-rewind-signature": f"sha256={sig}",  # lowercase
-    }
-    ok, _ = runner.verify_signature(config=cfg, headers=headers, body_bytes=body)
-    assert ok
-
-
-# ──────────────────────────────────────────────────────────────────
-# Review #154 F5 — replay protection
-# ──────────────────────────────────────────────────────────────────
-
-
-def test_verify_signature_rejects_stale_timestamp() -> None:
-    """Captured-and-replayed dispatch with timestamp older than
-    the tolerance window must be refused even if the signature
-    itself is valid for that timestamp."""
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    body = b"body"
-    stale_ts = int(time.time()) - runner.TIMESTAMP_TOLERANCE_SECS - 60
-    sig = runner.compute_signature(cfg.auth_token, "x", body, timestamp=stale_ts)
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": f"sha256={sig}",
-        "X-Rewind-Timestamp": str(stale_ts),
-    }
-    ok, reason = runner.verify_signature(config=cfg, headers=headers, body_bytes=body)
-    assert not ok
-    assert "tolerance" in reason
-
-
-def test_verify_signature_rejects_future_timestamp() -> None:
-    """Future-dated dispatches outside the tolerance are also refused
-    (defensive against clock drift attacks + dispatch-time races)."""
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    body = b"body"
-    future_ts = int(time.time()) + runner.TIMESTAMP_TOLERANCE_SECS + 60
-    sig = runner.compute_signature(cfg.auth_token, "x", body, timestamp=future_ts)
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": f"sha256={sig}",
-        "X-Rewind-Timestamp": str(future_ts),
-    }
-    ok, _ = runner.verify_signature(config=cfg, headers=headers, body_bytes=body)
-    assert not ok
-
-
-def test_verify_signature_rejects_malformed_timestamp() -> None:
-    cfg = runner.RunnerConfig(auth_token="my-token")
-    headers = {
-        "X-Rewind-Job-Id": "x",
-        "X-Rewind-Signature": "sha256=anything",
-        "X-Rewind-Timestamp": "not-a-number",
-    }
-    ok, reason = runner.verify_signature(config=cfg, headers=headers, body_bytes=b"")
-    assert not ok
-    assert "malformed" in reason
-
-
-def test_asgi_handler_replay_attack_short_circuits_with_duplicate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A second dispatch with the same job_id (within tolerance) must
-    NOT re-launch the user handler — process-level idempotency."""
-    runner.reset_replay_protection_for_tests()
-    cfg = runner.RunnerConfig(auth_token="t")
-    body = json.dumps(
-        {
-            "job_id": "replay-job-1",
-            "session_id": "s",
-            "replay_context_id": "r",
-            "replay_context_timeline_id": "tl",
-            "base_url": "http://x",
-        }
-    ).encode()
-    ts = int(time.time())
-    sig = runner.compute_signature(cfg.auth_token, "replay-job-1", body, timestamp=ts)
-    headers = {
-        "X-Rewind-Job-Id": "replay-job-1",
-        "X-Rewind-Signature": f"sha256={sig}",
-        "X-Rewind-Timestamp": str(ts),
-    }
-
-    invocations = []
-
-    async def stub_post(self, body: dict[str, Any]) -> None:
-        pass
-
-    monkeypatch.setattr(runner.ProgressReporter, "_post", stub_post)
-
-    @runner.handle_replay
-    async def handler(p, r) -> None:
-        invocations.append(p.job_id)
-
-    async def run():
-        # First arrival: 202 + handler runs.
-        s1, b1 = await runner.asgi_handler(
-            config=cfg, headers=headers, body_bytes=body, handler=handler
-        )
-        assert s1 == 202
-        assert b1["accepted"] is True
-
-        # Second (replay) arrival: 200 + duplicate flag, handler does NOT run.
-        s2, b2 = await runner.asgi_handler(
-            config=cfg, headers=headers, body_bytes=body, handler=handler
-        )
-        assert s2 == 200
-        assert b2["accepted"] is False
-        assert b2["duplicate"] is True
-
-        # Let the first handler scheduling complete.
-        await asyncio.sleep(0.05)
-
-    asyncio.run(run())
-    assert invocations == ["replay-job-1"]
-
-
-# ──────────────────────────────────────────────────────────────────
-# Review #154 F4 — ProgressReporter uses dispatch payload base_url
-# ──────────────────────────────────────────────────────────────────
-
-
-def test_progress_reporter_prefers_explicit_base_url_over_config() -> None:
-    """The reporter's URL must reflect the dispatch payload's base_url,
-    not the runner's local config — they diverge when Rewind runs
-    behind a proxy."""
-    cfg = runner.RunnerConfig(
-        auth_token="t",
-        rewind_base_url="http://runner-side-config.example",
-    )
+def test_progress_reporter_builds_url_from_base_url() -> None:
     reporter = runner.ProgressReporter(
-        cfg, "job-x", base_url="http://dispatcher-supplied.example"
+        "job-x", base_url="http://dispatcher-supplied.example"
     )
     assert reporter._url == "http://dispatcher-supplied.example/api/replay-jobs/job-x/events"
 
 
-def test_progress_reporter_falls_back_to_config_when_base_url_omitted() -> None:
-    cfg = runner.RunnerConfig(
-        auth_token="t",
-        rewind_base_url="http://config.example",
+def test_progress_reporter_strips_trailing_slash() -> None:
+    reporter = runner.ProgressReporter(
+        "job-x", base_url="http://example.com/"
     )
-    reporter = runner.ProgressReporter(cfg, "job-x")
-    assert reporter._url == "http://config.example/api/replay-jobs/job-x/events"
+    assert reporter._url == "http://example.com/api/replay-jobs/job-x/events"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -385,11 +103,7 @@ def test_dispatch_payload_at_step_defaults_to_none_for_back_compat() -> None:
 def test_dispatch_payload_tolerates_extra_unknown_keys() -> None:
     """Forward-compat: future server versions may add fields. Older
     runner SDKs hitting newer servers must keep working — extra
-    keys in the body are ignored, not rejected. This pins the
-    contract that lets us add fields without breaking deployed
-    runners (no HMAC concern: the server signs the wire bytes;
-    the runner verifies against raw `request.body`, so extra
-    fields are part of the signed payload on both ends)."""
+    keys in the body are ignored, not rejected."""
     body = {
         "job_id": "j",
         "session_id": "s",
@@ -410,55 +124,14 @@ def test_dispatch_payload_tolerates_extra_unknown_keys() -> None:
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_asgi_handler_rejects_invalid_signature() -> None:
-    cfg = runner.RunnerConfig(auth_token="t")
-    body = json.dumps(
-        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "u"}
-    ).encode()
-
-    called = False
-
-    @runner.handle_replay
-    async def handler(p, r) -> None:
-        nonlocal called
-        called = True
-
-    async def run():
-        status, resp = await runner.asgi_handler(
-            config=cfg,
-            headers={
-                "X-Rewind-Job-Id": "j",
-                "X-Rewind-Signature": "sha256=deadbeef",
-            },
-            body_bytes=body,
-            handler=handler,
-        )
-        assert status == 401
-        assert "error" in resp
-        # Give the loop a tick — handler must NOT have been scheduled.
-        await asyncio.sleep(0.05)
-        assert not called
-
-    asyncio.run(run())
-
-
 def test_asgi_handler_invalid_dispatch_body_returns_400() -> None:
-    cfg = runner.RunnerConfig(auth_token="t")
-    body = b'{"missing_required_fields": true}'
-    sig = runner.compute_signature(cfg.auth_token, "j", body)
-
     @runner.handle_replay
     async def handler(p, r) -> None:
         pass
 
     async def run():
         status, resp = await runner.asgi_handler(
-            config=cfg,
-            headers={
-                "X-Rewind-Job-Id": "j",
-                "X-Rewind-Signature": f"sha256={sig}",
-            },
-            body_bytes=body,
+            body_bytes=b'{"missing_required_fields": true}',
             handler=handler,
         )
         assert status == 400
@@ -470,13 +143,10 @@ def test_asgi_handler_invalid_dispatch_body_returns_400() -> None:
 def test_asgi_handler_dispatches_user_code_on_valid_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = runner.RunnerConfig(auth_token="t")
     body = json.dumps(
-        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "u"}
+        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "http://test"}
     ).encode()
-    sig = runner.compute_signature(cfg.auth_token, "j", body)
 
-    # Stub the ProgressReporter._post so we don't hit the network.
     received_events: list[dict[str, Any]] = []
 
     async def stub_post(self, body: dict[str, Any]) -> None:
@@ -495,11 +165,6 @@ def test_asgi_handler_dispatches_user_code_on_valid_request(
 
     async def run():
         status, resp = await runner.asgi_handler(
-            config=cfg,
-            headers={
-                "X-Rewind-Job-Id": "j",
-                "X-Rewind-Signature": f"sha256={sig}",
-            },
             body_bytes=body,
             handler=handler,
         )
@@ -526,11 +191,9 @@ def test_asgi_handler_dispatches_user_code_on_valid_request(
 def test_asgi_handler_emits_errored_when_user_code_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cfg = runner.RunnerConfig(auth_token="t")
     body = json.dumps(
-        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "u"}
+        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "http://test"}
     ).encode()
-    sig = runner.compute_signature(cfg.auth_token, "j", body)
 
     received_events: list[dict[str, Any]] = []
 
@@ -545,11 +208,6 @@ def test_asgi_handler_emits_errored_when_user_code_raises(
 
     async def run():
         status, _ = await runner.asgi_handler(
-            config=cfg,
-            headers={
-                "X-Rewind-Job-Id": "j",
-                "X-Rewind-Signature": f"sha256={sig}",
-            },
             body_bytes=body,
             handler=handler,
         )
@@ -567,6 +225,41 @@ def test_asgi_handler_emits_errored_when_user_code_raises(
     err = next(e for e in received_events if e["event_type"] == "errored")
     assert "agent fell over" in err["error_message"]
     assert err["error_stage"] == "agent"
+
+
+def test_asgi_handler_uses_payload_base_url_for_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reporter built by asgi_handler should prefer the dispatch
+    payload's base_url over the default."""
+    body = json.dumps(
+        {
+            "job_id": "j",
+            "session_id": "s",
+            "replay_context_id": "r",
+            "base_url": "http://from-dispatch.example",
+        }
+    ).encode()
+
+    captured_reporter: list[runner.ProgressReporter] = []
+
+    async def stub_post(self, body: dict[str, Any]) -> None:
+        pass
+
+    monkeypatch.setattr(runner.ProgressReporter, "_post", stub_post)
+
+    @runner.handle_replay
+    async def handler(payload, reporter) -> None:
+        captured_reporter.append(reporter)
+
+    async def run():
+        await runner.asgi_handler(body_bytes=body, handler=handler)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+
+    assert len(captured_reporter) == 1
+    assert "from-dispatch.example" in captured_reporter[0]._url
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -610,9 +303,6 @@ def test_install_bootstraps_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         _install._bootstrap_replay_context_from_env()
         assert _session_id.get() == "boot-sess"
         assert _replay_context_id.get() == "boot-ctx"
-        # Without REWIND_REPLAY_CONTEXT_TIMELINE_ID, _timeline_id
-        # stays unset (with a logged WARN — see the documented
-        # subprocess-bootstrap caveat).
         assert _timeline_id.get() is None
     finally:
         _session_id.set(None)
