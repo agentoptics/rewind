@@ -112,18 +112,97 @@ class RunnerConfig:
     def from_env(cls) -> "RunnerConfig":
         """Read ``REWIND_RUNNER_TOKEN`` and ``REWIND_URL``.
 
-        ``REWIND_RUNNER_TOKEN`` is required. ``REWIND_URL`` falls
-        back to the local-dev default.
+        ``REWIND_RUNNER_TOKEN`` is required unless
+        ``REWIND_RUNNER_AUTO_REGISTER`` is set to ``1`` or ``true``,
+        in which case the runner self-registers with the Rewind
+        server on first call and uses the returned token. This is
+        the recommended pattern for sidecar deployments where the
+        Rewind server's database is ephemeral (``emptyDir``).
         """
         token = os.environ.get("REWIND_RUNNER_TOKEN")
-        if not token:
-            raise RuntimeError(
-                "REWIND_RUNNER_TOKEN env var is required. Set it to the "
-                "raw token returned at runner registration."
+        base = os.environ.get("REWIND_URL", "http://127.0.0.1:4800")
+        if token:
+            return cls(auth_token=token, rewind_base_url=base)
+
+        auto = os.environ.get("REWIND_RUNNER_AUTO_REGISTER", "")
+        if auto in ("1", "true", "True", "TRUE"):
+            return cls.auto_register(
+                base_url=base,
+                name=os.environ.get("REWIND_RUNNER_NAME", "auto"),
+                webhook_url=os.environ.get(
+                    "REWIND_RUNNER_WEBHOOK_URL",
+                    "http://127.0.0.1:8000/rewind-webhook",
+                ),
             )
-        return cls(
-            auth_token=token,
-            rewind_base_url=os.environ.get("REWIND_URL", "http://127.0.0.1:4800"),
+
+        raise RuntimeError(
+            "REWIND_RUNNER_TOKEN env var is required. Set it to the "
+            "raw token returned at runner registration, or set "
+            "REWIND_RUNNER_AUTO_REGISTER=1 for sidecar deployments."
+        )
+
+    @classmethod
+    def auto_register(
+        cls,
+        base_url: str = "http://127.0.0.1:4800",
+        name: str = "auto",
+        webhook_url: str = "http://127.0.0.1:8000/rewind-webhook",
+        mode: str = "webhook",
+        *,
+        max_retries: int = 10,
+        retry_delay: float = 2.0,
+    ) -> "RunnerConfig":
+        """Register this process as a runner and return the config.
+
+        Retries on connection errors because the Rewind sidecar may
+        still be starting when the main container initializes. Safe
+        to call on every startup — duplicate names are allowed
+        (each gets a unique ID + token).
+        """
+        import json as _json
+        import time as _time
+        import urllib.error
+        import urllib.request
+
+        url = f"{base_url.rstrip('/')}/api/runners"
+        payload = _json.dumps(
+            {"name": name, "mode": mode, "webhook_url": webhook_url}
+        ).encode()
+
+        last_err: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    url, data=payload, method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    body = _json.loads(resp.read())
+                raw_token = body["raw_token"]
+                runner_id = body["runner"]["id"]
+                logger.info(
+                    "rewind runner auto-registered: id=%s name=%s "
+                    "(attempt %d/%d)",
+                    runner_id, name, attempt, max_retries,
+                )
+                return cls(auth_token=raw_token, rewind_base_url=base_url)
+            except (urllib.error.URLError, OSError, ConnectionError) as e:
+                last_err = e
+                if attempt < max_retries:
+                    logger.debug(
+                        "rewind auto-register attempt %d/%d failed: %s "
+                        "(retrying in %.1fs)",
+                        attempt, max_retries, e, retry_delay,
+                    )
+                    _time.sleep(retry_delay)
+            except (KeyError, ValueError) as e:
+                raise RuntimeError(
+                    f"rewind auto-register got unexpected response: {e}"
+                ) from e
+
+        raise RuntimeError(
+            f"rewind auto-register failed after {max_retries} attempts: "
+            f"{last_err}"
         )
 
 

@@ -290,6 +290,10 @@ struct StepDetailResponse {
 struct MessageView {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_invocations: Option<serde_json::Value>,
 }
 
 fn extract_messages(request: &serde_json::Value) -> Option<Vec<MessageView>> {
@@ -303,9 +307,14 @@ fn extract_messages(request: &serde_json::Value) -> Option<Vec<MessageView>> {
                 block.get("text").and_then(|t| t.as_str()).map(String::from)
             }).collect::<Vec<_>>().join("\n")
         } else {
-            return None;
+            String::new()
         };
-        Some(MessageView { role, content })
+        let tool_calls = m.get("tool_calls").cloned();
+        let tool_invocations = m.get("tool_invocations").cloned();
+        if content.is_empty() && tool_calls.is_none() && tool_invocations.is_none() {
+            return None;
+        }
+        Some(MessageView { role, content, tool_calls, tool_invocations })
     }).collect();
     if views.is_empty() { None } else { Some(views) }
 }

@@ -321,7 +321,14 @@ function StatusPill({ status }: { status: string }) {
   )
 }
 
-function ContextWindowView({ messages }: { messages: { role: string; content: string }[] | null }) {
+interface ContextMessage {
+  role: string
+  content: string
+  tool_calls?: { function: { name: string; arguments: string } }[]
+  tool_invocations?: { function: { name: string; arguments: string } }[]
+}
+
+function ContextWindowView({ messages }: { messages: ContextMessage[] | null }) {
   if (!messages || messages.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-neutral-500 text-sm p-4">
@@ -339,12 +346,43 @@ function ContextWindowView({ messages }: { messages: { role: string; content: st
 
   return (
     <div className="p-4 space-y-3">
-      {messages.map((msg, i) => (
-        <div key={i} className={cn('rounded-lg border p-3', roleColors[msg.role] || 'bg-neutral-900 border-neutral-800 text-neutral-300')}>
-          <div className="text-[10px] font-semibold uppercase tracking-wider mb-1.5 opacity-80">{msg.role}</div>
-          <pre className="text-xs whitespace-pre-wrap leading-relaxed font-mono">{msg.content}</pre>
-        </div>
-      ))}
+      {messages.map((msg, i) => {
+        const toolCalls = msg.tool_calls || msg.tool_invocations
+        const hasContent = msg.content && msg.content.trim().length > 0
+        const hasToolCalls = toolCalls && toolCalls.length > 0
+
+        return (
+          <div key={i} className={cn('rounded-lg border p-3', roleColors[msg.role] || 'bg-neutral-900 border-neutral-800 text-neutral-300')}>
+            <div className="text-[10px] font-semibold uppercase tracking-wider mb-1.5 opacity-80">{msg.role}</div>
+            {hasContent && (
+              <pre className="text-xs whitespace-pre-wrap leading-relaxed font-mono">{msg.content}</pre>
+            )}
+            {hasToolCalls && (
+              <div className="space-y-1.5">
+                {toolCalls!.map((tc, j) => {
+                  let argsDisplay: string
+                  try {
+                    argsDisplay = typeof tc.function.arguments === 'string'
+                      ? JSON.stringify(JSON.parse(tc.function.arguments), null, 2)
+                      : JSON.stringify(tc.function.arguments, null, 2)
+                  } catch {
+                    argsDisplay = String(tc.function.arguments)
+                  }
+                  return (
+                    <div key={j} className="bg-black/30 rounded px-2.5 py-2 border border-neutral-800/50">
+                      <span className="text-xs font-mono text-violet-400">{tc.function.name}</span>
+                      <pre className="text-[11px] text-neutral-400 whitespace-pre-wrap mt-1 font-mono">{argsDisplay}</pre>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {!hasContent && !hasToolCalls && (
+              <span className="text-xs italic text-neutral-600">(empty)</span>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
