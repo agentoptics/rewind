@@ -321,11 +321,15 @@ function StatusPill({ status }: { status: string }) {
   )
 }
 
+interface ToolCallEntry {
+  function: { name: string; arguments: string | Record<string, unknown> }
+}
+
 interface ContextMessage {
   role: string
   content: string
-  tool_calls?: { function: { name: string; arguments: string } }[]
-  tool_invocations?: { function: { name: string; arguments: string } }[]
+  tool_calls?: ToolCallEntry[]
+  tool_invocations?: ToolCallEntry[]
 }
 
 function ContextWindowView({ messages }: { messages: ContextMessage[] | null }) {
@@ -347,7 +351,8 @@ function ContextWindowView({ messages }: { messages: ContextMessage[] | null }) 
   return (
     <div className="p-4 space-y-3">
       {messages.map((msg, i) => {
-        const toolCalls = msg.tool_calls || msg.tool_invocations
+        const toolCalls = (msg.tool_calls?.length ? msg.tool_calls : null)
+          ?? (msg.tool_invocations?.length ? msg.tool_invocations : null)
         const hasContent = msg.content && msg.content.trim().length > 0
         const hasToolCalls = toolCalls && toolCalls.length > 0
 

@@ -154,10 +154,29 @@ class RunnerConfig:
     ) -> "RunnerConfig":
         """Register this process as a runner and return the config.
 
-        Retries on connection errors because the Rewind sidecar may
-        still be starting when the main container initializes. Safe
-        to call on every startup — duplicate names are allowed
-        (each gets a unique ID + token).
+        Retries on **connection errors** because the Rewind sidecar
+        may still be starting when the main container initializes.
+        HTTP 4xx/5xx errors fail fast (no retry) and surface the
+        server's response body in the ``RuntimeError``.
+
+        Safe to call on every startup — duplicate names are allowed
+        (each gets a unique ID + token). With ``emptyDir`` the DB
+        resets on restart so old rows vanish. With persistent
+        storage, runner rows accumulate; a TTL or stable-name
+        upsert is recommended for long-lived deployments.
+
+        .. warning::
+
+           This method is **synchronous** (blocking ``time.sleep``
+           + ``urllib``). Call it at module-load / ``__init__`` time
+           before the asyncio event loop is running, or wrap in
+           ``asyncio.to_thread``.
+
+        .. note::
+
+           The server must have ``REWIND_ALLOW_LOOPBACK_WEBHOOKS=1``
+           when using a loopback ``webhook_url`` (the default).
+           See ``docs/runners.md`` for the full env-var matrix.
         """
         import json as _json
         import time as _time
@@ -169,12 +188,17 @@ class RunnerConfig:
             {"name": name, "mode": mode, "webhook_url": webhook_url}
         ).encode()
 
+        bearer = os.environ.get("REWIND_AUTH_TOKEN", "")
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+
         last_err: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
             try:
                 req = urllib.request.Request(
                     url, data=payload, method="POST",
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     body = _json.loads(resp.read())
@@ -186,6 +210,15 @@ class RunnerConfig:
                     runner_id, name, attempt, max_retries,
                 )
                 return cls(auth_token=raw_token, rewind_base_url=base_url)
+            except urllib.error.HTTPError as e:
+                resp_body = ""
+                try:
+                    resp_body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"rewind auto-register HTTP {e.code}: {resp_body}"
+                ) from e
             except (urllib.error.URLError, OSError, ConnectionError) as e:
                 last_err = e
                 if attempt < max_retries:

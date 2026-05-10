@@ -290,8 +290,10 @@ struct StepDetailResponse {
 struct MessageView {
     role: String,
     content: String,
+    /// OpenAI / Anthropic format: `tool_calls` on assistant messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<serde_json::Value>,
+    /// LLM Gateway / Vercel AI SDK format: `tool_invocations`.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_invocations: Option<serde_json::Value>,
 }
