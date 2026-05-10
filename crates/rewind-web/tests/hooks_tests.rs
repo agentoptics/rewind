@@ -22,7 +22,7 @@ fn setup() -> (Router, Arc<Mutex<Store>>, TempDir, Arc<HookIngestionState>) {
         event_tx,
         hooks: hooks.clone(),
         otel_config: None,
-        auth_token: None, crypto: None, dispatcher: None, base_url: "http://127.0.0.1:4800".to_string(),
+        auth_token: None, replay_webhook_url: None, base_url: "http://127.0.0.1:4800".to_string(),
     };
     let app = Router::new().nest("/api/hooks", rewind_web::hooks::routes(state));
     (app, store, tmp, hooks)

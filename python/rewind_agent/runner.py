@@ -1,31 +1,23 @@
 """Operator-friendly runner library for Rewind dispatch webhooks.
 
-**Phase 3 commit 9/13.**
-
 A *runner* is a long-lived agent process that exposes an HTTP
-webhook endpoint. The Rewind server POSTs replay-job dispatches to
-that endpoint (HMAC-signed under the runner's auth token, see
-``crates/rewind-web/src/dispatcher.rs``); the runner verifies the
-signature, replies ``202 Accepted`` immediately, and asynchronously
-runs the agent under the supplied ``replay_context_id``. As the
-agent progresses, the runner POSTs ``started`` / ``progress`` /
-``completed`` / ``errored`` events back to ``POST /api/replay-
-jobs/{id}/events`` (authenticated with ``X-Rewind-Runner-Auth:
-<token>`` — same token the dispatch was signed with).
+webhook endpoint. The Rewind server POSTs replay-job dispatches
+directly to the configured webhook URL; the runner replies
+``202 Accepted`` immediately and asynchronously runs the agent
+under the supplied ``replay_context_id``. As the agent progresses,
+the runner POSTs ``started`` / ``progress`` / ``completed`` /
+``errored`` events back to ``POST /api/replay-jobs/{id}/events``.
 
 This module ships:
 
-- :class:`RunnerConfig` — env-loadable config (token, URL, base).
-- :func:`verify_signature` — pure HMAC verification helper.
+- :class:`DispatchPayload` — decoded webhook body.
 - :class:`ProgressReporter` — convenience wrapper around the
   events endpoint.
-- :func:`asgi_handler` — ASGI route handler suitable for FastAPI /
-  Starlette / aiohttp adapters; verifies the signature, replies
-  202 immediately, dispatches a coroutine to user code via the
-  ``@handle_replay`` decorator.
+- :func:`asgi_handler` — parses the webhook body, creates a
+  ``DispatchPayload`` and ``ProgressReporter``, and dispatches a
+  coroutine to user code via the ``@handle_replay`` decorator.
 - :func:`handle_replay` — decorator for user code that processes
-  a dispatched job. Receives a :class:`DispatchPayload` and a
-  :class:`ProgressReporter`.
+  a dispatched job.
 
 ## Example
 
@@ -34,13 +26,10 @@ This module ships:
     from fastapi import FastAPI, Request
     from rewind_agent import runner
 
-    config = runner.RunnerConfig.from_env()  # reads REWIND_RUNNER_TOKEN, etc.
     app = FastAPI()
 
     @runner.handle_replay
     async def my_replay_handler(payload, reporter):
-        # The dispatch is now in_progress (reporter.started() was
-        # auto-emitted before this runs).
         from rewind_agent import intercept
         from rewind_agent.explicit import ExplicitClient
 
@@ -51,7 +40,6 @@ This module ships:
         )
         intercept.install()
 
-        # Re-execute the agent under the replay context.
         for i, step in enumerate(my_agent_run(), start=1):
             await reporter.progress(i)
 
@@ -61,8 +49,6 @@ This module ships:
     async def webhook(request: Request):
         body = await request.body()
         return await runner.asgi_handler(
-            config=config,
-            headers=dict(request.headers),
             body_bytes=body,
             handler=my_replay_handler,
         )
@@ -72,171 +58,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
-import hmac
 import json
 import logging
-import os
-import time
-from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
-
-
-# ──────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────
-
-
-@dataclasses.dataclass(frozen=True)
-class RunnerConfig:
-    """Environment-loadable runner config.
-
-    Attributes
-    ----------
-    auth_token:
-        The runner's auth token (returned ONCE at registration).
-        Used to verify inbound dispatch signatures AND to
-        authenticate outbound event POSTs.
-    rewind_base_url:
-        The Rewind server base URL. Events are POSTed to
-        ``{rewind_base_url}/api/replay-jobs/{job_id}/events``.
-        Defaults from ``REWIND_URL`` env var.
-    """
-
-    auth_token: str
-    rewind_base_url: str = "http://127.0.0.1:4800"
-
-    @classmethod
-    def from_env(cls) -> "RunnerConfig":
-        """Read ``REWIND_RUNNER_TOKEN`` and ``REWIND_URL``.
-
-        ``REWIND_RUNNER_TOKEN`` is required unless
-        ``REWIND_RUNNER_AUTO_REGISTER`` is set to ``1`` or ``true``,
-        in which case the runner self-registers with the Rewind
-        server on first call and uses the returned token. This is
-        the recommended pattern for sidecar deployments where the
-        Rewind server's database is ephemeral (``emptyDir``).
-        """
-        token = os.environ.get("REWIND_RUNNER_TOKEN")
-        base = os.environ.get("REWIND_URL", "http://127.0.0.1:4800")
-        if token:
-            return cls(auth_token=token, rewind_base_url=base)
-
-        auto = os.environ.get("REWIND_RUNNER_AUTO_REGISTER", "")
-        if auto in ("1", "true", "True", "TRUE"):
-            return cls.auto_register(
-                base_url=base,
-                name=os.environ.get("REWIND_RUNNER_NAME", "auto"),
-                webhook_url=os.environ.get(
-                    "REWIND_RUNNER_WEBHOOK_URL",
-                    "http://127.0.0.1:8000/rewind-webhook",
-                ),
-            )
-
-        raise RuntimeError(
-            "REWIND_RUNNER_TOKEN env var is required. Set it to the "
-            "raw token returned at runner registration, or set "
-            "REWIND_RUNNER_AUTO_REGISTER=1 for sidecar deployments."
-        )
-
-    @classmethod
-    def auto_register(
-        cls,
-        base_url: str = "http://127.0.0.1:4800",
-        name: str = "auto",
-        webhook_url: str = "http://127.0.0.1:8000/rewind-webhook",
-        mode: str = "webhook",
-        *,
-        max_retries: int = 10,
-        retry_delay: float = 2.0,
-    ) -> "RunnerConfig":
-        """Register this process as a runner and return the config.
-
-        Retries on **connection errors** because the Rewind sidecar
-        may still be starting when the main container initializes.
-        HTTP 4xx/5xx errors fail fast (no retry) and surface the
-        server's response body in the ``RuntimeError``.
-
-        Safe to call on every startup — duplicate names are allowed
-        (each gets a unique ID + token). With ``emptyDir`` the DB
-        resets on restart so old rows vanish. With persistent
-        storage, runner rows accumulate; a TTL or stable-name
-        upsert is recommended for long-lived deployments.
-
-        .. warning::
-
-           This method is **synchronous** (blocking ``time.sleep``
-           + ``urllib``). Call it at module-load / ``__init__`` time
-           before the asyncio event loop is running, or wrap in
-           ``asyncio.to_thread``.
-
-        .. note::
-
-           The server must have ``REWIND_ALLOW_LOOPBACK_WEBHOOKS=1``
-           when using a loopback ``webhook_url`` (the default).
-           See ``docs/runners.md`` for the full env-var matrix.
-        """
-        import json as _json
-        import time as _time
-        import urllib.error
-        import urllib.request
-
-        url = f"{base_url.rstrip('/')}/api/runners"
-        payload = _json.dumps(
-            {"name": name, "mode": mode, "webhook_url": webhook_url}
-        ).encode()
-
-        bearer = os.environ.get("REWIND_AUTH_TOKEN", "")
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if bearer:
-            headers["Authorization"] = f"Bearer {bearer}"
-
-        last_err: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                req = urllib.request.Request(
-                    url, data=payload, method="POST",
-                    headers=headers,
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    body = _json.loads(resp.read())
-                raw_token = body["raw_token"]
-                runner_id = body["runner"]["id"]
-                logger.info(
-                    "rewind runner auto-registered: id=%s name=%s "
-                    "(attempt %d/%d)",
-                    runner_id, name, attempt, max_retries,
-                )
-                return cls(auth_token=raw_token, rewind_base_url=base_url)
-            except urllib.error.HTTPError as e:
-                resp_body = ""
-                try:
-                    resp_body = e.read().decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"rewind auto-register HTTP {e.code}: {resp_body}"
-                ) from e
-            except (urllib.error.URLError, OSError, ConnectionError) as e:
-                last_err = e
-                if attempt < max_retries:
-                    logger.debug(
-                        "rewind auto-register attempt %d/%d failed: %s "
-                        "(retrying in %.1fs)",
-                        attempt, max_retries, e, retry_delay,
-                    )
-                    _time.sleep(retry_delay)
-            except (KeyError, ValueError) as e:
-                raise RuntimeError(
-                    f"rewind auto-register got unexpected response: {e}"
-                ) from e
-
-        raise RuntimeError(
-            f"rewind auto-register failed after {max_retries} attempts: "
-            f"{last_err}"
-        )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -275,6 +101,7 @@ class DispatchPayload:
     replay_context_timeline_id: str
     base_url: str
     at_step: Optional[int] = None
+    dispatch_token: Optional[str] = None
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> "DispatchPayload":
@@ -282,119 +109,11 @@ class DispatchPayload:
             job_id=body["job_id"],
             session_id=body["session_id"],
             replay_context_id=body["replay_context_id"],
-            # Tolerate older dispatch payloads (pre-#154) by defaulting
-            # to empty so the runner can still process them — but a
-            # missing timeline id will result in `_timeline_id` not
-            # being set, with the documented consequence.
             replay_context_timeline_id=body.get("replay_context_timeline_id", ""),
             base_url=body["base_url"],
-            # Tolerate older servers (pre v0.14.8) that don't send
-            # at_step. Runners that depend on it for multi-turn
-            # replay should branch on `payload.at_step is not None`.
             at_step=body.get("at_step"),
+            dispatch_token=body.get("dispatch_token"),
         )
-
-
-# ──────────────────────────────────────────────────────────────────
-# Signature verification
-# ──────────────────────────────────────────────────────────────────
-
-
-SIGNATURE_HEADER = "X-Rewind-Signature"
-JOB_ID_HEADER = "X-Rewind-Job-Id"
-TIMESTAMP_HEADER = "X-Rewind-Timestamp"
-
-#: Maximum allowable clock skew between dispatcher and runner
-#: (review #154 F5). Rejects captured-and-replayed dispatches whose
-#: timestamp is outside this window.
-TIMESTAMP_TOLERANCE_SECS = 300  # 5 minutes
-
-
-def compute_signature(
-    token: str,
-    job_id: str,
-    body_bytes: bytes,
-    timestamp: Optional[int] = None,
-) -> str:
-    """Compute the canonical signature for a dispatch.
-
-    Mirrors ``crates/rewind-web/src/dispatcher.rs::compute_signature``.
-
-    **Review #154 F5:** the signed input now includes a unix-seconds
-    timestamp so replays of captured dispatches outside the tolerance
-    window are rejected. ``timestamp=None`` (the default) preserves
-    the legacy two-line input ``job_id || "\\n" || body`` for tests
-    that pin against the pre-#154 reference vector; production
-    dispatch always passes a timestamp.
-
-    Recipe (with timestamp): ``HMAC-SHA256(token, timestamp || "\\n"
-    || job_id || "\\n" || body)``, hex.
-    """
-    mac = hmac.new(token.encode("utf-8"), digestmod=hashlib.sha256)
-    if timestamp is not None:
-        mac.update(str(timestamp).encode("utf-8"))
-        mac.update(b"\n")
-    mac.update(job_id.encode("utf-8"))
-    mac.update(b"\n")
-    mac.update(body_bytes)
-    return mac.hexdigest()
-
-
-def verify_signature(
-    *,
-    config: RunnerConfig,
-    headers: dict[str, str],
-    body_bytes: bytes,
-    now: Optional[int] = None,
-) -> tuple[bool, Optional[str]]:
-    """Constant-time-compare the supplied signature against the canonical one.
-
-    Returns ``(ok, reason)``. ``ok=True`` means the request is
-    authentic. ``reason`` is a short human-readable hint when
-    verification fails (don't echo it back to untrusted callers).
-
-    **Review #154 F5:** also enforces the timestamp tolerance window.
-    A request whose ``X-Rewind-Timestamp`` is more than
-    :data:`TIMESTAMP_TOLERANCE_SECS` seconds away from ``now`` is
-    refused, defeating long-window replay attacks even if the
-    attacker captured a previously-valid signature.
-    """
-    job_id = _header(headers, JOB_ID_HEADER)
-    if not job_id:
-        return False, "missing X-Rewind-Job-Id"
-
-    sig_header = _header(headers, SIGNATURE_HEADER)
-    if not sig_header or not sig_header.startswith("sha256="):
-        return False, "missing or malformed X-Rewind-Signature"
-    supplied = sig_header[len("sha256=") :]
-
-    ts_header = _header(headers, TIMESTAMP_HEADER)
-    timestamp: Optional[int] = None
-    if ts_header is not None:
-        try:
-            timestamp = int(ts_header)
-        except ValueError:
-            return False, "malformed X-Rewind-Timestamp"
-        current = now if now is not None else int(time.time())
-        if abs(current - timestamp) > TIMESTAMP_TOLERANCE_SECS:
-            return False, (
-                f"timestamp outside tolerance: |{current} - {timestamp}| "
-                f"> {TIMESTAMP_TOLERANCE_SECS}s"
-            )
-
-    expected = compute_signature(config.auth_token, job_id, body_bytes, timestamp)
-    if not hmac.compare_digest(supplied, expected):
-        return False, "signature mismatch"
-    return True, None
-
-
-def _header(headers: dict[str, str], name: str) -> Optional[str]:
-    """Case-insensitive header lookup."""
-    name_l = name.lower()
-    for k, v in headers.items():
-        if k.lower() == name_l:
-            return v
-    return None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -410,25 +129,12 @@ class ProgressReporter:
     Built on top of httpx (already required transitively by other
     rewind_agent modules); falls back to ``urllib`` if httpx is
     absent.
-
-    **Review #154 F4:** the constructor takes ``base_url`` directly
-    so callbacks land back at the *dispatcher's* server URL rather
-    than the runner's own ``REWIND_URL`` env (they may differ when
-    Rewind sits behind a proxy or rewrites). :func:`asgi_handler`
-    builds the reporter from ``payload.base_url``;
-    ``RunnerConfig.rewind_base_url`` is the fallback for direct/test
-    usage.
     """
 
-    def __init__(
-        self,
-        config: RunnerConfig,
-        job_id: str,
-        base_url: Optional[str] = None,
-    ) -> None:
-        self.config = config
+    def __init__(self, job_id: str, base_url: str, dispatch_token: Optional[str] = None) -> None:
         self.job_id = job_id
-        url_root = (base_url or config.rewind_base_url).rstrip("/")
+        self._dispatch_token = dispatch_token
+        url_root = base_url.rstrip("/")
         self._url = f"{url_root}/api/replay-jobs/{job_id}/events"
 
     async def started(self) -> None:
@@ -467,13 +173,11 @@ class ProgressReporter:
         )
 
     async def _post(self, body: dict[str, Any]) -> None:
-        headers = {
-            "Content-Type": "application/json",
-            "X-Rewind-Runner-Auth": self.config.auth_token,
-        }
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._dispatch_token:
+            headers["X-Rewind-Dispatch-Token"] = self._dispatch_token
         body_bytes = json.dumps(body).encode("utf-8")
 
-        # Prefer httpx (async-native); fall back to urllib in a thread.
         try:
             import httpx  # noqa: PLC0415
         except ImportError:
@@ -529,106 +233,39 @@ def handle_replay(fn: HandlerFn) -> HandlerFn:
     return fn
 
 
-#: Recently-seen job_ids for replay protection (Review #154 F5).
-#: Bounded to 10_000 entries to cap memory; the dispatcher keeps
-#: job_ids unique per dispatch attempt so the only way for a job_id
-#: to repeat is a replay attack against the runner's webhook.
-_RECENT_JOB_IDS_CAP = 10_000
-_recent_job_ids: "OrderedDict[str, float]" = OrderedDict()
-_recent_lock: Optional[asyncio.Lock] = None
-
-
-def _get_recent_lock() -> asyncio.Lock:
-    """Lazy-create the lock so module import doesn't require a loop."""
-    global _recent_lock
-    if _recent_lock is None:
-        _recent_lock = asyncio.Lock()
-    return _recent_lock
-
-
-def reset_replay_protection_for_tests() -> None:
-    """Reset the seen-cache + lock. Test-only — never call in prod."""
-    global _recent_lock
-    _recent_job_ids.clear()
-    _recent_lock = None
-
-
-async def _seen_job_id(job_id: str) -> bool:
-    """Return True if this job_id was already accepted recently.
-
-    The dispatcher emits each `job_id` exactly once per real
-    dispatch; a duplicate is either a captured-replay attack OR a
-    legitimate retry from the dispatcher (which we currently don't
-    do, but defensive coding leaves room for v3.1 retries — when
-    that lands we'll switch to a delivery_id field).
-    """
-    async with _get_recent_lock():
-        if job_id in _recent_job_ids:
-            return True
-        _recent_job_ids[job_id] = time.time()
-        # Bound the cache.
-        while len(_recent_job_ids) > _RECENT_JOB_IDS_CAP:
-            _recent_job_ids.popitem(last=False)
-        return False
-
-
 async def asgi_handler(
     *,
-    config: RunnerConfig,
-    headers: dict[str, str],
     body_bytes: bytes,
     handler: HandlerFn,
+    base_url: str = "http://127.0.0.1:4800",
     auto_emit_started: bool = True,
 ) -> tuple[int, dict[str, Any]]:
-    """Verify the signature, dispatch the handler, return ``(status, body)``.
+    """Parse the dispatch body, dispatch the handler, return ``(status, body)``.
 
     Plug this into your web framework. FastAPI example in the
     module docstring above; aiohttp / Starlette adapt the same way.
 
+    No signature verification is performed — this relies on the runner
+    being reachable only from the dispatching Rewind server (co-located
+    sidecar / localhost). The dispatch payload includes a per-job
+    ``dispatch_token`` that the :class:`ProgressReporter` echoes back
+    via ``X-Rewind-Dispatch-Token`` when posting events.
+
     The handler runs as a background task — this function returns
-    ``(202, {"job_id": ...})`` immediately on signature success so
-    the Rewind dispatcher's 5-second timeout is satisfied.
-
-    **Review #154 F5:** before invoking the handler, the function
-    enforces:
-
-    1. Timestamp tolerance via :func:`verify_signature` (rejects
-       replays older than :data:`TIMESTAMP_TOLERANCE_SECS`).
-    2. Process-level idempotency via the ``job_id`` seen-cache —
-       a captured signed dispatch within the timestamp window
-       still cannot re-launch the agent because the second arrival
-       hits the cache and short-circuits with 200 + ``duplicate``.
-
-    **Review #154 F4:** the reporter handed to user code is built
-    from ``payload.base_url`` so event callbacks land at the
-    dispatcher's server, not the runner's local config.
+    ``(202, {"job_id": ...})`` immediately so the Rewind server's
+    timeout is satisfied.
     """
-    ok, reason = verify_signature(
-        config=config, headers=headers, body_bytes=body_bytes
-    )
-    if not ok:
-        logger.warning("rewind runner: signature rejection — %s", reason)
-        return 401, {"error": "signature verification failed"}
-
     try:
         body = json.loads(body_bytes)
         payload = DispatchPayload.from_json(body)
     except (ValueError, KeyError) as e:
         return 400, {"error": f"invalid dispatch body: {e}"}
 
-    # F5: process-level idempotency. The signed input changes per
-    # dispatch (timestamp varies), so an attacker can't forge a fresh
-    # one — but if they captured a signed dispatch INSIDE the 5-min
-    # tolerance window, the timestamp check passes. The seen-cache
-    # closes that residual window at the runner.
-    if await _seen_job_id(payload.job_id):
-        logger.warning(
-            "rewind runner: duplicate dispatch for job %s — likely replay attempt; ignoring",
-            payload.job_id,
-        )
-        return 200, {"job_id": payload.job_id, "accepted": False, "duplicate": True}
-
-    reporter = ProgressReporter(config, payload.job_id, base_url=payload.base_url)
+    reporter = ProgressReporter(
+        payload.job_id,
+        base_url=payload.base_url or base_url,
+        dispatch_token=payload.dispatch_token,
+    )
 
     async def _run() -> None:
         if auto_emit_started:
@@ -645,7 +282,5 @@ async def asgi_handler(
             except Exception:
                 logger.exception("rewind runner: errored event POST also failed")
 
-    # Fire-and-forget: the asyncio task runs to completion in the
-    # background while we return 202 immediately.
     asyncio.create_task(_run())
     return 202, {"job_id": payload.job_id, "accepted": True}

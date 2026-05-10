@@ -1,7 +1,5 @@
 pub mod api;
 pub mod auth;
-pub mod crypto;
-pub mod dispatcher;
 pub mod eval_api;
 pub mod hooks;
 pub mod otlp_ingest;
@@ -110,20 +108,12 @@ pub struct AppState {
     pub hooks: Arc<HookIngestionState>,
     pub otel_config: Option<OtelConfig>,
     /// Bearer token required for protected routes. `None` disables auth (loopback default).
-    /// See `auth::resolve_or_generate_token` and `docs/security-audit.md` §CRITICAL-02.
     pub auth_token: Option<String>,
-    /// AES-256-GCM cipher used to encrypt/decrypt runner auth tokens at rest.
-    /// `None` means `REWIND_RUNNER_SECRET_KEY` was unset at startup; the
-    /// `/api/runners` endpoints return `503` in that case so operators
-    /// see a clear bootstrap error. Phase 3 commit 4. See `crypto.rs`.
-    pub crypto: Option<crypto::CryptoBox>,
-    /// Outbound webhook dispatcher. `None` when `crypto` is None
-    /// (dispatch needs to decrypt runner tokens). Phase 3 commit 5.
-    pub dispatcher: Option<dispatcher::Dispatcher>,
-    /// Public-facing base URL (e.g. `http://localhost:4800`) sent
-    /// in dispatch payloads so runners know where to POST events
-    /// back. Reads from `REWIND_PUBLIC_URL` env var; falls back to
-    /// `http://127.0.0.1:4800`. Phase 3 commit 5.
+    /// Webhook URL for dispatching replay jobs. `None` means replay is unconfigured.
+    /// Set via `REWIND_REPLAY_WEBHOOK_URL` env var.
+    pub replay_webhook_url: Option<String>,
+    /// Public-facing base URL (e.g. `http://localhost:4800`) sent in dispatch
+    /// payloads so runners know where to POST events back.
     pub base_url: String,
 }
 
@@ -135,37 +125,17 @@ pub struct WebServer {
     auth_disabled: bool,
 }
 
-/// Read `REWIND_RUNNER_SECRET_KEY` and build the [`crypto::CryptoBox`].
-///
-/// **Review #153 MEDIUM 5 — fail-fast on misconfig:** if the env var
-/// is *unset*, returns `None` (runner endpoints will 503 with a clear
-/// bootstrap error). If the env var is *set but malformed* (bad
-/// base64, wrong key length), this **panics at startup** with an
-/// operator-actionable message rather than silently booting a server
-/// whose runner registry can never dispatch.
-///
-/// This matches the docstring on `crypto::CryptoBox::from_env`
-/// ("operator misconfig — fail loud at startup"). Previously the
-/// caller logged-and-swallowed, which made the failure invisible
-/// until the first `/api/runners` 503.
-fn bootstrap_crypto() -> Option<crypto::CryptoBox> {
-    match crypto::CryptoBox::from_env() {
-        Ok(maybe) => maybe,
-        Err(e) => panic!(
-            "FATAL: {} is set but malformed: {e}\n\
-             Generate a fresh key with `openssl rand -base64 32` and set it via the env var.",
-            crypto::KEY_ENV_VAR
-        ),
+fn bootstrap_replay_webhook_url() -> Option<String> {
+    let url = std::env::var("REWIND_REPLAY_WEBHOOK_URL").ok()?;
+    if let Err(reason) = url_guard::validate_webhook_url_sync(&url) {
+        tracing::error!(
+            "REWIND_REPLAY_WEBHOOK_URL is invalid ({url}): {reason} — replay dispatch disabled"
+        );
+        return None;
     }
+    Some(url)
 }
 
-/// Read `REWIND_PUBLIC_URL` (the externally-reachable base URL the
-/// runner SDK will POST events to). Falls back to
-/// `http://127.0.0.1:4800` for local development.
-///
-/// Operators running Rewind behind a proxy or on a non-default
-/// host MUST set this; otherwise dispatched runners receive
-/// `127.0.0.1:4800` in the payload and fail to call back.
 pub fn bootstrap_base_url() -> String {
     std::env::var("REWIND_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:4800".to_string())
 }
@@ -173,15 +143,8 @@ pub fn bootstrap_base_url() -> String {
 impl WebServer {
     pub fn new(store: Arc<Mutex<Store>>, event_tx: broadcast::Sender<StoreEvent>) -> Self {
         let otel_config = OtelConfig::from_env();
-        let crypto = bootstrap_crypto();
+        let replay_webhook_url = bootstrap_replay_webhook_url();
         let base_url = bootstrap_base_url();
-        let dispatcher = crypto.clone().and_then(|c| {
-            dispatcher::Dispatcher::new(c, base_url.clone())
-                .map_err(|e| {
-                    tracing::error!("dispatcher init failed: {e}");
-                })
-                .ok()
-        });
         WebServer {
             state: AppState {
                 store,
@@ -189,8 +152,7 @@ impl WebServer {
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
                 auth_token: None,
-                crypto,
-                dispatcher,
+                replay_webhook_url,
                 base_url,
             },
             dev_mode: false,
@@ -201,15 +163,8 @@ impl WebServer {
     pub fn new_standalone(store: Store) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let otel_config = OtelConfig::from_env();
-        let crypto = bootstrap_crypto();
+        let replay_webhook_url = bootstrap_replay_webhook_url();
         let base_url = bootstrap_base_url();
-        let dispatcher = crypto.clone().and_then(|c| {
-            dispatcher::Dispatcher::new(c, base_url.clone())
-                .map_err(|e| {
-                    tracing::error!("dispatcher init failed: {e}");
-                })
-                .ok()
-        });
         WebServer {
             state: AppState {
                 store: Arc::new(Mutex::new(store)),
@@ -217,8 +172,7 @@ impl WebServer {
                 hooks: Arc::new(HookIngestionState::new()),
                 otel_config,
                 auth_token: None,
-                crypto,
-                dispatcher,
+                replay_webhook_url,
                 base_url,
             },
             dev_mode: false,
@@ -436,13 +390,8 @@ impl WebServer {
         let eval_routes = eval_api::routes(self.state.clone());
         let hook_routes = hooks::routes(self.state.clone());
         let ws_route = ws::routes(self.state.clone());
-
         let otlp_routes = otlp_ingest::routes(self.state.clone());
 
-        // Compose protected routes (state-bearing APIs, WS, OTLP ingest) and
-        // attach auth middleware at this layer. `/_rewind/health` and the SPA
-        // static fallback remain open so liveness probes and the UI shell can
-        // load without a token.
         let protected = Router::new()
             .merge(otlp_routes)
             .nest("/api", api_routes)
@@ -454,9 +403,8 @@ impl WebServer {
                 auth::auth_middleware,
             ));
 
-        // Phase 3 commit 6: runner-callback route mounts OUTSIDE the
-        // bearer middleware. Runners authenticate via X-Rewind-Runner-Auth
-        // header inside the handler instead.
+        // Replay-job event callbacks mount OUTSIDE bearer auth — the runner
+        // is a co-located sidecar or trusted process.
         let runner_callbacks = runners::runner_callback_routes()
             .with_state(self.state.clone());
 

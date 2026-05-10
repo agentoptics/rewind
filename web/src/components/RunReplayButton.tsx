@@ -1,23 +1,7 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
 import { Play, Loader2, CheckCircle2, AlertCircle, Rocket, X } from 'lucide-react'
-import { api } from '@/lib/api'
 import { useReplayJob } from '@/hooks/use-replay-job'
 
-/**
- * Dashboard "Run replay" button (Phase 3 commit 8/13).
- *
- * Renders inline near the fork-button on the session-detail and
- * fork-timeline views. Clicking opens a modal that:
- *   1. Lists active runners (filtered to status=active).
- *   2. Lets the operator pick one + confirm a replay from a step.
- *   3. POSTs /api/sessions/{sid}/replay-jobs (shape A: server
- *      forks + creates context + dispatches).
- *   4. Streams progress over WebSocket via useReplayJob.
- *
- * If no runners are registered, the modal shows the CLI fallback
- * command (existing `rewind replay` flow).
- */
 export interface RunReplayButtonProps {
   sessionId: string
   sourceTimelineId: string
@@ -35,7 +19,7 @@ export function RunReplayButton({
       <button
         onClick={() => setOpen(true)}
         className="flex items-center gap-1.5 px-2.5 py-1 text-xs bg-cyan-700 hover:bg-cyan-600 text-white rounded transition-colors"
-        title="Dispatch this replay to a registered runner"
+        title="Run a replay from this step"
       >
         <Play size={12} /> Run replay
       </button>
@@ -64,12 +48,6 @@ export function ReplayJobModal({
   atStep,
   onClose,
 }: ReplayJobModalProps) {
-  const { data: runners = [], isLoading } = useQuery({
-    queryKey: ['runners'],
-    queryFn: api.runners,
-  })
-  const activeRunners = runners.filter((r) => r.status === 'active')
-  const [runnerId, setRunnerId] = useState<string>(activeRunners[0]?.id ?? '')
   const [strictMatch, setStrictMatch] = useState(false)
 
   const {
@@ -80,15 +58,8 @@ export function ReplayJobModal({
     reset,
   } = useReplayJob(sessionId)
 
-  // Update default runner once data loads.
-  if (!runnerId && activeRunners.length > 0) {
-    setRunnerId(activeRunners[0].id)
-  }
-
   const submit = () => {
-    if (!runnerId) return
     dispatch({
-      runner_id: runnerId,
       source_timeline_id: sourceTimelineId,
       at_step: atStep,
       strict_match: strictMatch,
@@ -100,17 +71,13 @@ export function ReplayJobModal({
     onClose()
   }
 
-  // Disable close affordances mid-dispatch so the user can't drop
-  // an in-flight job by accident. The Job-progress view has its own
-  // explicit Close button; the modal still closes from any state via
-  // the JobProgressView once the job reaches a terminal state.
   const closeDisabled = isDispatching
 
   return (
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Run replay on a registered runner"
+      aria-label="Run replay"
       className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
       onClick={() => {
         if (!closeDisabled) handleClose()
@@ -140,142 +107,54 @@ export function ReplayJobModal({
         <div className="px-5 py-4 space-y-4">
           <p className="text-xs text-neutral-500">
             Forks at step {atStep} on the selected timeline and
-            dispatches a replay job to a registered runner. Progress
-            streams here live via WebSocket.
+            dispatches a replay job. Progress streams here live via
+            WebSocket.
           </p>
 
-          {isLoading ? (
-            <div className="text-center py-6 text-neutral-500 text-sm">
-              Loading runners...
-            </div>
-          ) : activeRunners.length === 0 ? (
-            <NoRunnersFallback sessionId={sessionId} atStep={atStep} />
-          ) : !job ? (
-            <RunnerPickForm
-              runners={activeRunners}
-              runnerId={runnerId}
-              onRunnerChange={setRunnerId}
-              strictMatch={strictMatch}
-              onStrictMatchChange={setStrictMatch}
-              onSubmit={submit}
-              isDispatching={isDispatching}
-              error={dispatchError?.message ?? null}
-            />
-          ) : (
+          {job ? (
             <JobProgressView job={job} onClose={handleClose} />
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function RunnerPickForm({
-  runners,
-  runnerId,
-  onRunnerChange,
-  strictMatch,
-  onStrictMatchChange,
-  onSubmit,
-  isDispatching,
-  error,
-}: {
-  runners: { id: string; name: string }[]
-  runnerId: string
-  onRunnerChange: (id: string) => void
-  strictMatch: boolean
-  onStrictMatchChange: (v: boolean) => void
-  onSubmit: () => void
-  isDispatching: boolean
-  error: string | null
-}) {
-  return (
-    <div className="space-y-3">
-      <div>
-        <label className="block text-xs text-neutral-400 mb-1">
-          Runner
-        </label>
-        <select
-          value={runnerId}
-          onChange={(e) => onRunnerChange(e.target.value)}
-          className="w-full px-2 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200"
-        >
-          {runners.map((r) => (
-            <option key={r.id} value={r.id}>
-              {r.name} ({r.id.slice(0, 8)})
-            </option>
-          ))}
-        </select>
-      </div>
-      <label className="flex items-center gap-2 text-xs text-neutral-400">
-        <input
-          type="checkbox"
-          checked={strictMatch}
-          onChange={(e) => onStrictMatchChange(e.target.checked)}
-        />
-        <span>
-          Strict cache match
-          <span className="text-neutral-600">
-            {' '}
-            (HTTP 409 on body divergence; otherwise warn-only)
-          </span>
-        </span>
-      </label>
-      {error && (
-        <div className="text-xs text-red-400 bg-red-950/40 border border-red-800 rounded p-2">
-          {error}
-        </div>
-      )}
-      <div className="flex justify-end gap-2 pt-2">
-        <button
-          onClick={onSubmit}
-          disabled={isDispatching || !runnerId}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-cyan-600 hover:bg-cyan-500 disabled:bg-neutral-700 text-white rounded"
-        >
-          {isDispatching ? (
-            <>
-              <Loader2 size={14} className="animate-spin" /> Dispatching...
-            </>
           ) : (
-            <>
-              <Play size={14} /> Dispatch
-            </>
+            <div className="space-y-3">
+              <label className="flex items-center gap-2 text-xs text-neutral-400">
+                <input
+                  type="checkbox"
+                  checked={strictMatch}
+                  onChange={(e) => setStrictMatch(e.target.checked)}
+                />
+                <span>
+                  Strict cache match
+                  <span className="text-neutral-600">
+                    {' '}
+                    (HTTP 409 on body divergence; otherwise warn-only)
+                  </span>
+                </span>
+              </label>
+              {dispatchError && (
+                <div className="text-xs text-red-400 bg-red-950/40 border border-red-800 rounded p-2">
+                  {dispatchError.message}
+                </div>
+              )}
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  onClick={submit}
+                  disabled={isDispatching}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-cyan-600 hover:bg-cyan-500 disabled:bg-neutral-700 text-white rounded"
+                >
+                  {isDispatching ? (
+                    <>
+                      <Loader2 size={14} className="animate-spin" /> Dispatching...
+                    </>
+                  ) : (
+                    <>
+                      <Play size={14} /> Dispatch
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
           )}
-        </button>
+        </div>
       </div>
-    </div>
-  )
-}
-
-function NoRunnersFallback({
-  sessionId,
-  atStep,
-}: {
-  sessionId: string
-  atStep: number
-}) {
-  return (
-    <div className="space-y-3">
-      <p className="text-sm text-neutral-300">
-        No active runners registered.
-      </p>
-      <p className="text-xs text-neutral-500">
-        Register one on the{' '}
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault()
-            window.location.hash = '#/runners'
-          }}
-          className="text-cyan-400 hover:underline"
-        >
-          Runners page
-        </a>
-        , or run this replay locally via the CLI:
-      </p>
-      <pre className="px-3 py-2 bg-black border border-neutral-700 rounded text-xs text-cyan-300 overflow-x-auto">
-        rewind replay {sessionId.slice(0, 8)}... --from {atStep}
-      </pre>
     </div>
   )
 }
