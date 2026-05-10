@@ -134,13 +134,11 @@ impl Store {
     /// Insert a new replay job. The `runner_id` column is always set to
     /// NULL (the runner registry has been removed).
     pub fn create_replay_job(&self, job: &ReplayJob) -> Result<()> {
-        if !job.state.is_terminal() {
-            if job.replay_context_id.is_none() {
-                return Err(anyhow!(
-                    "replay_jobs.replay_context_id is required for non-terminal jobs (state={}); null is only allowed for completed/errored historical rows",
-                    job.state.as_str()
-                ));
-            }
+        if !job.state.is_terminal() && job.replay_context_id.is_none() {
+            return Err(anyhow!(
+                "replay_jobs.replay_context_id is required for non-terminal jobs (state={}); null is only allowed for completed/errored historical rows",
+                job.state.as_str()
+            ));
         }
         self.conn.execute(
             "INSERT INTO replay_jobs (id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total, dispatch_token)
