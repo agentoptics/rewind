@@ -101,6 +101,7 @@ class DispatchPayload:
     replay_context_timeline_id: str
     base_url: str
     at_step: Optional[int] = None
+    dispatch_token: Optional[str] = None
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> "DispatchPayload":
@@ -111,6 +112,7 @@ class DispatchPayload:
             replay_context_timeline_id=body.get("replay_context_timeline_id", ""),
             base_url=body["base_url"],
             at_step=body.get("at_step"),
+            dispatch_token=body.get("dispatch_token"),
         )
 
 
@@ -129,8 +131,9 @@ class ProgressReporter:
     absent.
     """
 
-    def __init__(self, job_id: str, base_url: str) -> None:
+    def __init__(self, job_id: str, base_url: str, dispatch_token: Optional[str] = None) -> None:
         self.job_id = job_id
+        self._dispatch_token = dispatch_token
         url_root = base_url.rstrip("/")
         self._url = f"{url_root}/api/replay-jobs/{job_id}/events"
 
@@ -170,7 +173,9 @@ class ProgressReporter:
         )
 
     async def _post(self, body: dict[str, Any]) -> None:
-        headers = {"Content-Type": "application/json"}
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._dispatch_token:
+            headers["X-Rewind-Dispatch-Token"] = self._dispatch_token
         body_bytes = json.dumps(body).encode("utf-8")
 
         try:
@@ -240,6 +245,12 @@ async def asgi_handler(
     Plug this into your web framework. FastAPI example in the
     module docstring above; aiohttp / Starlette adapt the same way.
 
+    No signature verification is performed — this relies on the runner
+    being reachable only from the dispatching Rewind server (co-located
+    sidecar / localhost). The dispatch payload includes a per-job
+    ``dispatch_token`` that the :class:`ProgressReporter` echoes back
+    via ``X-Rewind-Dispatch-Token`` when posting events.
+
     The handler runs as a background task — this function returns
     ``(202, {"job_id": ...})`` immediately so the Rewind server's
     timeout is satisfied.
@@ -250,7 +261,11 @@ async def asgi_handler(
     except (ValueError, KeyError) as e:
         return 400, {"error": f"invalid dispatch body: {e}"}
 
-    reporter = ProgressReporter(payload.job_id, base_url=payload.base_url or base_url)
+    reporter = ProgressReporter(
+        payload.job_id,
+        base_url=payload.base_url or base_url,
+        dispatch_token=payload.dispatch_token,
+    )
 
     async def _run() -> None:
         if auto_emit_started:

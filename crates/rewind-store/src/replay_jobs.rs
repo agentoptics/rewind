@@ -60,6 +60,11 @@ impl ReplayJobState {
 /// `runner_id` is kept as `Option<String>` for backward compatibility with
 /// existing databases that still have the column populated from the old
 /// runner registry. New jobs always set it to `None`.
+///
+/// `dispatch_token` is a random nonce generated when the job is created and
+/// sent in the webhook payload. The runner must echo it back via the
+/// `X-Rewind-Dispatch-Token` header when posting events — this proves the
+/// caller received the original dispatch without requiring key management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayJob {
     pub id: String,
@@ -77,6 +82,7 @@ pub struct ReplayJob {
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub progress_step: u32,
     pub progress_total: Option<u32>,
+    pub dispatch_token: Option<String>,
 }
 
 // -- ReplayJobEvent -----------------------------------------------------------
@@ -137,8 +143,8 @@ impl Store {
             }
         }
         self.conn.execute(
-            "INSERT INTO replay_jobs (id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total)
-             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO replay_jobs (id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total, dispatch_token)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 job.id,
                 job.session_id,
@@ -154,6 +160,7 @@ impl Store {
                 job.lease_expires_at.as_ref().map(|t| t.to_rfc3339()),
                 job.progress_step,
                 job.progress_total,
+                job.dispatch_token,
             ],
         )?;
         Ok(())
@@ -161,7 +168,7 @@ impl Store {
 
     pub fn get_replay_job(&self, id: &str) -> Result<Option<ReplayJob>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total
+            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total, dispatch_token
              FROM replay_jobs WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], Self::row_to_replay_job)?;
@@ -171,7 +178,7 @@ impl Store {
     /// List jobs for a session, newest first.
     pub fn list_replay_jobs_by_session(&self, session_id: &str) -> Result<Vec<ReplayJob>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total
+            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total, dispatch_token
              FROM replay_jobs WHERE session_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![session_id], Self::row_to_replay_job)?;
@@ -396,7 +403,7 @@ impl Store {
     /// `dispatch_deadline_at < now`.
     pub fn list_dispatch_deadline_expired(&self, now: DateTime<Utc>) -> Result<Vec<ReplayJob>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total
+            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total, dispatch_token
              FROM replay_jobs
              WHERE state = 'dispatched' AND dispatch_deadline_at IS NOT NULL AND dispatch_deadline_at < ?1
              ORDER BY dispatch_deadline_at ASC LIMIT 1000",
@@ -410,7 +417,7 @@ impl Store {
     pub fn list_expired_replay_jobs(&self) -> Result<Vec<ReplayJob>> {
         let now = Utc::now().to_rfc3339();
         let mut stmt = self.conn.prepare(
-            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total
+            "SELECT id, runner_id, session_id, replay_context_id, state, error_message, error_stage, created_at, dispatched_at, started_at, completed_at, dispatch_deadline_at, lease_expires_at, progress_step, progress_total, dispatch_token
              FROM replay_jobs
              WHERE state IN ('dispatched', 'in_progress')
                AND (
@@ -488,6 +495,7 @@ impl Store {
             lease_expires_at: parse_dt_opt(row, 12)?,
             progress_step: row.get(13)?,
             progress_total: row.get(14)?,
+            dispatch_token: row.get(15)?,
         })
     }
 
@@ -608,6 +616,7 @@ mod tests {
             lease_expires_at: None,
             progress_step: 0,
             progress_total: None,
+            dispatch_token: None,
         }
     }
 
@@ -896,6 +905,7 @@ mod tests {
             lease_expires_at: None,
             progress_step: 0,
             progress_total: None,
+            dispatch_token: None,
         };
         let err = store.create_replay_job(&job).unwrap_err();
         assert!(
@@ -925,6 +935,7 @@ mod tests {
             lease_expires_at: None,
             progress_step: 0,
             progress_total: None,
+            dispatch_token: None,
         };
         store.create_replay_job(&job).unwrap();
 
@@ -955,6 +966,7 @@ mod tests {
             lease_expires_at: None,
             progress_step: 0,
             progress_total: None,
+            dispatch_token: None,
         };
         store.create_replay_job(&job).unwrap();
     }

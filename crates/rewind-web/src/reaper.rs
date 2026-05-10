@@ -258,6 +258,7 @@ mod tests {
             lease_expires_at: Some(now + ChronoDuration::seconds(300)),
             progress_step: 0,
             progress_total: None,
+            dispatch_token: None,
         }
     }
 
@@ -329,6 +330,7 @@ mod tests {
             lease_expires_at: Some(now - ChronoDuration::seconds(60)),
             progress_step: 3,
             progress_total: Some(10),
+            dispatch_token: None,
         };
         let job_id = job.id.clone();
         store.create_replay_job(&job).unwrap();

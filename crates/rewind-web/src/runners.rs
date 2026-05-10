@@ -11,7 +11,7 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::Json,
     routing::{get, post},
     Router,
@@ -41,8 +41,14 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Runner-callback route for posting replay job events.
-/// Mounted OUTSIDE bearer auth middleware — no authentication required
-/// (the runner is a co-located sidecar or trusted process).
+/// Mounted OUTSIDE bearer auth middleware — authenticated by a per-job
+/// dispatch token (`X-Rewind-Dispatch-Token` header) that proves the
+/// caller received the original dispatch payload.
+///
+/// **Trust model:** the server and runner are co-located (same pod /
+/// localhost). The dispatch token prevents other processes on the same
+/// network from mutating job state; it is NOT a substitute for network
+/// isolation if the server port is exposed beyond the pod.
 pub fn runner_callback_routes() -> Router<AppState> {
     Router::new().route(
         "/api/replay-jobs/{id}/events",
@@ -226,6 +232,7 @@ async fn create_replay_job(
             }
         };
 
+        let dispatch_token = Uuid::new_v4().to_string();
         let job = ReplayJob {
             id: Uuid::new_v4().to_string(),
             runner_id: None,
@@ -242,15 +249,21 @@ async fn create_replay_job(
             lease_expires_at: None,
             progress_step: 0,
             progress_total: None,
+            dispatch_token: Some(dispatch_token),
         };
         store.create_replay_job(&job).map_err(internal)?;
+        // Advance Pending → Dispatched BEFORE the async network call.
+        // This prevents a race where the runner calls back with `started`
+        // before the spawn block runs, hitting the state-machine guard
+        // (Pending → InProgress is illegal; only Dispatched → InProgress
+        // is allowed).
         store
             .advance_replay_job_state(&job.id, ReplayJobState::Dispatched, None, None)
             .map_err(internal)?;
         (job, fork_timeline_id, at_step)
     };
 
-    // Dispatch via plain POST to the configured webhook URL.
+    // Dispatch via POST to the configured webhook URL.
     let job_clone = job.clone();
     let store_arc = state.store.clone();
     let event_tx = state.event_tx.clone();
@@ -264,11 +277,12 @@ async fn create_replay_job(
             "replay_context_timeline_id": timeline_for_payload,
             "at_step": at_step,
             "base_url": base_url,
+            "dispatch_token": job_clone.dispatch_token,
         });
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_default();
+            .expect("reqwest client builder should not fail with a simple timeout");
         let result = client
             .post(&webhook_url)
             .header("Content-Type", "application/json")
@@ -281,23 +295,21 @@ async fn create_replay_job(
             Ok(resp) => Some(format!("webhook returned {}", resp.status())),
             Err(e) => Some(format!("webhook dispatch failed: {e}")),
         };
-        if let Some(err_msg) = &outcome_err {
-            if let Ok(store) = store_arc.lock() {
+        if let Ok(store) = store_arc.lock() {
+            if let Some(err_msg) = &outcome_err {
                 let _ = store.advance_replay_job_state(
                     &job_clone.id,
                     ReplayJobState::Errored,
                     Some(err_msg),
                     Some("dispatch"),
                 );
+            } else {
+                let _ = store.set_dispatch_deadline_and_lease(
+                    &job_clone.id,
+                    Utc::now() + chrono::Duration::seconds(10),
+                    Utc::now() + chrono::Duration::seconds(INITIAL_LEASE_SECS),
+                );
             }
-        } else if let Ok(store) = store_arc.lock() {
-            let _ = store.set_dispatch_deadline_and_lease(
-                &job_clone.id,
-                Utc::now() + chrono::Duration::seconds(10),
-                Utc::now() + chrono::Duration::seconds(INITIAL_LEASE_SECS),
-            );
-        }
-        if let Ok(store) = store_arc.lock() {
             if let Ok(Some(after)) = store.get_replay_job(&job_clone.id) {
                 let _ = event_tx.send(StoreEvent::ReplayJobUpdated {
                     job_id: after.id.clone(),
@@ -420,10 +432,14 @@ pub struct PostReplayJobEventResponse {
 
 /// `POST /api/replay-jobs/{id}/events`
 ///
-/// No authentication required — the runner is a co-located sidecar
-/// or trusted process communicating over localhost/cluster-internal network.
+/// Authenticated by the `X-Rewind-Dispatch-Token` header: the server
+/// generates a random token when creating the job and sends it in the
+/// dispatch payload. The runner echoes it back here. This proves the
+/// caller received the original dispatch without requiring any key
+/// management or shared secrets.
 async fn post_replay_job_event(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
     Json(req): Json<PostReplayJobEventRequest>,
 ) -> Result<(StatusCode, Json<PostReplayJobEventResponse>), (StatusCode, Json<ErrorBody>)> {
@@ -436,6 +452,23 @@ async fn post_replay_job_event(
         .get_replay_job(&job_id)
         .map_err(internal)?
         .ok_or_else(|| not_found("replay_job"))?;
+
+    if let Some(expected_token) = &job.dispatch_token {
+        let provided = headers
+            .get("X-Rewind-Dispatch-Token")
+            .and_then(|v| v.to_str().ok());
+        match provided {
+            Some(t) if t == expected_token => {}
+            _ => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorBody {
+                        error: "missing or invalid X-Rewind-Dispatch-Token header".to_string(),
+                    }),
+                ));
+            }
+        }
+    }
 
     let event = ReplayJobEvent {
         id: Uuid::new_v4().to_string(),

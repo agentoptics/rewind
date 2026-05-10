@@ -126,7 +126,14 @@ pub struct WebServer {
 }
 
 fn bootstrap_replay_webhook_url() -> Option<String> {
-    std::env::var("REWIND_REPLAY_WEBHOOK_URL").ok()
+    let url = std::env::var("REWIND_REPLAY_WEBHOOK_URL").ok()?;
+    if let Err(reason) = url_guard::validate_webhook_url_sync(&url) {
+        tracing::error!(
+            "REWIND_REPLAY_WEBHOOK_URL is invalid ({url}): {reason} — replay dispatch disabled"
+        );
+        return None;
+    }
+    Some(url)
 }
 
 pub fn bootstrap_base_url() -> String {

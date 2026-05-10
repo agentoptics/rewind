@@ -395,6 +395,8 @@ impl Store {
         //   - replay_jobs: state machine pending → dispatched → in_progress →
         //     completed/errored, with lease columns for the reaper task
         //   - replay_job_events: append-only event log per job
+        // One-time migration: drop the orphaned runners table from pre-0.15.0 databases.
+        self.conn.execute("DROP TABLE IF EXISTS runners", [])?;
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS replay_jobs (
                 id TEXT PRIMARY KEY,
@@ -412,10 +414,16 @@ impl Store {
                 dispatch_deadline_at TEXT,
                 lease_expires_at TEXT,
                 progress_step INTEGER NOT NULL DEFAULT 0,
-                progress_total INTEGER
+                progress_total INTEGER,
+                dispatch_token TEXT
             )",
             [],
         )?;
+        // Migration: add dispatch_token column to existing replay_jobs tables.
+        let _ = self.conn.execute(
+            "ALTER TABLE replay_jobs ADD COLUMN dispatch_token TEXT",
+            [],
+        );
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_replay_jobs_state ON replay_jobs(state)",
             [],

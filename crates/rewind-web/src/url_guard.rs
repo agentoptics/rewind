@@ -18,6 +18,50 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Synchronous URL validation for webhook URLs configured at startup.
+///
+/// Unlike [`validate_export_endpoint`], this does NOT perform DNS resolution
+/// (which requires async / a running tokio runtime). Instead it validates:
+/// 1. HTTP(S) scheme
+/// 2. Well-formed host/port
+/// 3. If the host is an IP literal, reject cloud metadata / RFC 1918 / link-local
+///    but explicitly **allow loopback** (127.0.0.0/8, ::1) since the sidecar
+///    deployment model dispatches to localhost.
+pub fn validate_webhook_url_sync(url: &str) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("must start with http:// or https://".to_string());
+    }
+    let (host, _port) =
+        parse_host_port(url).ok_or_else(|| "URL is malformed".to_string())?;
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_non_loopback(ip) {
+            return Err(format!(
+                "resolves to blocked IP {ip} (private/link-local/reserved); \
+                 SSRF protection — only public or loopback targets allowed"
+            ));
+        }
+        return Ok(());
+    }
+
+    if looks_like_numeric_ip(&host) {
+        return Err(format!(
+            "host '{host}' looks like a non-standard IP literal (rejected for SSRF safety)"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Like `is_blocked` but allows loopback addresses (the expected target
+/// for sidecar-to-runner dispatch on the same pod).
+fn is_blocked_non_loopback(ip: IpAddr) -> bool {
+    if ip.is_loopback() {
+        return false;
+    }
+    is_blocked(ip)
+}
+
 /// Reject an endpoint URL if it's malformed, non-HTTP(S), or resolves to any
 /// non-public-unicast IP.
 ///

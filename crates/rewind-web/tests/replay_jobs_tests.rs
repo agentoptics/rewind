@@ -58,12 +58,23 @@ fn setup_no_webhook() -> (Router, Router, Arc<Mutex<Store>>, TempDir) {
 }
 
 async fn json_post(app: Router, uri: &str, body: Value) -> (StatusCode, Value) {
-    let req = Request::builder()
+    json_post_with_headers(app, uri, body, vec![]).await
+}
+
+async fn json_post_with_headers(
+    app: Router,
+    uri: &str,
+    body: Value,
+    extra_headers: Vec<(&str, &str)>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
         .method("POST")
         .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
+        .header(header::CONTENT_TYPE, "application/json");
+    for (k, v) in extra_headers {
+        builder = builder.header(k, v);
+    }
+    let req = builder.body(Body::from(body.to_string())).unwrap();
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -257,6 +268,7 @@ async fn create_replay_job_rejects_context_in_use() {
             lease_expires_at: Some(Utc::now() + chrono::Duration::seconds(300)),
             progress_step: 0,
             progress_total: None,
+            dispatch_token: None,
         };
         s.create_replay_job(&job).unwrap();
     }
@@ -326,6 +338,7 @@ async fn event_endpoint_started_transitions_dispatched_to_in_progress() {
     let (_api, callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
     let (session_id, _, ctx_id) = seed_session_and_context(&store);
 
+    let token = Uuid::new_v4().to_string();
     let job_id = {
         let s = store.lock().unwrap();
         let job = ReplayJob {
@@ -344,16 +357,18 @@ async fn event_endpoint_started_transitions_dispatched_to_in_progress() {
             lease_expires_at: Some(Utc::now() + chrono::Duration::seconds(300)),
             progress_step: 0,
             progress_total: None,
+            dispatch_token: Some(token.clone()),
         };
         let id = job.id.clone();
         s.create_replay_job(&job).unwrap();
         id
     };
 
-    let (status, body) = json_post(
+    let (status, body) = json_post_with_headers(
         callbacks,
         &format!("/api/replay-jobs/{job_id}/events"),
         json!({"event_type": "started"}),
+        vec![("X-Rewind-Dispatch-Token", &token)],
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -372,6 +387,7 @@ async fn event_endpoint_progress_updates_step() {
     let (_api, callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
     let (session_id, _, ctx_id) = seed_session_and_context(&store);
 
+    let token = Uuid::new_v4().to_string();
     let job_id = {
         let s = store.lock().unwrap();
         let job = ReplayJob {
@@ -390,16 +406,18 @@ async fn event_endpoint_progress_updates_step() {
             lease_expires_at: Some(Utc::now() + chrono::Duration::seconds(300)),
             progress_step: 0,
             progress_total: None,
+            dispatch_token: Some(token.clone()),
         };
         let id = job.id.clone();
         s.create_replay_job(&job).unwrap();
         id
     };
 
-    let (status, _body) = json_post(
+    let (status, _body) = json_post_with_headers(
         callbacks,
         &format!("/api/replay-jobs/{job_id}/events"),
         json!({"event_type": "progress", "step_number": 7, "progress_total": 20}),
+        vec![("X-Rewind-Dispatch-Token", &token)],
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -417,6 +435,7 @@ async fn event_endpoint_completed_transitions_to_completed() {
     let (_api, callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
     let (session_id, _, ctx_id) = seed_session_and_context(&store);
 
+    let token = Uuid::new_v4().to_string();
     let job_id = {
         let s = store.lock().unwrap();
         let job = ReplayJob {
@@ -435,16 +454,18 @@ async fn event_endpoint_completed_transitions_to_completed() {
             lease_expires_at: Some(Utc::now() + chrono::Duration::seconds(300)),
             progress_step: 5,
             progress_total: Some(5),
+            dispatch_token: Some(token.clone()),
         };
         let id = job.id.clone();
         s.create_replay_job(&job).unwrap();
         id
     };
 
-    let (status, _body) = json_post(
+    let (status, _body) = json_post_with_headers(
         callbacks,
         &format!("/api/replay-jobs/{job_id}/events"),
         json!({"event_type": "completed"}),
+        vec![("X-Rewind-Dispatch-Token", &token)],
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -460,6 +481,7 @@ async fn event_endpoint_returns_409_on_illegal_transition() {
     let (_api, callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
     let (session_id, _, ctx_id) = seed_session_and_context(&store);
 
+    let token = Uuid::new_v4().to_string();
     let job_id = {
         let s = store.lock().unwrap();
         let job = ReplayJob {
@@ -478,19 +500,108 @@ async fn event_endpoint_returns_409_on_illegal_transition() {
             lease_expires_at: None,
             progress_step: 0,
             progress_total: None,
+            dispatch_token: Some(token.clone()),
         };
         let id = job.id.clone();
         s.create_replay_job(&job).unwrap();
         id
     };
 
-    let (status, body) = json_post(
+    let (status, body) = json_post_with_headers(
         callbacks,
         &format!("/api/replay-jobs/{job_id}/events"),
         json!({"event_type": "progress", "step_number": 1}),
+        vec![("X-Rewind-Dispatch-Token", &token)],
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["accepted"], false);
     assert!(body["reason"].as_str().unwrap().contains("state machine"));
+}
+
+// ── Dispatch token enforcement ───────────────────────────────────
+
+#[tokio::test]
+async fn event_endpoint_rejects_missing_dispatch_token() {
+    let (webhook_url, _rx) = spawn_webhook_stub().await;
+    let (_api, callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
+    let (session_id, _, ctx_id) = seed_session_and_context(&store);
+
+    let job_id = {
+        let s = store.lock().unwrap();
+        let job = ReplayJob {
+            id: Uuid::new_v4().to_string(),
+            runner_id: None,
+            session_id,
+            replay_context_id: Some(ctx_id),
+            state: ReplayJobState::Dispatched,
+            error_message: None,
+            error_stage: None,
+            created_at: Utc::now(),
+            dispatched_at: Some(Utc::now()),
+            started_at: None,
+            completed_at: None,
+            dispatch_deadline_at: Some(Utc::now() + chrono::Duration::seconds(60)),
+            lease_expires_at: Some(Utc::now() + chrono::Duration::seconds(300)),
+            progress_step: 0,
+            progress_total: None,
+            dispatch_token: Some("secret-token-123".to_string()),
+        };
+        let id = job.id.clone();
+        s.create_replay_job(&job).unwrap();
+        id
+    };
+
+    // No token header — should be rejected
+    let (status, body) = json_post(
+        callbacks,
+        &format!("/api/replay-jobs/{job_id}/events"),
+        json!({"event_type": "started"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body["error"].as_str().unwrap().contains("Dispatch-Token"));
+}
+
+#[tokio::test]
+async fn event_endpoint_rejects_wrong_dispatch_token() {
+    let (webhook_url, _rx) = spawn_webhook_stub().await;
+    let (_api, callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
+    let (session_id, _, ctx_id) = seed_session_and_context(&store);
+
+    let job_id = {
+        let s = store.lock().unwrap();
+        let job = ReplayJob {
+            id: Uuid::new_v4().to_string(),
+            runner_id: None,
+            session_id,
+            replay_context_id: Some(ctx_id),
+            state: ReplayJobState::Dispatched,
+            error_message: None,
+            error_stage: None,
+            created_at: Utc::now(),
+            dispatched_at: Some(Utc::now()),
+            started_at: None,
+            completed_at: None,
+            dispatch_deadline_at: Some(Utc::now() + chrono::Duration::seconds(60)),
+            lease_expires_at: Some(Utc::now() + chrono::Duration::seconds(300)),
+            progress_step: 0,
+            progress_total: None,
+            dispatch_token: Some("correct-token".to_string()),
+        };
+        let id = job.id.clone();
+        s.create_replay_job(&job).unwrap();
+        id
+    };
+
+    // Wrong token — should be rejected
+    let (status, body) = json_post_with_headers(
+        callbacks,
+        &format!("/api/replay-jobs/{job_id}/events"),
+        json!({"event_type": "started"}),
+        vec![("X-Rewind-Dispatch-Token", "wrong-token")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body["error"].as_str().unwrap().contains("Dispatch-Token"));
 }
