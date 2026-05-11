@@ -74,34 +74,30 @@ logger = logging.getLogger(__name__)
 class DispatchPayload:
     """Decoded body of a dispatch webhook from the Rewind server.
 
-    Mirrors ``crates/rewind-web/src/dispatcher.rs::DispatchBody``.
+    Mirrors ``crates/rewind-web/src/runners.rs`` dispatch payload.
 
-    **Review #154 F2:** ``replay_context_timeline_id`` is the timeline
-    the replay context targets — runners pass it to
-    ``ExplicitClient.attach_replay_context`` so live cache misses
-    record into the fork.
+    ``replay_context_timeline_id`` is the fork the replay context is
+    bound to — pass it to ``ExplicitClient.attach_replay_context`` so
+    live cache misses (writes) record into the fork, not the source.
 
-    **Added 2026-04-29:** ``at_step`` is the original fork-point of
-    the replay-context's timeline — i.e. the step number the user
-    clicked Run replay at in the dashboard. Distinct from the
-    replay-context's ``from_step`` (always 0 because the agent
-    re-runs from scratch). Runners use ``at_step`` to drive
-    multi-turn replay: when ``at_step > 1``, fetch the source
-    timeline's steps 1..at_step-1, reconstruct the conversation
-    history, and invoke the agent at the right turn so edits to
-    user messages in turn 2+ actually take effect.
+    ``source_timeline_id`` is the timeline that holds the user's edits.
+    Runners use it to **read** the (potentially edited) step content at
+    ``at_step``.  For ``CreateAndDispatch`` this differs from the fork;
+    for ``ReuseContext`` both point to the same timeline.
 
-    Defaults to ``None`` for back-compat with older servers (pre
-    v0.14.8) that don't send the field.
+    ``at_step`` is the original fork-point — the step number the user
+    clicked "Run replay" at.  When ``at_step > 1`` runners reconstruct
+    conversation history from steps 1..at_step-1 on the source timeline.
     """
 
     job_id: str
     session_id: str
     replay_context_id: str
     replay_context_timeline_id: str
+    source_timeline_id: str
     base_url: str
-    at_step: Optional[int] = None
-    dispatch_token: Optional[str] = None
+    at_step: int
+    dispatch_token: str
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> "DispatchPayload":
@@ -109,10 +105,11 @@ class DispatchPayload:
             job_id=body["job_id"],
             session_id=body["session_id"],
             replay_context_id=body["replay_context_id"],
-            replay_context_timeline_id=body.get("replay_context_timeline_id", ""),
+            replay_context_timeline_id=body["replay_context_timeline_id"],
+            source_timeline_id=body["source_timeline_id"],
             base_url=body["base_url"],
-            at_step=body.get("at_step"),
-            dispatch_token=body.get("dispatch_token"),
+            at_step=body["at_step"],
+            dispatch_token=body["dispatch_token"],
         )
 
 
