@@ -36,87 +36,56 @@ def test_progress_reporter_strips_trailing_slash() -> None:
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_dispatch_payload_decodes_canonical_body() -> None:
-    body = {
+def _canonical_body(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
         "job_id": "j",
         "session_id": "s",
         "replay_context_id": "r",
         "replay_context_timeline_id": "tl-fork",
+        "source_timeline_id": "tl-source",
+        "at_step": 2,
         "base_url": "http://x.example",
+        "dispatch_token": "tok",
     }
+    base.update(overrides)
+    return base
+
+
+def test_dispatch_payload_decodes_canonical_body() -> None:
+    body = _canonical_body()
     payload = runner.DispatchPayload.from_json(body)
     assert payload.job_id == "j"
     assert payload.session_id == "s"
     assert payload.replay_context_id == "r"
     assert payload.replay_context_timeline_id == "tl-fork"
+    assert payload.source_timeline_id == "tl-source"
+    assert payload.at_step == 2
     assert payload.base_url == "http://x.example"
+    assert payload.dispatch_token == "tok"
 
 
-def test_dispatch_payload_tolerates_missing_timeline_id_for_back_compat() -> None:
-    """Older dispatchers (pre-#154) don't include
-    replay_context_timeline_id; runner library decodes them anyway
-    with an empty string. attach_replay_context will then leave
-    _timeline_id unset (logged as a soft warning in user code)."""
-    body = {
-        "job_id": "j",
-        "session_id": "s",
-        "replay_context_id": "r",
-        "base_url": "http://x.example",
-    }
+def test_dispatch_payload_source_differs_from_fork() -> None:
+    """source_timeline_id (read target) and replay_context_timeline_id
+    (write target) are independent fields."""
+    body = _canonical_body(
+        replay_context_timeline_id="write-fork",
+        source_timeline_id="read-source",
+    )
     payload = runner.DispatchPayload.from_json(body)
-    assert payload.replay_context_timeline_id == ""
-
-
-def test_dispatch_payload_decodes_at_step() -> None:
-    """v0.14.8+ servers include `at_step` in the dispatch body — the
-    fork-point of the replay-context's timeline. Runners use it to
-    drive multi-turn replay (start the agent at the right turn so
-    edits to user messages in turn 2+ take effect)."""
-    body = {
-        "job_id": "j",
-        "session_id": "s",
-        "replay_context_id": "r",
-        "replay_context_timeline_id": "tl-fork",
-        "at_step": 4,
-        "base_url": "http://x.example",
-    }
-    payload = runner.DispatchPayload.from_json(body)
-    assert payload.at_step == 4
-
-
-def test_dispatch_payload_at_step_defaults_to_none_for_back_compat() -> None:
-    """Older servers (pre v0.14.8) don't send `at_step`. The SDK
-    decodes the body anyway; runners that need at_step branch on
-    `payload.at_step is not None` and fall back to single-turn
-    behavior when it's missing."""
-    body = {
-        "job_id": "j",
-        "session_id": "s",
-        "replay_context_id": "r",
-        "replay_context_timeline_id": "tl-fork",
-        "base_url": "http://x.example",
-    }
-    payload = runner.DispatchPayload.from_json(body)
-    assert payload.at_step is None
+    assert payload.source_timeline_id == "read-source"
+    assert payload.replay_context_timeline_id == "write-fork"
 
 
 def test_dispatch_payload_tolerates_extra_unknown_keys() -> None:
-    """Forward-compat: future server versions may add fields. Older
-    runner SDKs hitting newer servers must keep working — extra
+    """Forward-compat: future server versions may add fields. Extra
     keys in the body are ignored, not rejected."""
-    body = {
-        "job_id": "j",
-        "session_id": "s",
-        "replay_context_id": "r",
-        "replay_context_timeline_id": "tl-fork",
-        "at_step": 4,
-        "base_url": "http://x.example",
-        "future_field_added_in_v0_14_99": "ignored",
-        "another_future_field": {"nested": [1, 2, 3]},
-    }
+    body = _canonical_body(
+        future_field="ignored",
+        another_future_field={"nested": [1, 2, 3]},
+    )
     payload = runner.DispatchPayload.from_json(body)
     assert payload.job_id == "j"
-    assert payload.at_step == 4
+    assert payload.at_step == 2
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -143,9 +112,7 @@ def test_asgi_handler_invalid_dispatch_body_returns_400() -> None:
 def test_asgi_handler_dispatches_user_code_on_valid_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    body = json.dumps(
-        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "http://test"}
-    ).encode()
+    body = json.dumps(_canonical_body()).encode()
 
     received_events: list[dict[str, Any]] = []
 
@@ -191,9 +158,7 @@ def test_asgi_handler_dispatches_user_code_on_valid_request(
 def test_asgi_handler_emits_errored_when_user_code_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    body = json.dumps(
-        {"job_id": "j", "session_id": "s", "replay_context_id": "r", "base_url": "http://test"}
-    ).encode()
+    body = json.dumps(_canonical_body()).encode()
 
     received_events: list[dict[str, Any]] = []
 
@@ -233,12 +198,7 @@ def test_asgi_handler_uses_payload_base_url_for_reporter(
     """The reporter built by asgi_handler should prefer the dispatch
     payload's base_url over the default."""
     body = json.dumps(
-        {
-            "job_id": "j",
-            "session_id": "s",
-            "replay_context_id": "r",
-            "base_url": "http://from-dispatch.example",
-        }
+        _canonical_body(base_url="http://from-dispatch.example")
     ).encode()
 
     captured_reporter: list[runner.ProgressReporter] = []

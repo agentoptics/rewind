@@ -327,6 +327,7 @@ async fn dispatch_payload_carries_at_step() {
     assert!(payload["session_id"].is_string());
     assert!(payload["replay_context_id"].is_string());
     assert!(payload["replay_context_timeline_id"].is_string());
+    assert!(payload["source_timeline_id"].is_string());
     assert!(payload["base_url"].is_string());
 }
 
@@ -561,6 +562,69 @@ async fn event_endpoint_rejects_missing_dispatch_token() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body["error"].as_str().unwrap().contains("Dispatch-Token"));
+}
+
+// ── Regression: shape-A dispatch sends source_timeline_id (not fork)
+//    for reading, replay_context_timeline_id = fork for writing ───────
+
+#[tokio::test]
+async fn dispatch_payload_separates_source_and_fork_timeline_ids() {
+    let (webhook_url, mut rx) = spawn_webhook_stub().await;
+    let (api, _callbacks, store, _tmp) = setup_with_webhook(&webhook_url);
+    let (session_id, root_timeline_id) = seed_session_with_n_steps(&store, 3);
+
+    let (status, resp) = json_post(
+        api,
+        &format!("/api/sessions/{session_id}/replay-jobs"),
+        json!({
+            "source_timeline_id": root_timeline_id,
+            "at_step": 2,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {resp:?}");
+
+    // Response fork_timeline_id must be a NEW timeline (the replay fork),
+    // not the source timeline we passed in.
+    let response_fork_id = resp["fork_timeline_id"]
+        .as_str()
+        .expect("response must include fork_timeline_id");
+    assert_ne!(
+        response_fork_id, root_timeline_id,
+        "response fork_timeline_id must be the new fork, not the source"
+    );
+
+    // Capture the webhook payload.
+    let (_headers, body_bytes) =
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("webhook must be called within 3s")
+            .expect("stub channel closed");
+    let payload: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    // replay_context_timeline_id (write target) = the new fork
+    let payload_write_tl = payload["replay_context_timeline_id"]
+        .as_str()
+        .expect("payload must include replay_context_timeline_id");
+    assert_eq!(
+        payload_write_tl, response_fork_id,
+        "replay_context_timeline_id in payload must match the fork returned to dashboard"
+    );
+
+    // source_timeline_id (read target) = the original source timeline
+    let payload_read_tl = payload["source_timeline_id"]
+        .as_str()
+        .expect("payload must include source_timeline_id");
+    assert_eq!(
+        payload_read_tl, root_timeline_id,
+        "source_timeline_id in payload must be the timeline the user edited"
+    );
+
+    // The two must differ (fork != source).
+    assert_ne!(
+        payload_write_tl, payload_read_tl,
+        "write timeline (fork) and read timeline (source) must differ for shape A"
+    );
 }
 
 #[tokio::test]

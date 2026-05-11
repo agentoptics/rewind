@@ -146,7 +146,7 @@ async fn create_replay_job(
         )
     })?;
 
-    let (job, fork_timeline_id, at_step) = {
+    let (job, fork_timeline_id, dispatch_timeline_id, at_step) = {
         let store = state
             .store
             .lock()
@@ -156,7 +156,13 @@ async fn create_replay_job(
             .map_err(internal)?
             .ok_or_else(|| not_found("session"))?;
 
-        let (replay_context_id, fork_timeline_id, at_step) = match req {
+        // Returns (replay_context_id, fork_timeline_id, dispatch_timeline_id, at_step).
+        // fork_timeline_id: the new fork created for replay output (returned to dashboard).
+        // dispatch_timeline_id: the timeline the runner should READ from to find
+        //   edited step content. For CreateAndDispatch this is the source timeline
+        //   (where the user's edits live); for ReuseContext it's the context's
+        //   bound timeline (edits were already on the fork the context targets).
+        let (replay_context_id, fork_timeline_id, dispatch_timeline_id, at_step) = match req {
             CreateReplayJobRequest::CreateAndDispatch(a) => {
                 let timelines = store.get_timelines(&session.id).map_err(internal)?;
                 if !timelines.iter().any(|t| t.id == a.source_timeline_id) {
@@ -183,7 +189,7 @@ async fn create_replay_job(
                         .set_replay_context_strict_match(&ctx_id, true)
                         .map_err(internal)?;
                 }
-                (ctx_id, Some(fork.id), a.at_step)
+                (ctx_id, Some(fork.id), Some(a.source_timeline_id.clone()), a.at_step)
             }
             CreateReplayJobRequest::ReuseContext(b) => {
                 let ctx = store
@@ -228,7 +234,7 @@ async fn create_replay_job(
                     .find(|t| t.id == ctx.timeline_id)
                     .and_then(|t| t.fork_at_step)
                     .unwrap_or(1);
-                (b.replay_context_id, Some(ctx.timeline_id), at_step)
+                (b.replay_context_id, Some(ctx.timeline_id.clone()), Some(ctx.timeline_id), at_step)
             }
         };
 
@@ -260,21 +266,30 @@ async fn create_replay_job(
         store
             .advance_replay_job_state(&job.id, ReplayJobState::Dispatched, None, None)
             .map_err(internal)?;
-        (job, fork_timeline_id, at_step)
+        (job, fork_timeline_id, dispatch_timeline_id, at_step)
     };
 
     // Dispatch via POST to the configured webhook URL.
     let job_clone = job.clone();
     let store_arc = state.store.clone();
     let event_tx = state.event_tx.clone();
-    let timeline_for_payload = fork_timeline_id.clone().unwrap_or_default();
+    // replay_context_timeline_id: the fork the replay context is bound to —
+    // the runner passes this to attach_replay_context() so writes (live cache
+    // misses) record into the fork, not the source.
+    let write_timeline = fork_timeline_id.clone().unwrap_or_default();
+    // source_timeline_id: the timeline that holds the user's edits — the
+    // runner reads this to fetch the (potentially edited) step content at
+    // at_step. For CreateAndDispatch this differs from the fork; for
+    // ReuseContext both point to the same timeline.
+    let read_timeline = dispatch_timeline_id.unwrap_or_default();
     let base_url = state.base_url.clone();
     tokio::spawn(async move {
         let payload = serde_json::json!({
             "job_id": job_clone.id,
             "session_id": job_clone.session_id,
             "replay_context_id": job_clone.replay_context_id,
-            "replay_context_timeline_id": timeline_for_payload,
+            "replay_context_timeline_id": write_timeline,
+            "source_timeline_id": read_timeline,
             "at_step": at_step,
             "base_url": base_url,
             "dispatch_token": job_clone.dispatch_token,
