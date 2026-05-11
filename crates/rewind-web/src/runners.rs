@@ -183,7 +183,7 @@ async fn create_replay_job(
                         .set_replay_context_strict_match(&ctx_id, true)
                         .map_err(internal)?;
                 }
-                (ctx_id, Some(fork.id), a.at_step)
+                (ctx_id, Some(a.source_timeline_id.clone()), a.at_step)
             }
             CreateReplayJobRequest::ReuseContext(b) => {
                 let ctx = store
